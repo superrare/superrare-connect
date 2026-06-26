@@ -1,0 +1,45 @@
+{
+  "name": "@superrare/connect",
+  "version": "0.1.0",
+  "description": "Public SDK for using SuperRare Connect",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "browser": "./dist/superrare-connect.global.js",
+  "types": "./dist/index.d.ts",
+  "license": "MIT",
+  "packageManager": "pnpm@10.17.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/superrare/superrare-connect.git"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./global": "./dist/superrare-connect.global.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "pnpm typecheck && tsup",
+    "test": "pnpm build && pnpm --dir examples/react typecheck && vitest run",
+    "prepublishOnly": "pnpm build && pnpm test"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.5"
+  }
+}
