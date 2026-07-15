@@ -12,11 +12,17 @@ import {
   type ConnectSessionState,
 } from './api.js';
 import {
+  buildConnectAcceptOfferIntentRequest,
   buildConnectBidIntentRequest,
   buildConnectBuyIntentRequest,
+  buildConnectCancelOfferIntentRequest,
+  buildConnectMakeOfferIntentRequest,
   buildConnectMintIntentRequest,
+  type AcceptOfferActionParams,
   type BidActionParams,
   type BuyActionParams,
+  type CancelOfferActionParams,
+  type MakeOfferActionParams,
   type MintActionParams,
 } from './actions-flow-core.js';
 import {
@@ -95,6 +101,13 @@ export type SuperRareConnectActionsNamespace = {
   getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
+export type SuperRareConnectOffersNamespace = {
+  make: (params: MakeOfferActionParams) => Promise<ConnectIntentCreation>;
+  accept: (params: AcceptOfferActionParams) => Promise<ConnectIntentCreation>;
+  cancel: (params: CancelOfferActionParams) => Promise<ConnectIntentCreation>;
+  getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
+};
+
 export type SuperRareConnectIntentsNamespace = {
   get: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
@@ -104,6 +117,7 @@ export type SuperRareConnectClient = {
   user: SuperRareConnectUserNamespace;
   checkout: SuperRareConnectCheckoutNamespace;
   actions: SuperRareConnectActionsNamespace;
+  offers: SuperRareConnectOffersNamespace;
   intents: SuperRareConnectIntentsNamespace;
 };
 
@@ -178,7 +192,10 @@ export function createSuperRareClient(
       | ReturnType<typeof buildConnectCheckoutIntentRequest>
       | ReturnType<typeof buildConnectBuyIntentRequest>
       | ReturnType<typeof buildConnectBidIntentRequest>
-      | ReturnType<typeof buildConnectMintIntentRequest>,
+      | ReturnType<typeof buildConnectMintIntentRequest>
+      | ReturnType<typeof buildConnectMakeOfferIntentRequest>
+      | ReturnType<typeof buildConnectAcceptOfferIntentRequest>
+      | ReturnType<typeof buildConnectCancelOfferIntentRequest>,
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
       throw new ConnectReturnPathError();
@@ -308,6 +325,35 @@ export function createSuperRareClient(
       },
       async mint(params): Promise<ConnectIntentCreation> {
         return await startIntent(buildConnectMintIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async getStatus(params): Promise<ConnectIntent> {
+        return await getConnectIntent({
+          ...apiOptions,
+          intentId: params.intentId,
+        });
+      },
+    },
+    offers: {
+      async make(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectMakeOfferIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async accept(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectAcceptOfferIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async cancel(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectCancelOfferIntentRequest({
           ...params,
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),

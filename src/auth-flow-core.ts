@@ -36,6 +36,26 @@ export type ConnectPurchaseTerms = {
   unitPrice?: string;
 };
 
+export type ConnectOfferTerms = {
+  currency: string;
+  amount: string;
+};
+
+export type ConnectBatchOfferCreateTerms = {
+  currency: string;
+  amount: string;
+  expiresAt: string;
+};
+
+export type ConnectExpectedOfferTerms = {
+  currency: string;
+  amount: string;
+};
+
+export type ConnectCancelOfferTerms = {
+  currency: string;
+};
+
 export type ConnectErc721DirectListingTarget = {
   kind: 'erc721-direct-listing';
   chainId: ConnectChainId;
@@ -91,6 +111,38 @@ export type ConnectErc1155ReleaseTarget = {
   tokenId: string;
 };
 
+export type ConnectErc721OfferTarget = {
+  kind: 'erc721-offer';
+  chainId: ConnectChainId;
+  contract: ConnectEthereumAddress;
+  tokenId: string;
+};
+
+export type ConnectErc721BatchOfferCreateTarget = {
+  kind: 'erc721-batch-offer';
+  chainId: ConnectChainId;
+  tokens: Array<{
+    contract: ConnectEthereumAddress;
+    tokenId: string;
+  }>;
+};
+
+export type ConnectErc721BatchOfferTarget = {
+  kind: 'erc721-batch-offer';
+  chainId: ConnectChainId;
+  creator: ConnectEthereumAddress;
+  root: string;
+};
+
+export type ConnectErc721BatchOfferAcceptTarget = {
+  kind: 'erc721-batch-offer';
+  chainId: ConnectChainId;
+  creator: ConnectEthereumAddress;
+  root: string;
+  contract: ConnectEthereumAddress;
+  tokenId: string;
+};
+
 export type ConnectErc1155CheckoutReleaseItem = {
   kind: 'release';
   contract: ConnectEthereumAddress;
@@ -127,6 +179,18 @@ export type ConnectMintTarget =
   | ConnectErc721ReleaseTarget
   | ConnectErc1155ReleaseTarget;
 
+export type ConnectMakeOfferTarget =
+  | ConnectErc721OfferTarget
+  | ConnectErc721BatchOfferCreateTarget;
+
+export type ConnectAcceptOfferTarget =
+  | ConnectErc721OfferTarget
+  | ConnectErc721BatchOfferAcceptTarget;
+
+export type ConnectCancelOfferTarget =
+  | ConnectErc721OfferTarget
+  | ConnectErc721BatchOfferTarget;
+
 export type ConnectActionInput =
   | { type: 'login' }
   | {
@@ -148,6 +212,30 @@ export type ConnectActionInput =
     type: 'mint';
     target: ConnectMintTarget;
     purchase: ConnectPurchaseTerms;
+  }
+  | {
+    type: 'offer';
+    target: ConnectErc721OfferTarget;
+    offer: ConnectOfferTerms;
+  }
+  | {
+    type: 'offer';
+    target: ConnectErc721BatchOfferCreateTarget;
+    offer: ConnectBatchOfferCreateTerms;
+  }
+  | {
+    type: 'offer-accept';
+    target: ConnectErc721OfferTarget | ConnectErc721BatchOfferAcceptTarget;
+    expected: ConnectExpectedOfferTerms;
+  }
+  | {
+    type: 'offer-cancel';
+    target: ConnectErc721OfferTarget;
+    offer: ConnectCancelOfferTerms;
+  }
+  | {
+    type: 'offer-cancel';
+    target: ConnectErc721BatchOfferTarget;
   }
   | {
     type: 'checkout';

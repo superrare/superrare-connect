@@ -2,11 +2,19 @@ import type {
   ConnectBidTarget,
   ConnectBidTerms,
   ConnectActionInput,
+  ConnectAcceptOfferTarget,
+  ConnectBatchOfferCreateTerms,
   ConnectBuyTarget,
+  ConnectCancelOfferTerms,
   ConnectErc1155ListingTarget,
+  ConnectErc721BatchOfferCreateTarget,
+  ConnectErc721BatchOfferTarget,
+  ConnectErc721OfferTarget,
+  ConnectExpectedOfferTerms,
   ConnectExpectedPriceTerms,
   ConnectExpectedUnitPriceTerms,
   ConnectMintTarget,
+  ConnectOfferTerms,
   ConnectPurchaseTerms,
   CreateConnectIntentRequest,
 } from './auth-flow-core.js';
@@ -39,6 +47,34 @@ export type MintActionParams = ActionParamsBase & {
   purchase: ConnectPurchaseTerms;
 };
 
+type Erc721MakeOfferActionParams = ActionParamsBase & {
+  target: ConnectErc721OfferTarget;
+  offer: ConnectOfferTerms;
+};
+
+type Erc721BatchMakeOfferActionParams = ActionParamsBase & {
+  target: ConnectErc721BatchOfferCreateTarget;
+  offer: ConnectBatchOfferCreateTerms;
+};
+
+export type MakeOfferActionParams = Erc721MakeOfferActionParams | Erc721BatchMakeOfferActionParams;
+
+export type AcceptOfferActionParams = ActionParamsBase & {
+  target: ConnectAcceptOfferTarget;
+  expected: ConnectExpectedOfferTerms;
+};
+
+type Erc721CancelOfferActionParams = ActionParamsBase & {
+  target: ConnectErc721OfferTarget;
+  offer: ConnectCancelOfferTerms;
+};
+
+type Erc721BatchCancelOfferActionParams = ActionParamsBase & {
+  target: ConnectErc721BatchOfferTarget;
+};
+
+export type CancelOfferActionParams = Erc721CancelOfferActionParams | Erc721BatchCancelOfferActionParams;
+
 export type BuildConnectBuyIntentRequestInput = BuyActionParams & {
   state: string;
 };
@@ -48,6 +84,18 @@ export type BuildConnectBidIntentRequestInput = BidActionParams & {
 };
 
 export type BuildConnectMintIntentRequestInput = MintActionParams & {
+  state: string;
+};
+
+export type BuildConnectMakeOfferIntentRequestInput = MakeOfferActionParams & {
+  state: string;
+};
+
+export type BuildConnectAcceptOfferIntentRequestInput = AcceptOfferActionParams & {
+  state: string;
+};
+
+export type BuildConnectCancelOfferIntentRequestInput = CancelOfferActionParams & {
   state: string;
 };
 
@@ -136,6 +184,108 @@ export function buildConnectMintIntentRequest(
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
     },
   };
+}
+
+export function buildConnectMakeOfferIntentRequest(
+  input: BuildConnectMakeOfferIntentRequestInput,
+): BuildConnectActionIntentRequestResult {
+  const sharedResult = buildSharedActionFields(input);
+  if (!sharedResult.ok) return sharedResult;
+
+  return {
+    ok: true,
+    request: {
+      action: buildConnectMakeOfferAction(input),
+      returnPath: sharedResult.returnPath,
+      state: input.state,
+      ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+    },
+  };
+}
+
+function buildConnectMakeOfferAction(
+  input: BuildConnectMakeOfferIntentRequestInput,
+): Extract<ConnectActionInput, { type: 'offer' }> {
+  if (isErc721BatchMakeOfferIntentRequestInput(input)) {
+    return {
+      type: 'offer',
+      target: input.target,
+      offer: input.offer,
+    };
+  }
+
+  return {
+    type: 'offer',
+    target: input.target,
+    offer: input.offer,
+  };
+}
+
+function isErc721BatchMakeOfferIntentRequestInput(
+  input: BuildConnectMakeOfferIntentRequestInput,
+): input is Erc721BatchMakeOfferActionParams & { state: string } {
+  return input.target.kind === 'erc721-batch-offer';
+}
+
+export function buildConnectAcceptOfferIntentRequest(
+  input: BuildConnectAcceptOfferIntentRequestInput,
+): BuildConnectActionIntentRequestResult {
+  const sharedResult = buildSharedActionFields(input);
+  if (!sharedResult.ok) return sharedResult;
+
+  return {
+    ok: true,
+    request: {
+      action: {
+        type: 'offer-accept',
+        target: input.target,
+        expected: input.expected,
+      },
+      returnPath: sharedResult.returnPath,
+      state: input.state,
+      ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+    },
+  };
+}
+
+export function buildConnectCancelOfferIntentRequest(
+  input: BuildConnectCancelOfferIntentRequestInput,
+): BuildConnectActionIntentRequestResult {
+  const sharedResult = buildSharedActionFields(input);
+  if (!sharedResult.ok) return sharedResult;
+
+  return {
+    ok: true,
+    request: {
+      action: buildConnectCancelOfferAction(input),
+      returnPath: sharedResult.returnPath,
+      state: input.state,
+      ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+    },
+  };
+}
+
+function buildConnectCancelOfferAction(
+  input: BuildConnectCancelOfferIntentRequestInput,
+): Extract<ConnectActionInput, { type: 'offer-cancel' }> {
+  if (isErc721BatchCancelOfferIntentRequestInput(input)) {
+    return {
+      type: 'offer-cancel',
+      target: input.target,
+    };
+  }
+
+  return {
+    type: 'offer-cancel',
+    target: input.target,
+    offer: input.offer,
+  };
+}
+
+function isErc721BatchCancelOfferIntentRequestInput(
+  input: BuildConnectCancelOfferIntentRequestInput,
+): input is Erc721BatchCancelOfferActionParams & { state: string } {
+  return input.target.kind === 'erc721-batch-offer';
 }
 
 function buildSharedActionFields(input: {
