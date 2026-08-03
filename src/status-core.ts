@@ -1,4 +1,12 @@
-export type ConnectActionType = 'login' | 'checkout' | 'bid' | 'buy' | 'mint';
+export type ConnectActionType =
+  | 'login'
+  | 'checkout'
+  | 'bid'
+  | 'buy'
+  | 'mint'
+  | 'offer'
+  | 'offer-accept'
+  | 'offer-cancel';
 
 export type ConnectIntentStatus =
   | 'pending'
@@ -24,17 +32,21 @@ export type ConnectActionTargetKind =
   | 'erc721-batch-reserve-auction'
   | 'erc721-release'
   | 'erc1155-release'
-  | 'erc1155-checkout';
+  | 'erc1155-checkout'
+  | 'erc721-offer'
+  | 'erc721-batch-offer';
 
 export type ConnectResolvedActionSnapshot = {
   actionKey: string;
-  actionType: 'checkout' | 'bid' | 'buy' | 'mint';
+  actionType: 'checkout' | 'bid' | 'buy' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel';
   resolvedAt: string;
   targetKind: ConnectActionTargetKind;
   terms: {
     amount?: string;
     available: boolean;
+    buyer?: string;
     currency?: string;
+    expiry?: string;
     marketplace?: string;
     merkleRoot?: string;
     merkleProof?: string[];

@@ -7,7 +7,9 @@ import {
 } from '../src/client.js';
 import type {
   ConnectErc1155CheckoutTarget,
+  ConnectErc721BatchOfferTarget,
   ConnectErc721DirectListingTarget,
+  ConnectErc721OfferTarget,
   ConnectErc721ReleaseTarget,
   ConnectErc721ReserveAuctionTarget,
 } from '../src/auth-flow-core.js';
@@ -47,6 +49,20 @@ const checkoutTarget: ConnectErc1155CheckoutTarget = {
       expected: { currency: 'ETH', unitPrice: '1.2' },
     },
   ],
+};
+
+const offerTarget: ConnectErc721OfferTarget = {
+  kind: 'erc721-offer',
+  chainId: 1,
+  contract: '0x1234567890123456789012345678901234567890',
+  tokenId: '123',
+};
+
+const batchOfferTarget: ConnectErc721BatchOfferTarget = {
+  kind: 'erc721-batch-offer',
+  chainId: 1,
+  creator: '0x2222222222222222222222222222222222222222',
+  root: '0xroot',
 };
 
 describe('createSuperRareClient', () => {
@@ -496,6 +512,85 @@ describe('createSuperRareClient', () => {
     });
   });
 
+  it('starts make, accept, and cancel offer intents through the offers namespace', async () => {
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_offer',
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const body: unknown = await request.json();
+
+        if (isConnectActionRequest(body, 'offer')) {
+          expect(body).toEqual({
+            action: {
+              type: 'offer',
+              target: offerTarget,
+              offer: { currency: 'ETH', amount: '1.2' },
+            },
+            returnPath: '/offer/complete',
+            state: 'state_offer',
+          });
+          return connectIntentCreationResponse('connect_intent_offer');
+        }
+
+        if (isConnectActionRequest(body, 'offer-accept')) {
+          expect(body).toEqual({
+            action: {
+              type: 'offer-accept',
+              target: offerTarget,
+              expected: { currency: 'ETH', amount: '1.2' },
+            },
+            returnPath: '/offer/accept/complete',
+            state: 'state_offer',
+          });
+          return connectIntentCreationResponse('connect_intent_offer_accept');
+        }
+
+        if (isConnectActionRequest(body, 'offer-cancel')) {
+          expect(body).toEqual({
+            action: {
+              type: 'offer-cancel',
+              target: batchOfferTarget,
+            },
+            returnPath: '/offer/cancel/complete',
+            state: 'state_offer',
+          });
+          return connectIntentCreationResponse('connect_intent_offer_cancel');
+        }
+
+        throw new Error('Unexpected offer Connect request.');
+      },
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: false,
+    });
+
+    await expect(client.offers.make({
+      target: offerTarget,
+      offer: { currency: 'ETH', amount: '1.2' },
+      returnPath: '/offer/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_offer' });
+    await expect(client.offers.accept({
+      target: offerTarget,
+      expected: { currency: 'ETH', amount: '1.2' },
+      returnPath: '/offer/accept/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_offer_accept' });
+    await expect(client.offers.cancel({
+      target: batchOfferTarget,
+      returnPath: '/offer/cancel/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_offer_cancel' });
+
+    expect(assignedUrls).toEqual([
+      'https://connect.superrare.test/intents/connect_intent_offer',
+      'https://connect.superrare.test/intents/connect_intent_offer_accept',
+      'https://connect.superrare.test/intents/connect_intent_offer_cancel',
+    ]);
+  });
+
   it('supports anonymous checkout, actions, and intent status without a Connect session', async () => {
     const requestedUrls: string[] = [];
     const client = createSuperRareClient({
@@ -629,8 +724,8 @@ function connectIntentCreationResponse(intentId: string): Response {
 
 function isConnectActionRequest(
   value: unknown,
-  type: 'checkout' | 'buy' | 'bid' | 'mint',
-): value is { action: { type: 'checkout' | 'buy' | 'bid' | 'mint' } } {
+  type: 'checkout' | 'buy' | 'bid' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel',
+): value is { action: { type: 'checkout' | 'buy' | 'bid' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel' } } {
   return (
     typeof value === 'object' &&
     value !== null &&

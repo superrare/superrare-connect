@@ -132,6 +132,55 @@ describe('Connect API client', () => {
     });
   });
 
+  it('parses intent status carrying an offer snapshot with buyer and expiry terms', async () => {
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+
+      expect(request.method).toBe('GET');
+      expect(request.url).toBe('https://rare-api.test/v1/connect/intents/connect_intent_offer');
+
+      return jsonResponse({
+        data: {
+          intentId: 'connect_intent_offer',
+          type: 'offer',
+          status: 'completed',
+          returnPath: '/offer/complete',
+          expiresAt: '2026-06-22T00:00:00.000Z',
+          resolvedActionSnapshot: {
+            actionKey: 'offer_key',
+            actionType: 'offer',
+            resolvedAt: '2026-06-21T00:00:00.000Z',
+            targetKind: 'erc721-offer',
+            terms: {
+              available: true,
+              amount: '1.2',
+              currency: 'ETH',
+              buyer: '0x0000000000000000000000000000000000000001',
+              expiry: '1750550400',
+            },
+          },
+          result: { transactionHash: '0xtransaction' },
+        },
+      });
+    });
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_offer',
+    })).resolves.toMatchObject({
+      intentId: 'connect_intent_offer',
+      type: 'offer',
+      resolvedActionSnapshot: {
+        targetKind: 'erc721-offer',
+        terms: {
+          buyer: '0x0000000000000000000000000000000000000001',
+          expiry: '1750550400',
+        },
+      },
+    });
+  });
+
   it('gets checkout status', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);
@@ -156,6 +205,54 @@ describe('Connect API client', () => {
     })).resolves.toMatchObject({
       sessionId: 'connect_checkout_session_123',
       status: 'completed',
+    });
+  });
+
+  it('parses checkout status carrying a batch-offer snapshot with buyer and expiry terms', async () => {
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+
+      expect(request.method).toBe('GET');
+      expect(request.url).toBe('https://rare-api.test/v1/connect/checkout/connect_checkout_session_offer');
+
+      return jsonResponse({
+        data: {
+          sessionId: 'connect_checkout_session_offer',
+          status: 'completed',
+          intentId: 'connect_intent_offer_accept',
+          transactionHash: '0xtransaction',
+          resolvedActionSnapshot: {
+            actionKey: 'offer_accept_key',
+            actionType: 'offer-accept',
+            resolvedAt: '2026-06-21T00:00:00.000Z',
+            targetKind: 'erc721-batch-offer',
+            terms: {
+              available: true,
+              amount: '1.2',
+              currency: 'ETH',
+              buyer: '0x0000000000000000000000000000000000000001',
+              expiry: '1750550400',
+              merkleRoot: '0xroot',
+            },
+          },
+        },
+      });
+    });
+
+    await expect(getConnectCheckoutStatus({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      sessionId: 'connect_checkout_session_offer',
+    })).resolves.toMatchObject({
+      sessionId: 'connect_checkout_session_offer',
+      status: 'completed',
+      resolvedActionSnapshot: {
+        targetKind: 'erc721-batch-offer',
+        terms: {
+          buyer: '0x0000000000000000000000000000000000000001',
+          expiry: '1750550400',
+        },
+      },
     });
   });
 

@@ -66,14 +66,14 @@ const getConnectCurrentUserResponseSchema = z.object({
 
 const connectIntentSchema = z.object({
   intentId: z.string().min(1),
-  type: z.enum(['login', 'checkout', 'bid', 'buy', 'mint']),
+  type: z.enum(['login', 'checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel']),
   status: z.enum(['pending', 'requires_user', 'processing', 'completed', 'failed', 'cancelled', 'expired']),
   initiatingOrigin: z.string().optional(),
   returnPath: z.string(),
   expiresAt: z.string().min(1),
   resolvedActionSnapshot: z.object({
     actionKey: z.string(),
-    actionType: z.enum(['checkout', 'bid', 'buy', 'mint']),
+    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel']),
     resolvedAt: z.string(),
     targetKind: z.enum([
       'erc721-direct-listing',
@@ -84,11 +84,15 @@ const connectIntentSchema = z.object({
       'erc721-release',
       'erc1155-release',
       'erc1155-checkout',
+      'erc721-offer',
+      'erc721-batch-offer',
     ]),
     terms: z.object({
       amount: z.string().optional(),
       available: z.boolean(),
+      buyer: z.string().optional(),
       currency: z.string().optional(),
+      expiry: z.string().optional(),
       marketplace: z.string().optional(),
       merkleRoot: z.string().optional(),
       merkleProof: z.array(z.string()).optional(),
@@ -124,7 +128,7 @@ const connectCheckoutStatusSchema = z.object({
   expiresAt: z.string().optional(),
   resolvedActionSnapshot: z.object({
     actionKey: z.string(),
-    actionType: z.enum(['checkout', 'bid', 'buy', 'mint']),
+    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel']),
     resolvedAt: z.string(),
     targetKind: z.enum([
       'erc721-direct-listing',
@@ -135,11 +139,15 @@ const connectCheckoutStatusSchema = z.object({
       'erc721-release',
       'erc1155-release',
       'erc1155-checkout',
+      'erc721-offer',
+      'erc721-batch-offer',
     ]),
     terms: z.object({
       amount: z.string().optional(),
       available: z.boolean(),
+      buyer: z.string().optional(),
       currency: z.string().optional(),
+      expiry: z.string().optional(),
       marketplace: z.string().optional(),
       merkleRoot: z.string().optional(),
       merkleProof: z.array(z.string()).optional(),
