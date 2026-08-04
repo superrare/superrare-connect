@@ -66,14 +66,14 @@ const getConnectCurrentUserResponseSchema = z.object({
 
 const connectIntentSchema = z.object({
   intentId: z.string().min(1),
-  type: z.enum(['login', 'checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel']),
+  type: z.enum(['login', 'checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
   status: z.enum(['pending', 'requires_user', 'processing', 'completed', 'failed', 'cancelled', 'expired']),
   initiatingOrigin: z.string().optional(),
   returnPath: z.string(),
   expiresAt: z.string().min(1),
   resolvedActionSnapshot: z.object({
     actionKey: z.string(),
-    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel']),
+    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
     resolvedAt: z.string(),
     targetKind: z.enum([
       'erc721-direct-listing',
@@ -128,7 +128,7 @@ const connectCheckoutStatusSchema = z.object({
   expiresAt: z.string().optional(),
   resolvedActionSnapshot: z.object({
     actionKey: z.string(),
-    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel']),
+    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
     resolvedAt: z.string(),
     targetKind: z.enum([
       'erc721-direct-listing',

@@ -2,7 +2,7 @@
 
 Public browser SDK for starting SuperRare-hosted Connect flows from external websites.
 
-SuperRare Connect handles wallet connection, checkout, buys, bids, mints, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, redirect users, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, and status flows do not require an authenticated Connect session.
+SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, redirect users, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, and status flows do not require an authenticated Connect session.
 
 ## Install
 
@@ -165,6 +165,24 @@ await superrare.actions.mint({
 ```
 
 The SDK never accepts arbitrary calldata, contract instructions, private keys, API secrets, or wallet-provider objects from integrators.
+
+## Anonymous Auction Settlement
+
+Settling an ended reserve auction is permissionless: anyone can trigger it, and the outcome (winning bidder, amount, transfer) is already fixed on-chain, so no expected terms are supplied. Rare API resolves the ended auction across both auction houses and pins the settlement details into the hosted intent; the hosted page submits the `settleAuction` transaction from the connected wallet.
+
+```ts
+await superrare.actions.settle({
+  target: {
+    kind: 'erc721-reserve-auction',
+    chainId: 11155111,
+    contract: '0x345ea85bc5391a55a46c9508727b37da2227b41e',
+    tokenId: '4',
+  },
+  returnPath: '/settle/complete',
+});
+```
+
+Intent creation fails when the auction has not ended, has no winning bid, or was already settled.
 
 ## Intent Status
 

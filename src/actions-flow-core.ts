@@ -9,6 +9,7 @@ import type {
   ConnectErc1155ListingTarget,
   ConnectErc721BatchOfferCreateTarget,
   ConnectErc721BatchOfferTarget,
+  ConnectErc721ReserveAuctionTarget,
   ConnectErc721OfferTarget,
   ConnectExpectedOfferTerms,
   ConnectExpectedPriceTerms,
@@ -40,6 +41,10 @@ export type BuyActionParams = Erc721BuyActionParams | Erc1155BuyActionParams;
 export type BidActionParams = ActionParamsBase & {
   target: ConnectBidTarget;
   bid: ConnectBidTerms;
+};
+
+export type SettleActionParams = ActionParamsBase & {
+  target: ConnectErc721ReserveAuctionTarget;
 };
 
 export type MintActionParams = ActionParamsBase & {
@@ -80,6 +85,10 @@ export type BuildConnectBuyIntentRequestInput = BuyActionParams & {
 };
 
 export type BuildConnectBidIntentRequestInput = BidActionParams & {
+  state: string;
+};
+
+export type BuildConnectSettleIntentRequestInput = SettleActionParams & {
   state: string;
 };
 
@@ -157,6 +166,26 @@ export function buildConnectBidIntentRequest(
         type: 'bid',
         target: input.target,
         bid: input.bid,
+      },
+      returnPath: sharedResult.returnPath,
+      state: input.state,
+      ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+    },
+  };
+}
+
+export function buildConnectSettleIntentRequest(
+  input: BuildConnectSettleIntentRequestInput,
+): BuildConnectActionIntentRequestResult {
+  const sharedResult = buildSharedActionFields(input);
+  if (!sharedResult.ok) return sharedResult;
+
+  return {
+    ok: true,
+    request: {
+      action: {
+        type: 'settle',
+        target: input.target,
       },
       returnPath: sharedResult.returnPath,
       state: input.state,

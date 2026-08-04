@@ -23,6 +23,7 @@ export {
   type CancelOfferActionParams,
   type MakeOfferActionParams,
   type MintActionParams,
+  type SettleActionParams,
 } from './actions-flow-core.js';
 export {
   type ConnectAcceptOfferTarget,

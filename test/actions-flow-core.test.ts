@@ -6,6 +6,7 @@ import {
   buildConnectCancelOfferIntentRequest,
   buildConnectMakeOfferIntentRequest,
   buildConnectMintIntentRequest,
+  buildConnectSettleIntentRequest,
 } from '../src/actions-flow-core.js';
 import type {
   ConnectErc721BatchOfferAcceptTarget,
@@ -277,6 +278,26 @@ describe('buildConnectCancelOfferIntentRequest', () => {
           target: batchOfferTarget,
         },
         returnPath: '/offer/cancel/complete',
+        state: 'state_123',
+      },
+    });
+  });
+});
+
+describe('buildConnectSettleIntentRequest', () => {
+  it('builds a settle intent request with a reserve auction target', () => {
+    expect(buildConnectSettleIntentRequest({
+      target: reserveAuctionTarget,
+      returnPath: '/settle/complete',
+      state: 'state_123',
+    })).toEqual({
+      ok: true,
+      request: {
+        action: {
+          type: 'settle',
+          target: reserveAuctionTarget,
+        },
+        returnPath: '/settle/complete',
         state: 'state_123',
       },
     });
