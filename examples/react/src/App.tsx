@@ -9,7 +9,7 @@ import {
   type ConnectIntent,
   type ConnectSession,
   type SuperRareConnectClient,
-} from '@superrare/connect';
+} from '@rareprotocol/connect';
 import { createPublicClient, formatUnits, http } from 'viem';
 import { sepolia } from 'viem/chains';
 
