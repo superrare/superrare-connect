@@ -4,7 +4,7 @@ This guide applies to the entire repository.
 
 ## Project Purpose
 
-`@superrare/connect` is a public TypeScript SDK for starting SuperRare-hosted Connect flows from external websites.
+`@rareprotocol/connect` is a public TypeScript SDK for starting SuperRare-hosted Connect flows from external websites.
 
 The package should support:
 

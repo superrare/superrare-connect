@@ -1,4 +1,4 @@
-# @superrare/connect
+# @rareprotocol/connect
 
 Public browser SDK for starting SuperRare-hosted Connect flows from external websites.
 
@@ -7,11 +7,11 @@ SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auctio
 ## Install
 
 ```sh
-pnpm add @superrare/connect
+pnpm add @rareprotocol/connect
 ```
 
 ```ts
-import { createSuperRareClient } from '@superrare/connect';
+import { createSuperRareClient } from '@rareprotocol/connect';
 
 const superrare = createSuperRareClient();
 ```
@@ -59,7 +59,7 @@ ESM CDN-style usage:
 
 ```html
 <script type="module">
-  import { createSuperRareClient } from 'https://cdn.example.com/@superrare/connect/index.js';
+  import { createSuperRareClient } from 'https://cdn.example.com/@rareprotocol/connect/index.js';
 
   const superrare = createSuperRareClient();
 </script>
@@ -187,7 +187,7 @@ Intent creation fails when the auction has not ended, has no winning bid, or was
 ## Intent Status
 
 ```ts
-import { resolveConnectIntentOutcome } from '@superrare/connect';
+import { resolveConnectIntentOutcome } from '@rareprotocol/connect';
 
 const intent = await superrare.intents.get({
   intentId: 'connect_intent_123',
@@ -270,7 +270,7 @@ returnPath: '/checkout/complete?listing=123'
 Rejected values include absolute URLs, protocol-relative URLs, backslashes, encoded slash or backslash bypasses, control characters, empty strings, and paths without a leading slash.
 
 ```ts
-import { normalizeReturnPath } from '@superrare/connect';
+import { normalizeReturnPath } from '@rareprotocol/connect';
 
 const result = normalizeReturnPath('/account');
 ```

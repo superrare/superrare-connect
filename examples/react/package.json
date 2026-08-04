@@ -1,5 +1,5 @@
 {
-  "name": "@superrare/connect-react-example",
+  "name": "@rareprotocol/connect-react-example",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@rareprotocol/rare-cli": "^1.4.0",
-    "@superrare/connect": "workspace:*",
+    "@rareprotocol/connect": "workspace:*",
     "buffer": "^6.0.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

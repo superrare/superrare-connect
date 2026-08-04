@@ -27,12 +27,12 @@ importers:
 
   examples/react:
     dependencies:
+      '@rareprotocol/connect':
+        specifier: workspace:*
+        version: link:../..
       '@rareprotocol/rare-cli':
         specifier: ^1.4.0
         version: 1.4.0(typescript@5.9.3)
-      '@superrare/connect':
-        specifier: workspace:*
-        version: link:../..
       buffer:
         specifier: ^6.0.3
         version: 6.0.3
