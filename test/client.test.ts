@@ -512,6 +512,53 @@ describe('createSuperRareClient', () => {
     });
   });
 
+  it('starts settle intents through actions.settle and navigates to the hosted URL', async () => {
+    const navigations: string[] = [];
+    const navigation: ConnectNavigation = {
+      assign(url) {
+        navigations.push(url);
+      },
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_settle',
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+
+        expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
+        expect(await request.json()).toEqual({
+          action: {
+            type: 'settle',
+            target: reserveAuctionTarget,
+          },
+          returnPath: '/settle/complete',
+          state: 'state_settle',
+        });
+
+        return jsonResponse({
+          data: {
+            intentId: 'connect_intent_settle',
+            url: 'https://connect.superrare.test/action/connect_intent_settle',
+            expiresAt: '2026-06-22T00:00:00.000Z',
+          },
+        });
+      },
+      navigation,
+      sessionStorage: false,
+    });
+
+    await expect(client.actions.settle({
+      target: reserveAuctionTarget,
+      returnPath: '/settle/complete',
+    })).resolves.toMatchObject({
+      intentId: 'connect_intent_settle',
+      url: 'https://connect.superrare.test/action/connect_intent_settle',
+    });
+    expect(navigations).toEqual([
+      'https://connect.superrare.test/action/connect_intent_settle',
+    ]);
+  });
+
   it('starts make, accept, and cancel offer intents through the offers namespace', async () => {
     const assignedUrls: string[] = [];
     const client = createSuperRareClient({
