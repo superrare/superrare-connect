@@ -18,12 +18,14 @@ import {
   buildConnectCancelOfferIntentRequest,
   buildConnectMakeOfferIntentRequest,
   buildConnectMintIntentRequest,
+  buildConnectSettleIntentRequest,
   type AcceptOfferActionParams,
   type BidActionParams,
   type BuyActionParams,
   type CancelOfferActionParams,
   type MakeOfferActionParams,
   type MintActionParams,
+  type SettleActionParams,
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
@@ -98,6 +100,7 @@ export type SuperRareConnectActionsNamespace = {
   buy: (params: BuyActionParams) => Promise<ConnectIntentCreation>;
   bid: (params: BidActionParams) => Promise<ConnectIntentCreation>;
   mint: (params: MintActionParams) => Promise<ConnectIntentCreation>;
+  settle: (params: SettleActionParams) => Promise<ConnectIntentCreation>;
   getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
@@ -318,6 +321,13 @@ export function createSuperRareClient(
       },
       async bid(params): Promise<ConnectIntentCreation> {
         return await startIntent(buildConnectBidIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async settle(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectSettleIntentRequest({
           ...params,
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),

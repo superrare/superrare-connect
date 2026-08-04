@@ -6,7 +6,8 @@ export type ConnectActionType =
   | 'mint'
   | 'offer'
   | 'offer-accept'
-  | 'offer-cancel';
+  | 'offer-cancel'
+  | 'settle';
 
 export type ConnectIntentStatus =
   | 'pending'
@@ -38,7 +39,7 @@ export type ConnectActionTargetKind =
 
 export type ConnectResolvedActionSnapshot = {
   actionKey: string;
-  actionType: 'checkout' | 'bid' | 'buy' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel';
+  actionType: 'checkout' | 'bid' | 'buy' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel' | 'settle';
   resolvedAt: string;
   targetKind: ConnectActionTargetKind;
   terms: {

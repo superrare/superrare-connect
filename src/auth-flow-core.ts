@@ -209,6 +209,10 @@ export type ConnectActionInput =
     bid: ConnectBidTerms;
   }
   | {
+    type: 'settle';
+    target: ConnectErc721ReserveAuctionTarget;
+  }
+  | {
     type: 'mint';
     target: ConnectMintTarget;
     purchase: ConnectPurchaseTerms;
