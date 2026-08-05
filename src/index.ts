@@ -78,6 +78,13 @@ export {
   type ConnectSessionState,
 } from './api.js';
 export {
+  DEFAULT_CONNECT_POPUP_HEIGHT,
+  DEFAULT_CONNECT_POPUP_WIDTH,
+  type ConnectPopupOpener,
+  type ConnectPopupSize,
+  type ConnectPopupWindow,
+} from './popup-core.js';
+export {
   normalizeReturnPath,
   type ReturnPathNormalizationResult,
 } from './return-path-core.js';

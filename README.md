@@ -256,6 +256,24 @@ const superrare = createSuperRareClient({
 
 Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. Use `navigation: false` to create hosted intents without assigning `window.location`. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `navigation`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
 
+## Popup Checkout
+
+By default a hosted action navigates the current page. Set `display: 'popup'` to open the hosted flow in a small centered window instead — the way wallet and social sign-in flows behave — so your page keeps its state while the buyer pays.
+
+```ts
+const superrare = createSuperRareClient({
+  display: 'popup',
+  popup: { width: 480, height: 720 },
+  onIntentSettled: (intent) => {
+    // Fires when the intent reaches a terminal status, and with the latest
+    // known state if the buyer closes the popup early.
+    refreshArtwork(intent);
+  },
+});
+```
+
+Call `actions.buy()` (or any other action) directly from the click handler: the popup opens synchronously inside the user gesture, so browsers do not block it. When a popup cannot be opened the SDK falls back to the redirect flow, and `auth.login()` always redirects because the auth callback must return to your page.
+
 ## Return Path Safety
 
 Public flow parameters use `returnPath`, not `returnUrl`.

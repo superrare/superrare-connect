@@ -51,6 +51,14 @@ import {
   type ConnectSession,
   type ConnectSessionStorage,
 } from './session-storage-core.js';
+import {
+  appendConnectPopupDisplay,
+  getConnectPopupFeatures,
+  isConnectIntentSettled,
+  type ConnectPopupOpener,
+  type ConnectPopupSize,
+  type ConnectPopupWindow,
+} from './popup-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
 
 export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
@@ -58,6 +66,19 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   initiatingOrigin?: string;
   createState?: () => string;
   navigation?: ConnectNavigation | false;
+  /**
+   * How hosted action/checkout intents open. `redirect` (default) navigates
+   * the current page; `popup` opens a small centered window — the integrator's
+   * page stays put and `onIntentSettled` fires when the flow finishes.
+   * Login intents always redirect (the auth callback returns to the page).
+   */
+  display?: 'redirect' | 'popup';
+  popup?: ConnectPopupSize & { open?: ConnectPopupOpener };
+  /**
+   * Popup mode only: called once the intent reaches a terminal status, or with
+   * the latest intent state when the user closes the popup early.
+   */
+  onIntentSettled?: (intent: ConnectIntent) => void;
   sessionStorage?: ConnectSessionStorage | false;
   pendingAuthStorageKey?: string;
   sessionStorageKey?: string;
@@ -190,6 +211,54 @@ export function createSuperRareClient(
     notifySessionListeners(sessionListeners, session);
     return session;
   };
+  const openPopupWindow = (): ConnectPopupWindow | null => {
+    const open = options.popup?.open ?? readBrowserPopupOpener();
+    if (open === undefined) return null;
+
+    const screen = readBrowserScreenSize();
+    return open(
+      'about:blank',
+      'superrare-connect',
+      getConnectPopupFeatures({
+        size: options.popup,
+        screenWidth: screen?.width,
+        screenHeight: screen?.height,
+      }),
+    );
+  };
+  const watchPopupIntent = async (
+    popup: ConnectPopupWindow,
+    intentId: string,
+  ): Promise<void> => {
+    for (;;) {
+      await sleep(POPUP_POLL_INTERVAL_MS);
+      let intent: ConnectIntent | undefined;
+      try {
+        intent = await getConnectIntent({ ...apiOptions, intentId });
+      } catch {
+        // Transient fetch failure — keep watching while the popup is open.
+      }
+
+      if (intent !== undefined && isConnectIntentSettled(intent.status)) {
+        if (!popup.closed) popup.close();
+        options.onIntentSettled?.(intent);
+        return;
+      }
+
+      if (popup.closed) {
+        // The user dismissed the popup; report the latest known state.
+        if (intent === undefined) {
+          try {
+            intent = await getConnectIntent({ ...apiOptions, intentId });
+          } catch {
+            return;
+          }
+        }
+        options.onIntentSettled?.(intent);
+        return;
+      }
+    }
+  };
   const startIntent = async (
     requestResult:
       | ReturnType<typeof buildConnectCheckoutIntentRequest>
@@ -204,11 +273,27 @@ export function createSuperRareClient(
       throw new ConnectReturnPathError();
     }
 
-    const intent = resolveHostedIntent(await createConnectIntent({
-      ...apiOptions,
-      request: requestResult.request,
-    }));
-    navigation?.assign(intent.url);
+    // The popup must open before the first await to stay inside the user
+    // gesture; otherwise browsers block it. It navigates once the intent exists.
+    const popup = options.display === 'popup' ? openPopupWindow() : null;
+    let intent: ConnectIntentCreation;
+    try {
+      intent = resolveHostedIntent(await createConnectIntent({
+        ...apiOptions,
+        request: requestResult.request,
+      }));
+    } catch (error) {
+      popup?.close();
+      throw error;
+    }
+
+    if (popup !== null) {
+      popup.location.replace(appendConnectPopupDisplay(intent.url));
+      void watchPopupIntent(popup, intent.intentId);
+    } else {
+      navigation?.assign(intent.url);
+    }
+
     return intent;
   };
   const me = async (): Promise<ConnectCurrentUser> => {
@@ -418,6 +503,50 @@ function resolveConnectNavigation(
 function readBrowserNavigation(): ConnectNavigation | undefined {
   const location = Reflect.get(globalThis, 'location');
   return isConnectNavigation(location) ? location : undefined;
+}
+
+const POPUP_POLL_INTERVAL_MS = 2000;
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function readBrowserPopupOpener(): ConnectPopupOpener | undefined {
+  const open = Reflect.get(globalThis, 'open');
+  if (typeof open !== 'function') return undefined;
+  return (url, target, features) => {
+    const popup: unknown = open.call(globalThis, url, target, features);
+    return isConnectPopupWindow(popup) ? popup : null;
+  };
+}
+
+function isConnectPopupWindow(value: unknown): value is ConnectPopupWindow {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'closed' in value &&
+    'close' in value &&
+    'location' in value &&
+    typeof value.close === 'function'
+  );
+}
+
+function readBrowserScreenSize(): { width: number; height: number } | undefined {
+  const screen: unknown = Reflect.get(globalThis, 'screen');
+  if (
+    typeof screen === 'object' &&
+    screen !== null &&
+    'width' in screen &&
+    'height' in screen &&
+    typeof screen.width === 'number' &&
+    typeof screen.height === 'number'
+  ) {
+    return { width: screen.width, height: screen.height };
+  }
+
+  return undefined;
 }
 
 function isConnectNavigation(value: unknown): value is ConnectNavigation {

@@ -14,6 +14,7 @@ import type {
   ConnectErc721ReserveAuctionTarget,
 } from '../src/auth-flow-core.js';
 import type { SuperRareConnectApiError } from '../src/errors.js';
+import type { ConnectPopupWindow } from '../src/popup-core.js';
 import type { ConnectSessionStorage } from '../src/session-storage-core.js';
 
 const directListingTarget: ConnectErc721DirectListingTarget = {
@@ -748,6 +749,177 @@ describe('createSuperRareClient', () => {
       'https://rare-api.test/v1/connect/intents',
       'https://rare-api.test/v1/connect/intents',
       'https://rare-api.test/v1/connect/intents/connect_intent_bid',
+    ]);
+  });
+
+  it('opens hosted intents in a sized popup and closes it once the intent settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const opened: Array<{ url: string; target: string; features: string }> = [];
+      const replacedUrls: string[] = [];
+      const assignedUrls: string[] = [];
+      const settledStatuses: string[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: {
+          replace(url) {
+            replacedUrls.push(url);
+          },
+        },
+      };
+      let statusRequests = 0;
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        popup: {
+          width: 400,
+          height: 640,
+          open: (url, target, features) => {
+            opened.push({ url, target, features });
+            return popup;
+          },
+        },
+        onIntentSettled: (intent) => {
+          settledStatuses.push(intent.status);
+        },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: statusRequests < 2 ? 'requires_user' : 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: '2026-06-22T00:00:00.000Z',
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: {
+          assign(url) {
+            assignedUrls.push(url);
+          },
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      })).resolves.toMatchObject({ intentId: 'connect_intent_buy' });
+
+      expect(opened).toHaveLength(1);
+      expect(opened[0]?.url).toBe('about:blank');
+      expect(opened[0]?.target).toBe('superrare-connect');
+      expect(opened[0]?.features).toContain('popup=yes');
+      expect(opened[0]?.features).toContain('width=400');
+      expect(opened[0]?.features).toContain('height=640');
+      // The popup navigates with the display marker; the page does not redirect.
+      expect(replacedUrls).toEqual([
+        'https://connect.superrare.test/intents/connect_intent_buy?display=popup',
+      ]);
+      expect(assignedUrls).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(popup.closed).toBe(false);
+      expect(settledStatuses).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(popup.closed).toBe(true);
+      expect(settledStatuses).toEqual(['completed']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports the latest intent state when the user closes the popup early', async () => {
+    vi.useFakeTimers();
+    try {
+      const settledStatuses: string[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        popup: { open: () => popup },
+        onIntentSettled: (intent) => {
+          settledStatuses.push(intent.status);
+        },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'requires_user',
+                returnPath: '/buy/complete',
+                expiresAt: '2026-06-22T00:00:00.000Z',
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(settledStatuses).toEqual(['requires_user']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls back to redirect navigation when the popup is blocked', async () => {
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_popup',
+      display: 'popup',
+      popup: { open: () => null },
+      fetch: async () => connectIntentCreationResponse('connect_intent_buy'),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: false,
+    });
+
+    await client.actions.buy({
+      target: directListingTarget,
+      expected: { currency: 'ETH', price: '1.2' },
+      returnPath: '/buy/complete',
+    });
+
+    expect(assignedUrls).toEqual([
+      'https://connect.superrare.test/intents/connect_intent_buy',
     ]);
   });
 });
