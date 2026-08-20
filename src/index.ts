@@ -7,6 +7,8 @@ export {
   type SuperRareConnectActionsNamespace,
   type ConnectAuthLoginParams,
   type ConnectNavigation,
+  type ConnectPopupMessageEvent,
+  type ConnectPopupMessageEvents,
   type ConnectSessionChangeCallback,
   type SuperRareConnectAuthNamespace,
   type SuperRareConnectCheckoutNamespace,
@@ -84,6 +86,13 @@ export {
   type ConnectPopupSize,
   type ConnectPopupWindow,
 } from './popup-core.js';
+export {
+  CONNECT_AUTH_CALLBACK_MESSAGE_TYPE,
+  parseConnectAuthCallbackMessage,
+  type ConnectAuthCallbackMessage,
+  type ConnectAuthCallbackMessageParseResult,
+  type ConnectPopupLoginResult,
+} from './popup-login-core.js';
 export {
   normalizeReturnPath,
   type ReturnPathNormalizationResult,

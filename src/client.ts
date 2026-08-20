@@ -59,6 +59,11 @@ import {
   type ConnectPopupSize,
   type ConnectPopupWindow,
 } from './popup-core.js';
+import {
+  getConnectPopupLoginDeadline,
+  parseConnectAuthCallbackMessage,
+  type ConnectPopupLoginResult,
+} from './popup-login-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
 
 export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
@@ -70,10 +75,15 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
    * How hosted action/checkout intents open. `redirect` (default) navigates
    * the current page; `popup` opens a small centered window — the integrator's
    * page stays put and `onIntentSettled` fires when the flow finishes.
-   * Login intents always redirect (the auth callback returns to the page).
+   * `auth.login` always redirects (the auth callback returns to the page);
+   * `auth.loginWithPopup` is the popup counterpart for login.
    */
   display?: 'redirect' | 'popup';
-  popup?: ConnectPopupSize & { open?: ConnectPopupOpener };
+  popup?: ConnectPopupSize & {
+    open?: ConnectPopupOpener;
+    /** Message-event source for popup login; defaults to the window. */
+    messageEvents?: ConnectPopupMessageEvents;
+  };
   /**
    * Popup mode only: called once the intent reaches a terminal status, or with
    * the latest intent state when the user closes the popup early.
@@ -88,6 +98,16 @@ export type ConnectNavigation = {
   assign: (url: string) => void;
 };
 
+export type ConnectPopupMessageEvent = {
+  origin: string;
+  data: unknown;
+};
+
+export type ConnectPopupMessageEvents = {
+  /** Subscribes to `message` events; returns the unsubscribe function. */
+  subscribe: (listener: (event: ConnectPopupMessageEvent) => void) => () => void;
+};
+
 export type ConnectAuthLoginParams = {
   returnPath?: string;
   initiatingOrigin?: string;
@@ -95,6 +115,7 @@ export type ConnectAuthLoginParams = {
 
 export type SuperRareConnectAuthNamespace = {
   login: (params?: ConnectAuthLoginParams) => Promise<ConnectIntentCreation>;
+  loginWithPopup: (params?: ConnectAuthLoginParams) => Promise<ConnectPopupLoginResult>;
   parseCallback: (searchParams: URLSearchParams) => ConnectAuthCallbackParseResult;
   exchangeCallback: (searchParams: URLSearchParams) => Promise<ConnectSession>;
   exchangeCode: (params: ConnectAuthCallbackParams) => Promise<ConnectSession>;
@@ -307,30 +328,151 @@ export function createSuperRareClient(
       sessionId: session.sessionId,
     });
   };
+  const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
+  const startLoginIntent = async (
+    params: ConnectAuthLoginParams,
+  ): Promise<ConnectIntentCreation> => {
+    const requestResult = buildConnectLoginIntentRequest({
+      returnPath: params.returnPath,
+      state: createState(),
+      initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+    });
+    if (!requestResult.ok) {
+      throw new ConnectReturnPathError();
+    }
+
+    const intent = resolveHostedIntent(await createConnectLoginIntent({
+      ...apiOptions,
+      request: requestResult.request,
+    }));
+    writePendingAuthToStorage(storage, pendingAuthStorageKey, {
+      intentId: intent.intentId,
+      state: requestResult.request.state,
+      expiresAt: intent.expiresAt,
+    });
+    return intent;
+  };
+  const completePopupLogin = async (
+    params: ConnectAuthCallbackParams,
+  ): Promise<ConnectPopupLoginResult> => {
+    const session = await exchangeCode(params);
+    // The session is already established; a failed profile lookup must not
+    // turn the login into an error.
+    const user = await getConnectCurrentUser({
+      ...apiOptions,
+      sessionId: session.sessionId,
+    }).catch((): undefined => undefined);
+    return { status: 'authenticated', session, user };
+  };
+  const watchPopupLogin = (input: {
+    popup: ConnectPopupWindow;
+    intent: ConnectIntentCreation;
+    messageEvents: ConnectPopupMessageEvents;
+  }): Promise<ConnectPopupLoginResult> => {
+    const connectOrigin = new URL(input.intent.url).origin;
+    const deadline = getConnectPopupLoginDeadline(input.intent.expiresAt);
+
+    return new Promise<ConnectPopupLoginResult>((resolve, reject) => {
+      let settled = false;
+      // The hosted page closes itself right after posting the callback, so
+      // the close-watcher must stand down once an exchange is in flight.
+      let exchanging = false;
+      let unsubscribe: () => void = () => {};
+      const settle = (finish: () => void): void => {
+        if (settled) return;
+        settled = true;
+        unsubscribe();
+        if (!input.popup.closed) input.popup.close();
+        finish();
+      };
+
+      unsubscribe = input.messageEvents.subscribe((event) => {
+        if (settled || exchanging) return;
+        const parsed = parseConnectAuthCallbackMessage({
+          data: event.data,
+          origin: event.origin,
+          expectedOrigin: connectOrigin,
+        });
+        // Unrelated or foreign-origin messages — keep waiting.
+        if (!parsed.ok) return;
+
+        const verification = verifyConnectAuthCallbackAgainstPending({
+          pendingAuth: readPendingAuthFromStorage(storage, pendingAuthStorageKey),
+          callbackParams: parsed.params,
+        });
+        if (!verification.ok) {
+          settle(() => {
+            reject(new ConnectAuthPendingError(verification.error));
+          });
+          return;
+        }
+
+        exchanging = true;
+        completePopupLogin(parsed.params).then(
+          (result) => {
+            settle(() => {
+              resolve(result);
+            });
+          },
+          (error: unknown) => {
+            settle(() => {
+              reject(toRejectionError(error));
+            });
+          },
+        );
+      });
+
+      const watchPopupClosed = async (): Promise<void> => {
+        while (!settled) {
+          await sleep(POPUP_POLL_INTERVAL_MS);
+          if (settled || exchanging) continue;
+          if (input.popup.closed) {
+            settle(() => {
+              resolve({ status: 'cancelled' });
+            });
+            return;
+          }
+          if (deadline !== undefined && Date.now() >= deadline) {
+            settle(() => {
+              resolve({ status: 'expired' });
+            });
+            return;
+          }
+        }
+      };
+      void watchPopupClosed();
+    });
+  };
 
   return {
     auth: {
       async login(params = {}): Promise<ConnectIntentCreation> {
-        const requestResult = buildConnectLoginIntentRequest({
-          returnPath: params.returnPath,
-          state: createState(),
-          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
-        });
-        if (!requestResult.ok) {
-          throw new ConnectReturnPathError();
-        }
-
-        const intent = resolveHostedIntent(await createConnectLoginIntent({
-          ...apiOptions,
-          request: requestResult.request,
-        }));
-        writePendingAuthToStorage(storage, pendingAuthStorageKey, {
-          intentId: intent.intentId,
-          state: requestResult.request.state,
-          expiresAt: intent.expiresAt,
-        });
+        const intent = await startLoginIntent(params);
         navigation?.assign(intent.url);
         return intent;
+      },
+      async loginWithPopup(params = {}): Promise<ConnectPopupLoginResult> {
+        // The popup must open before the first await to stay inside the user
+        // gesture; it navigates once the intent exists. Without a message
+        // source the callback could never be received, so don't open one.
+        const popup = messageEvents === undefined ? null : openPopupWindow();
+        let intent: ConnectIntentCreation;
+        try {
+          intent = await startLoginIntent(params);
+        } catch (error) {
+          popup?.close();
+          throw error;
+        }
+
+        if (popup === null || messageEvents === undefined) {
+          // Popup blocked: fall back to the redirect login — the pending auth
+          // is stored, so the normal callback exchange completes it.
+          navigation?.assign(intent.url);
+          return { status: 'redirected', intent };
+        }
+
+        popup.location.replace(appendConnectPopupDisplay(intent.url));
+        return await watchPopupLogin({ popup, intent, messageEvents });
       },
       parseCallback: parseConnectAuthCallbackSearchParams,
       async exchangeCallback(searchParams): Promise<ConnectSession> {
@@ -511,6 +653,42 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function readBrowserMessageEvents(): ConnectPopupMessageEvents | undefined {
+  const addEventListener = Reflect.get(globalThis, 'addEventListener');
+  const removeEventListener = Reflect.get(globalThis, 'removeEventListener');
+  if (typeof addEventListener !== 'function' || typeof removeEventListener !== 'function') {
+    return undefined;
+  }
+
+  return {
+    subscribe(listener) {
+      const domListener = (event: unknown): void => {
+        if (isConnectPopupMessageEvent(event)) {
+          listener({ origin: event.origin, data: event.data });
+        }
+      };
+      addEventListener.call(globalThis, 'message', domListener);
+      return () => {
+        removeEventListener.call(globalThis, 'message', domListener);
+      };
+    },
+  };
+}
+
+function isConnectPopupMessageEvent(value: unknown): value is ConnectPopupMessageEvent {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'origin' in value &&
+    typeof value.origin === 'string' &&
+    'data' in value
+  );
+}
+
+function toRejectionError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function readBrowserPopupOpener(): ConnectPopupOpener | undefined {
