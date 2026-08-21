@@ -896,6 +896,92 @@ describe('createSuperRareClient', () => {
     }
   });
 
+  it('refuses to navigate to a non-web intent URL in popup and redirect modes', async () => {
+    // The hosted URL comes from Rare API, but it is the last thing standing
+    // between the SDK and a real navigation: an executable URL must never
+    // reach location.replace or location.assign.
+    const executableIntentResponse = (): Response => jsonResponse({
+      data: {
+        intentId: 'connect_intent_buy',
+        url: 'javascript:alert(1)',
+        expiresAt: '2026-06-22T00:00:00.000Z',
+      },
+    });
+    const buyParams = {
+      target: directListingTarget,
+      expected: { currency: 'ETH', price: '1.2' },
+      returnPath: '/buy/complete',
+    } as const;
+
+    const replacedUrls: string[] = [];
+    const popup: ConnectPopupWindow = {
+      closed: false,
+      close(): void {
+        popup.closed = true;
+      },
+      location: {
+        replace(url: string): void {
+          replacedUrls.push(url);
+        },
+      },
+    };
+    const popupClient = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_popup',
+      display: 'popup',
+      popup: { open: () => popup },
+      fetch: async () => executableIntentResponse(),
+      navigation: false,
+      sessionStorage: false,
+    });
+
+    await expect(popupClient.actions.buy(buyParams)).rejects.toThrow('Invalid Connect intent URL.');
+    expect(replacedUrls).toEqual([]);
+    expect(popup.closed).toBe(true);
+
+    const assignedUrls: string[] = [];
+    const redirectClient = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_redirect',
+      fetch: async () => executableIntentResponse(),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: false,
+    });
+
+    await expect(redirectClient.actions.buy(buyParams)).rejects.toThrow('Invalid Connect intent URL.');
+    expect(assignedUrls).toEqual([]);
+  });
+
+  it('refuses a non-web login intent URL without storing pending auth', async () => {
+    const storage = createMemoryStorage();
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      fetch: async () => jsonResponse({
+        data: {
+          intentId: 'connect_intent_login',
+          url: 'data:text/html,<script>alert(1)</script>',
+          expiresAt: '2027-01-01T00:00:00.000Z',
+        },
+      }),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.login({ returnPath: '/account' })).rejects.toThrow('Invalid Connect intent URL.');
+    expect(assignedUrls).toEqual([]);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
   it('falls back to redirect navigation when the popup is blocked', async () => {
     const assignedUrls: string[] = [];
     const client = createSuperRareClient({

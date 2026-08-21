@@ -303,6 +303,17 @@ export function createSuperRareClient(
       }
     }
   };
+  // Every hosted URL the SDK navigates a window to crosses this guard: the
+  // URL comes from Rare API, but a `javascript:`/`data:` URL reaching
+  // `location.replace`/`assign` would execute, so only web URLs are allowed.
+  const requireNavigableHostedUrl = (url: string): string => {
+    const hostedUrl = resolveConnectHostedUrl(url);
+    if (!hostedUrl.ok) {
+      throw new Error('Invalid Connect intent URL.');
+    }
+
+    return hostedUrl.origin;
+  };
   const startIntent = async (
     requestResult:
       | ReturnType<typeof buildConnectCheckoutIntentRequest>
@@ -326,6 +337,13 @@ export function createSuperRareClient(
         ...apiOptions,
         request: requestResult.request,
       }));
+    } catch (error) {
+      popup?.close();
+      throw error;
+    }
+
+    try {
+      requireNavigableHostedUrl(intent.url);
     } catch (error) {
       popup?.close();
       throw error;
@@ -519,6 +537,9 @@ export function createSuperRareClient(
     auth: {
       async login(params = {}): Promise<ConnectIntentCreation> {
         const { intent, pendingAuth } = await createLoginIntent(params);
+        // Guard before anything is stored, so a rejected URL leaves no
+        // pending record behind.
+        requireNavigableHostedUrl(intent.url);
         persistPendingAuth(pendingAuth);
         navigation?.assign(intent.url);
         return intent;
@@ -558,10 +579,12 @@ export function createSuperRareClient(
           return { status: 'cancelled' };
         }
 
-        const hostedUrl = resolveConnectHostedUrl(intent.url);
-        if (!hostedUrl.ok) {
+        let connectOrigin: string;
+        try {
+          connectOrigin = requireNavigableHostedUrl(intent.url);
+        } catch (error) {
           popup?.close();
-          throw new Error('Invalid Connect intent URL.');
+          throw error;
         }
 
         if (popup === null || messageEvents === undefined) {
@@ -572,7 +595,6 @@ export function createSuperRareClient(
           return { status: 'redirected', intent };
         }
 
-        const connectOrigin = hostedUrl.origin;
         const popupUrl = appendConnectPopupDisplay(intent.url);
         const deadline = getConnectPopupLoginDeadline({
           expiresAt: intent.expiresAt,
