@@ -246,6 +246,23 @@ Call it directly from a click handler so the browser does not block the popup. P
 - `expired` — the login intent expired while the popup was open.
 - `redirected` — the popup was blocked, so the SDK fell back to the redirect login; the callback lands on `returnPath` as in the flow above.
 
+For controlled environments (tests, non-browser hosts), `popup.open` and `popup.messageEvents` let you supply the window opener and the `message`-event source the popup login listens on:
+
+```ts
+createSuperRareClient({
+  popup: {
+    open: (url, target, features) => window.open(url, target, features),
+    messageEvents: {
+      // Must deliver every `message` event as { origin, data }; the returned
+      // function unsubscribes.
+      subscribe: (listener) => { /* ... */ return () => { /* ... */ }; },
+    },
+  },
+});
+```
+
+Both default to the browser's own `window.open` and `window.addEventListener('message', ...)`. When the popup cannot be opened, the SDK falls back to the redirect login — that fallback needs session storage, so `loginWithPopup` throws instead of redirecting when storage is disabled and no popup is available.
+
 Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it also works with `sessionStorage: false` and with overlapping logins), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran in the meantime resolves `cancelled` instead of resurrecting the session.
 
 ## Session And User

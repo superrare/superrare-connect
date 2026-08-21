@@ -1469,6 +1469,212 @@ describe('auth.loginWithPopup', () => {
     }
   });
 
+  it('keeps a newer redirect login\'s pending record when a popup login commits', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const states = ['state_first', 'state_second'];
+    const assignedUrls: string[] = [];
+    let intentCount = 0;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => states.shift() ?? 'state_extra',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        intentCount += 1;
+        const intentId = intentCount === 1 ? 'connect_intent_first' : 'connect_intent_second';
+        return jsonResponse({
+          data: {
+            intentId,
+            url: `https://connect.superrare.test/login?intentId=${intentId}`,
+            expiresAt: '2027-01-01T00:00:00.000Z',
+          },
+        });
+      },
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: storage,
+    });
+
+    const popupPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    // A redirect login starts before the popup callback lands; its pending
+    // record is now the stored one.
+    await client.auth.login({ returnPath: '/account' });
+    expect(assignedUrls).toHaveLength(1);
+
+    emitter.emit({
+      origin: 'https://connect.superrare.test',
+      data: { ...authCallbackMessage, intentId: 'connect_intent_first', state: 'state_first' },
+    });
+    await expect(popupPromise).resolves.toMatchObject({ status: 'authenticated' });
+
+    // The popup commit must not have consumed the redirect login's record.
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBe(JSON.stringify({
+      intentId: 'connect_intent_second',
+      state: 'state_second',
+      expiresAt: '2027-01-01T00:00:00.000Z',
+    }));
+    await expect(client.auth.exchangeCallback(new URLSearchParams({
+      intentId: 'connect_intent_second',
+      state: 'state_second',
+      code: 'connect_auth_code_login',
+    }))).resolves.toMatchObject({ sessionId: 'connect_session_login' });
+  });
+
+  it('drops the login when logout happens before the callback arrives', async () => {
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    client.auth.logout();
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+
+    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+    expect(client.auth.getSession()).toBeUndefined();
+  });
+
+  it('drops the login when logout happens during the profile lookup', async () => {
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    let releaseProfile: (() => void) | undefined;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          await new Promise<void>((resolve) => {
+            releaseProfile = resolve;
+          });
+          return jsonResponse({
+            data: {
+              address: '0x0000000000000000000000000000000000000009',
+              username: 'collector',
+              fullName: null,
+              avatarUri: null,
+            },
+          });
+        }
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(releaseProfile).toBeDefined();
+    });
+
+    client.auth.logout();
+    releaseProfile?.();
+
+    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+    expect(client.auth.getSession()).toBeUndefined();
+  });
+
+  it('opens each popup login in its own named browsing context', async () => {
+    const openedTargets: string[] = [];
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: {
+        open: (_url, target) => {
+          openedTargets.push(target);
+          return createPopupStub();
+        },
+        messageEvents: emitter.messageEvents,
+      },
+      fetch: async () => loginIntentCreationResponse(),
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    void client.auth.loginWithPopup();
+    void client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(openedTargets).toHaveLength(2);
+    });
+
+    expect(new Set(openedTargets).size).toBe(2);
+  });
+
+  it('refuses the redirect fallback when the popup is blocked and storage is disabled', async () => {
+    const emitter = createMessageEmitter();
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => null, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: false,
+    });
+
+    // Redirecting would strand the user: the callback could never verify.
+    await expect(client.auth.loginWithPopup()).rejects.toThrow(
+      'requires session storage',
+    );
+    expect(assignedUrls).toEqual([]);
+  });
+
+  it('releases the popup and pending record when popup navigation throws', async () => {
+    const storage = createMemoryStorage();
+    const emitter = createMessageEmitter();
+    const popup = createPopupStub();
+    popup.location.replace = (): never => {
+      throw new Error('navigation blocked');
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      navigation: false,
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.loginWithPopup()).rejects.toThrow('navigation blocked');
+    expect(popup.closed).toBe(true);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+    expect(emitter.listenerCount()).toBe(0);
+  });
+
   it('releases the popup and pending record when the intent URL is malformed', async () => {
     const storage = createMemoryStorage();
     const popup = createPopupStub();
