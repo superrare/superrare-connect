@@ -3,6 +3,7 @@ import {
   CONNECT_AUTH_CALLBACK_MESSAGE_TYPE,
   getConnectPopupLoginDeadline,
   parseConnectAuthCallbackMessage,
+  resolveConnectHostedUrl,
 } from '../src/popup-login-core.js';
 
 const expectedOrigin = 'https://connect.superrare.test';
@@ -78,5 +79,31 @@ describe('getConnectPopupLoginDeadline', () => {
       now: 1_000,
       fallbackMs: 60_000,
     })).toBe(61_000);
+  });
+});
+
+describe('resolveConnectHostedUrl', () => {
+  it('accepts http and https hosted URLs and reports their origin', () => {
+    expect(resolveConnectHostedUrl('https://connect.superrare.test/login?intentId=a'))
+      .toEqual({ ok: true, origin: 'https://connect.superrare.test' });
+    expect(resolveConnectHostedUrl('http://localhost:5004/login'))
+      .toEqual({ ok: true, origin: 'http://localhost:5004' });
+  });
+
+  it('rejects executable and non-web protocols', () => {
+    for (const url of [
+      'javascript:alert(1)',
+      'data:text/html,<script>alert(1)</script>',
+      'file:///etc/passwd',
+      'about:blank',
+    ]) {
+      expect(resolveConnectHostedUrl(url))
+        .toEqual({ ok: false, error: 'unsupported_protocol' });
+    }
+  });
+
+  it('rejects an unparseable URL', () => {
+    expect(resolveConnectHostedUrl('not a url'))
+      .toEqual({ ok: false, error: 'unparseable' });
   });
 });

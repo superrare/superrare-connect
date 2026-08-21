@@ -108,3 +108,28 @@ export function getConnectPopupLoginDeadline(input: {
   const deadline = Date.parse(input.expiresAt);
   return Number.isNaN(deadline) ? input.now + input.fallbackMs : deadline;
 }
+
+export type ConnectHostedUrlResult =
+  | { ok: true; origin: string }
+  | { ok: false; error: 'unparseable' | 'unsupported_protocol' };
+
+/**
+ * Validates a hosted URL before the SDK navigates a window to it. The URL
+ * comes from Rare API, but this is the last boundary before an actual
+ * navigation, and only web URLs may cross it: a `javascript:` or `data:` URL
+ * would otherwise execute in the opened window.
+ */
+export function resolveConnectHostedUrl(url: string): ConnectHostedUrlResult {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return { ok: false, error: 'unparseable' };
+  }
+
+  if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+    return { ok: false, error: 'unsupported_protocol' };
+  }
+
+  return { ok: true, origin: parsedUrl.origin };
+}

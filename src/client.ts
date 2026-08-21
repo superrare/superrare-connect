@@ -62,6 +62,7 @@ import {
 import {
   getConnectPopupLoginDeadline,
   parseConnectAuthCallbackMessage,
+  resolveConnectHostedUrl,
   type ConnectPopupLoginResult,
 } from './popup-login-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
@@ -205,6 +206,16 @@ export class ConnectSessionRequiredError extends Error {
 const DEFAULT_CONNECT_SESSION_STORAGE_KEY = 'superrare.connect.session';
 const DEFAULT_CONNECT_PENDING_AUTH_STORAGE_KEY = 'superrare.connect.pendingAuth';
 
+/**
+ * Bumped by every session commit or clear, across every client in the page:
+ * an exchange that resolves after the session changed underneath it (logout,
+ * a newer login, another client instance) must not write its result back.
+ * Page-scoped by nature — a logout in a different TAB cannot be observed here.
+ */
+let sessionCommitGeneration = 0;
+/** Popup logins need a unique browsing-context name across all clients. */
+let popupLoginCount = 0;
+
 export function createSuperRareClient(
   options: SuperRareConnectClientOptions = {},
 ): SuperRareConnectClient {
@@ -225,19 +236,21 @@ export function createSuperRareClient(
     }),
   });
   const createState = options.createState ?? createConnectState;
-  // Bumped by every session commit or clear: an exchange that resolves after
-  // the session changed underneath it (logout, a newer login) must not write
-  // its stale result back.
-  let sessionGeneration = 0;
   const commitSession = (session: ConnectSession): void => {
-    sessionGeneration += 1;
+    sessionCommitGeneration += 1;
     writeConnectSessionToStorage(storage, storageKey, session);
     removePendingAuthFromStorage(storage, pendingAuthStorageKey);
     notifySessionListeners(sessionListeners, session);
   };
   const exchangeCode = async (params: ConnectAuthCallbackParams): Promise<ConnectSession> => {
+    const generation = sessionCommitGeneration;
     const session = await exchangeConnectAuthCode(params, apiOptions);
-    commitSession(session);
+    // A login that committed while this exchange was in flight is the newer
+    // one and wins; the exchanged session is still returned to the caller.
+    if (generation === sessionCommitGeneration) {
+      commitSession(session);
+    }
+
     return session;
   };
   const openPopupWindow = (
@@ -339,10 +352,7 @@ export function createSuperRareClient(
     });
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
-  // Each popup login gets its own named browsing context: a shared name would
-  // let a second flow navigate the window out from under the first.
-  let popupLoginCount = 0;
-  const startLoginIntent = async (
+  const createLoginIntent = async (
     params: ConnectAuthLoginParams,
   ): Promise<StartedLoginIntent> => {
     const requestResult = buildConnectLoginIntentRequest({
@@ -358,40 +368,38 @@ export function createSuperRareClient(
       ...apiOptions,
       request: requestResult.request,
     }));
-    const pendingAuth: PendingConnectAuth = {
-      intentId: intent.intentId,
-      state: requestResult.request.state,
-      expiresAt: intent.expiresAt,
+    return {
+      intent,
+      pendingAuth: {
+        intentId: intent.intentId,
+        state: requestResult.request.state,
+        expiresAt: intent.expiresAt,
+      },
     };
-    writePendingAuthToStorage(storage, pendingAuthStorageKey, pendingAuth);
-    return { intent, pendingAuth };
   };
-  // Only the record this operation wrote: a newer login may have replaced it.
-  const removePendingAuthIfOwned = (intentId: string): void => {
-    const storedPendingAuth = readPendingAuthFromStorage(storage, pendingAuthStorageKey);
-    if (storedPendingAuth?.intentId === intentId) {
-      removePendingAuthFromStorage(storage, pendingAuthStorageKey);
-    }
+  // Only a REDIRECT login needs its pending record to survive the navigation.
+  // A popup login verifies its callback against the record it holds in memory,
+  // so it never writes here — the single storage key stays owned by whichever
+  // redirect login is actually in flight.
+  const persistPendingAuth = (pendingAuth: PendingConnectAuth): void => {
+    writePendingAuthToStorage(storage, pendingAuthStorageKey, pendingAuth);
   };
   const completePopupLogin = async (input: {
     params: ConnectAuthCallbackParams;
-    intentId: string;
     operationGeneration: number;
   }): Promise<ConnectPopupLoginResult> => {
     const session = await exchangeConnectAuthCode(input.params, apiOptions);
-    if (input.operationGeneration !== sessionGeneration) {
+    if (input.operationGeneration !== sessionCommitGeneration) {
       // Logout or another login landed since this operation began; the stale
       // session is dropped rather than written over the current state.
       return { status: 'cancelled' };
     }
 
-    // Commit without the redirect path's unconditional pending cleanup: only
-    // this operation's own record may be removed, so a newer redirect login's
-    // pending callback survives.
-    sessionGeneration += 1;
-    const committedGeneration = sessionGeneration;
+    // Commit without the redirect path's pending cleanup: this login never
+    // owned the shared record, so a redirect login's pending callback stands.
+    sessionCommitGeneration += 1;
+    const committedGeneration = sessionCommitGeneration;
     writeConnectSessionToStorage(storage, storageKey, session);
-    removePendingAuthIfOwned(input.intentId);
     notifySessionListeners(sessionListeners, session);
     // The session is already established; a failed profile lookup must not
     // turn the login into an error.
@@ -399,7 +407,7 @@ export function createSuperRareClient(
       ...apiOptions,
       sessionId: session.sessionId,
     }).catch((): undefined => undefined);
-    if (sessionGeneration !== committedGeneration) {
+    if (sessionCommitGeneration !== committedGeneration) {
       // Logged out (or replaced) while the profile was loading — the caller
       // must not be handed this as an active login.
       return { status: 'cancelled' };
@@ -428,14 +436,6 @@ export function createSuperRareClient(
         if (!input.popup.closed) input.popup.close();
         finish();
       };
-      // Every outcome except a committed login releases this operation's
-      // pending record; the redirect fallback never reaches here.
-      const settleWithoutLogin = (finish: () => void): void => {
-        settle(() => {
-          removePendingAuthIfOwned(input.pendingAuth.intentId);
-          finish();
-        });
-      };
 
       unsubscribe = input.messageEvents.subscribe((event) => {
         if (settled || exchanging) return;
@@ -456,14 +456,14 @@ export function createSuperRareClient(
           callbackParams: parsed.params,
         });
         if (!verification.ok) {
-          settleWithoutLogin(() => {
+          settle(() => {
             reject(new ConnectAuthPendingError(verification.error));
           });
           return;
         }
 
         if (Date.now() >= input.deadline) {
-          settleWithoutLogin(() => {
+          settle(() => {
             resolve({ status: 'expired' });
           });
           return;
@@ -472,7 +472,6 @@ export function createSuperRareClient(
         exchanging = true;
         completePopupLogin({
           params: parsed.params,
-          intentId: input.pendingAuth.intentId,
           operationGeneration: input.operationGeneration,
         }).then(
           (result) => {
@@ -483,12 +482,12 @@ export function createSuperRareClient(
               return;
             }
 
-            settleWithoutLogin(() => {
+            settle(() => {
               resolve(result);
             });
           },
           (error: unknown) => {
-            settleWithoutLogin(() => {
+            settle(() => {
               reject(toRejectionError(error));
             });
           },
@@ -500,13 +499,13 @@ export function createSuperRareClient(
           await sleep(POPUP_POLL_INTERVAL_MS);
           if (settled || exchanging) continue;
           if (input.popup.closed) {
-            settleWithoutLogin(() => {
+            settle(() => {
               resolve({ status: 'cancelled' });
             });
             return;
           }
           if (Date.now() >= input.deadline) {
-            settleWithoutLogin(() => {
+            settle(() => {
               resolve({ status: 'expired' });
             });
             return;
@@ -519,14 +518,15 @@ export function createSuperRareClient(
   return {
     auth: {
       async login(params = {}): Promise<ConnectIntentCreation> {
-        const { intent } = await startLoginIntent(params);
+        const { intent, pendingAuth } = await createLoginIntent(params);
+        persistPendingAuth(pendingAuth);
         navigation?.assign(intent.url);
         return intent;
       },
       async loginWithPopup(params = {}): Promise<ConnectPopupLoginResult> {
         // A logout or another login after this point invalidates the whole
         // operation, so its exchange can never resurrect a replaced session.
-        const operationGeneration = sessionGeneration;
+        const operationGeneration = sessionCommitGeneration;
         // The popup must open before the first await to stay inside the user
         // gesture; it navigates once the intent exists. Without a message
         // source the callback could never be received, so don't open one.
@@ -544,33 +544,36 @@ export function createSuperRareClient(
 
         let started: StartedLoginIntent;
         try {
-          started = await startLoginIntent(params);
+          started = await createLoginIntent(params);
         } catch (error) {
           popup?.close();
           throw error;
         }
 
         const { intent, pendingAuth } = started;
+        // Creating the intent is a round trip; a logout during it invalidates
+        // this login before anything is stored or navigated.
+        if (operationGeneration !== sessionCommitGeneration) {
+          popup?.close();
+          return { status: 'cancelled' };
+        }
+
+        const hostedUrl = resolveConnectHostedUrl(intent.url);
+        if (!hostedUrl.ok) {
+          popup?.close();
+          throw new Error('Invalid Connect intent URL.');
+        }
+
         if (popup === null || messageEvents === undefined) {
-          // Popup blocked: fall back to the redirect login — the pending auth
-          // is stored, so the normal callback exchange completes it.
+          // Popup blocked: fall back to the redirect login. Only now is the
+          // pending record stored — it has to survive the navigation.
+          persistPendingAuth(pendingAuth);
           navigation?.assign(intent.url);
           return { status: 'redirected', intent };
         }
 
-        // Nothing may fail between here and the watcher without releasing
-        // the blank popup and this operation's pending record.
-        let connectOrigin: string;
-        let popupUrl: string;
-        try {
-          connectOrigin = new URL(intent.url).origin;
-          popupUrl = appendConnectPopupDisplay(intent.url);
-        } catch (error) {
-          popup.close();
-          removePendingAuthIfOwned(intent.intentId);
-          throw new Error('Invalid Connect intent URL.', { cause: error });
-        }
-
+        const connectOrigin = hostedUrl.origin;
+        const popupUrl = appendConnectPopupDisplay(intent.url);
         const deadline = getConnectPopupLoginDeadline({
           expiresAt: intent.expiresAt,
           now: Date.now(),
@@ -589,9 +592,8 @@ export function createSuperRareClient(
         } catch (error) {
           // The watcher releases its own settlements; this boundary covers a
           // throwing collaborator (navigation, subscription) before the
-          // watcher owns the cleanup. Both cleanups are idempotent.
+          // watcher owns the cleanup. Closing twice is harmless.
           if (!popup.closed) popup.close();
-          removePendingAuthIfOwned(intent.intentId);
           throw error;
         }
       },
@@ -627,7 +629,7 @@ export function createSuperRareClient(
         return await me();
       },
       clearSession(): void {
-        sessionGeneration += 1;
+        sessionCommitGeneration += 1;
         removeConnectSessionFromStorage(storage, storageKey);
         removePendingAuthFromStorage(storage, pendingAuthStorageKey);
         notifySessionListeners(sessionListeners, undefined);
