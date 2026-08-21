@@ -87,10 +87,6 @@ export {
   type ConnectPopupWindow,
 } from './popup-core.js';
 export {
-  CONNECT_AUTH_CALLBACK_MESSAGE_TYPE,
-  parseConnectAuthCallbackMessage,
-  type ConnectAuthCallbackMessage,
-  type ConnectAuthCallbackMessageParseResult,
   type ConnectPopupLoginResult,
 } from './popup-login-core.js';
 export {

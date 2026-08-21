@@ -65,11 +65,18 @@ describe('parseConnectAuthCallbackMessage', () => {
 
 describe('getConnectPopupLoginDeadline', () => {
   it('parses an ISO expiry into epoch milliseconds', () => {
-    expect(getConnectPopupLoginDeadline('2027-01-01T00:00:00.000Z'))
-      .toBe(Date.parse('2027-01-01T00:00:00.000Z'));
+    expect(getConnectPopupLoginDeadline({
+      expiresAt: '2027-01-01T00:00:00.000Z',
+      now: 1_000,
+      fallbackMs: 60_000,
+    })).toBe(Date.parse('2027-01-01T00:00:00.000Z'));
   });
 
-  it('returns no deadline for an unparseable expiry', () => {
-    expect(getConnectPopupLoginDeadline('not-a-date')).toBeUndefined();
+  it('falls back to now plus the fallback window for an unparseable expiry', () => {
+    expect(getConnectPopupLoginDeadline({
+      expiresAt: 'not-a-date',
+      now: 1_000,
+      fallbackMs: 60_000,
+    })).toBe(61_000);
   });
 });

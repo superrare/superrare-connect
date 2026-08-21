@@ -246,7 +246,7 @@ Call it directly from a click handler so the browser does not block the popup. P
 - `expired` — the login intent expired while the popup was open.
 - `redirected` — the popup was blocked, so the SDK fell back to the redirect login; the callback lands on `returnPath` as in the flow above.
 
-Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the pending auth, and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message.
+Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it also works with `sessionStorage: false` and with overlapping logins), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran in the meantime resolves `cancelled` instead of resurrecting the session.
 
 ## Session And User
 

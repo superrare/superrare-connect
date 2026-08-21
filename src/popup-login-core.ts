@@ -97,10 +97,14 @@ export type ConnectPopupLoginResult =
 
 /**
  * Deadline for the popup watcher, in epoch milliseconds. An unparseable
- * `expiresAt` yields no deadline — the watcher then only ends on completion
- * or on the popup closing.
+ * `expiresAt` falls back to `now + fallbackMs`, so the watcher always has a
+ * deterministic end instead of waiting on the user to close the popup.
  */
-export function getConnectPopupLoginDeadline(expiresAt: string): number | undefined {
-  const deadline = Date.parse(expiresAt);
-  return Number.isNaN(deadline) ? undefined : deadline;
+export function getConnectPopupLoginDeadline(input: {
+  expiresAt: string;
+  now: number;
+  fallbackMs: number;
+}): number {
+  const deadline = Date.parse(input.expiresAt);
+  return Number.isNaN(deadline) ? input.now + input.fallbackMs : deadline;
 }

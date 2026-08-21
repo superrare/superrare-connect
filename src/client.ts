@@ -225,11 +225,19 @@ export function createSuperRareClient(
     }),
   });
   const createState = options.createState ?? createConnectState;
-  const exchangeCode = async (params: ConnectAuthCallbackParams): Promise<ConnectSession> => {
-    const session = await exchangeConnectAuthCode(params, apiOptions);
+  // Bumped by every session commit or clear: an exchange that resolves after
+  // the session changed underneath it (logout, a newer login) must not write
+  // its stale result back.
+  let sessionGeneration = 0;
+  const commitSession = (session: ConnectSession): void => {
+    sessionGeneration += 1;
     writeConnectSessionToStorage(storage, storageKey, session);
     removePendingAuthFromStorage(storage, pendingAuthStorageKey);
     notifySessionListeners(sessionListeners, session);
+  };
+  const exchangeCode = async (params: ConnectAuthCallbackParams): Promise<ConnectSession> => {
+    const session = await exchangeConnectAuthCode(params, apiOptions);
+    commitSession(session);
     return session;
   };
   const openPopupWindow = (): ConnectPopupWindow | null => {
@@ -331,7 +339,7 @@ export function createSuperRareClient(
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
   const startLoginIntent = async (
     params: ConnectAuthLoginParams,
-  ): Promise<ConnectIntentCreation> => {
+  ): Promise<StartedLoginIntent> => {
     const requestResult = buildConnectLoginIntentRequest({
       returnPath: params.returnPath,
       state: createState(),
@@ -345,17 +353,33 @@ export function createSuperRareClient(
       ...apiOptions,
       request: requestResult.request,
     }));
-    writePendingAuthToStorage(storage, pendingAuthStorageKey, {
+    const pendingAuth: PendingConnectAuth = {
       intentId: intent.intentId,
       state: requestResult.request.state,
       expiresAt: intent.expiresAt,
-    });
-    return intent;
+    };
+    writePendingAuthToStorage(storage, pendingAuthStorageKey, pendingAuth);
+    return { intent, pendingAuth };
+  };
+  // Only the record this operation wrote: a newer login may have replaced it.
+  const removePendingAuthIfOwned = (intentId: string): void => {
+    const storedPendingAuth = readPendingAuthFromStorage(storage, pendingAuthStorageKey);
+    if (storedPendingAuth?.intentId === intentId) {
+      removePendingAuthFromStorage(storage, pendingAuthStorageKey);
+    }
   };
   const completePopupLogin = async (
     params: ConnectAuthCallbackParams,
   ): Promise<ConnectPopupLoginResult> => {
-    const session = await exchangeCode(params);
+    const generation = sessionGeneration;
+    const session = await exchangeConnectAuthCode(params, apiOptions);
+    if (generation !== sessionGeneration) {
+      // Logout or a newer login landed while the exchange was in flight; the
+      // stale session is dropped rather than written over the current state.
+      return { status: 'cancelled' };
+    }
+
+    commitSession(session);
     // The session is already established; a failed profile lookup must not
     // turn the login into an error.
     const user = await getConnectCurrentUser({
@@ -366,13 +390,12 @@ export function createSuperRareClient(
   };
   const watchPopupLogin = (input: {
     popup: ConnectPopupWindow;
-    intent: ConnectIntentCreation;
+    pendingAuth: PendingConnectAuth;
     messageEvents: ConnectPopupMessageEvents;
-  }): Promise<ConnectPopupLoginResult> => {
-    const connectOrigin = new URL(input.intent.url).origin;
-    const deadline = getConnectPopupLoginDeadline(input.intent.expiresAt);
-
-    return new Promise<ConnectPopupLoginResult>((resolve, reject) => {
+    connectOrigin: string;
+    deadline: number;
+  }): Promise<ConnectPopupLoginResult> =>
+    new Promise<ConnectPopupLoginResult>((resolve, reject) => {
       let settled = false;
       // The hosted page closes itself right after posting the callback, so
       // the close-watcher must stand down once an exchange is in flight.
@@ -385,24 +408,43 @@ export function createSuperRareClient(
         if (!input.popup.closed) input.popup.close();
         finish();
       };
+      // Every outcome except a committed login releases this operation's
+      // pending record; the redirect fallback never reaches here.
+      const settleWithoutLogin = (finish: () => void): void => {
+        settle(() => {
+          removePendingAuthIfOwned(input.pendingAuth.intentId);
+          finish();
+        });
+      };
 
       unsubscribe = input.messageEvents.subscribe((event) => {
         if (settled || exchanging) return;
         const parsed = parseConnectAuthCallbackMessage({
           data: event.data,
           origin: event.origin,
-          expectedOrigin: connectOrigin,
+          expectedOrigin: input.connectOrigin,
         });
-        // Unrelated or foreign-origin messages — keep waiting.
-        if (!parsed.ok) return;
+        // Unrelated or foreign-origin messages — keep waiting. So is a
+        // callback for another intent: with overlapping logins it belongs to
+        // a sibling operation, not to this one.
+        if (!parsed.ok || parsed.params.intentId !== input.pendingAuth.intentId) return;
 
+        // Verified against this operation's own record, so storage-disabled
+        // clients and overlapping logins cannot confuse it.
         const verification = verifyConnectAuthCallbackAgainstPending({
-          pendingAuth: readPendingAuthFromStorage(storage, pendingAuthStorageKey),
+          pendingAuth: input.pendingAuth,
           callbackParams: parsed.params,
         });
         if (!verification.ok) {
-          settle(() => {
+          settleWithoutLogin(() => {
             reject(new ConnectAuthPendingError(verification.error));
+          });
+          return;
+        }
+
+        if (Date.now() >= input.deadline) {
+          settleWithoutLogin(() => {
+            resolve({ status: 'expired' });
           });
           return;
         }
@@ -410,12 +452,19 @@ export function createSuperRareClient(
         exchanging = true;
         completePopupLogin(parsed.params).then(
           (result) => {
-            settle(() => {
+            if (result.status === 'authenticated') {
+              settle(() => {
+                resolve(result);
+              });
+              return;
+            }
+
+            settleWithoutLogin(() => {
               resolve(result);
             });
           },
           (error: unknown) => {
-            settle(() => {
+            settleWithoutLogin(() => {
               reject(toRejectionError(error));
             });
           },
@@ -427,13 +476,13 @@ export function createSuperRareClient(
           await sleep(POPUP_POLL_INTERVAL_MS);
           if (settled || exchanging) continue;
           if (input.popup.closed) {
-            settle(() => {
+            settleWithoutLogin(() => {
               resolve({ status: 'cancelled' });
             });
             return;
           }
-          if (deadline !== undefined && Date.now() >= deadline) {
-            settle(() => {
+          if (Date.now() >= input.deadline) {
+            settleWithoutLogin(() => {
               resolve({ status: 'expired' });
             });
             return;
@@ -442,12 +491,11 @@ export function createSuperRareClient(
       };
       void watchPopupClosed();
     });
-  };
 
   return {
     auth: {
       async login(params = {}): Promise<ConnectIntentCreation> {
-        const intent = await startLoginIntent(params);
+        const { intent } = await startLoginIntent(params);
         navigation?.assign(intent.url);
         return intent;
       },
@@ -456,14 +504,15 @@ export function createSuperRareClient(
         // gesture; it navigates once the intent exists. Without a message
         // source the callback could never be received, so don't open one.
         const popup = messageEvents === undefined ? null : openPopupWindow();
-        let intent: ConnectIntentCreation;
+        let started: StartedLoginIntent;
         try {
-          intent = await startLoginIntent(params);
+          started = await startLoginIntent(params);
         } catch (error) {
           popup?.close();
           throw error;
         }
 
+        const { intent, pendingAuth } = started;
         if (popup === null || messageEvents === undefined) {
           // Popup blocked: fall back to the redirect login — the pending auth
           // is stored, so the normal callback exchange completes it.
@@ -471,8 +520,32 @@ export function createSuperRareClient(
           return { status: 'redirected', intent };
         }
 
-        popup.location.replace(appendConnectPopupDisplay(intent.url));
-        return await watchPopupLogin({ popup, intent, messageEvents });
+        // Nothing may fail between here and the watcher without releasing
+        // the blank popup and this operation's pending record.
+        let connectOrigin: string;
+        let popupUrl: string;
+        try {
+          connectOrigin = new URL(intent.url).origin;
+          popupUrl = appendConnectPopupDisplay(intent.url);
+        } catch (error) {
+          popup.close();
+          removePendingAuthIfOwned(intent.intentId);
+          throw new Error('Invalid Connect intent URL.', { cause: error });
+        }
+
+        const deadline = getConnectPopupLoginDeadline({
+          expiresAt: intent.expiresAt,
+          now: Date.now(),
+          fallbackMs: POPUP_LOGIN_FALLBACK_TIMEOUT_MS,
+        });
+        popup.location.replace(popupUrl);
+        return await watchPopupLogin({
+          popup,
+          pendingAuth,
+          messageEvents,
+          connectOrigin,
+          deadline,
+        });
       },
       parseCallback: parseConnectAuthCallbackSearchParams,
       async exchangeCallback(searchParams): Promise<ConnectSession> {
@@ -506,6 +579,7 @@ export function createSuperRareClient(
         return await me();
       },
       clearSession(): void {
+        sessionGeneration += 1;
         removeConnectSessionFromStorage(storage, storageKey);
         removePendingAuthFromStorage(storage, pendingAuthStorageKey);
         notifySessionListeners(sessionListeners, undefined);
@@ -648,6 +722,13 @@ function readBrowserNavigation(): ConnectNavigation | undefined {
 }
 
 const POPUP_POLL_INTERVAL_MS = 2000;
+/** Deadline for a popup login whose intent carries an unparseable expiry. */
+const POPUP_LOGIN_FALLBACK_TIMEOUT_MS = 15 * 60_000;
+
+type StartedLoginIntent = {
+  intent: ConnectIntentCreation;
+  pendingAuth: PendingConnectAuth;
+};
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
