@@ -1474,6 +1474,82 @@ describe('auth.loginWithPopup', () => {
     }
   });
 
+  it('cancels when the popup is closed while the intent is still being created', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        // The intent request never settles: nothing else can end this login.
+        fetch: async () => await new Promise<Response>(() => {}),
+        navigation: false,
+        sessionStorage: storage,
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      await vi.advanceTimersByTimeAsync(0);
+      // Closed before the login watcher exists — the gap this covers.
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+      expect(popup.replacedUrls).toEqual([]);
+      expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forwards an abort signal to every request the caller waits on', async () => {
+    // The timeouts are only real if the signal actually reaches fetch.
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const signalsByPath = new Map<string, AbortSignal | null | undefined>();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        signalsByPath.set(new URL(request.url).pathname, init?.signal);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({
+            data: {
+              address: '0x0000000000000000000000000000000000000009',
+              username: 'collector',
+              fullName: null,
+              avatarUri: null,
+            },
+          });
+        }
+
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+
+    for (const path of [
+      '/v1/connect/intents',
+      '/v1/connect/auth/exchange',
+      '/v1/connect/users/me',
+    ]) {
+      expect(signalsByPath.get(path)).toBeInstanceOf(AbortSignal);
+    }
+  });
+
   it('times out a completion the backend never answers', async () => {
     vi.useFakeTimers();
     try {

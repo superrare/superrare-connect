@@ -373,6 +373,9 @@ export function createSuperRareClient(
   let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
   const createLoginIntent = async (
     params: ConnectAuthLoginParams,
+    // Not `options`: that name belongs to the client options this closure
+    // reads for initiatingOrigin.
+    intentOptions: { signal?: AbortSignal } = {},
   ): Promise<StartedLoginIntent> => {
     const requestResult = buildConnectLoginIntentRequest({
       returnPath: params.returnPath,
@@ -386,6 +389,7 @@ export function createSuperRareClient(
     const intent = resolveHostedIntent(await createConnectLoginIntent({
       ...apiOptions,
       request: requestResult.request,
+      signal: intentOptions.signal,
     }));
     return {
       intent,
@@ -444,6 +448,20 @@ export function createSuperRareClient(
     }
 
     return { status: 'authenticated', session, user };
+  };
+  // Nothing watches the popup while its intent is being created, so a window
+  // closed during that gap would leave the caller unanswered. This covers it.
+  const watchPopupDismissal = async (
+    popup: ConnectPopupWindow,
+    isSettled: () => boolean,
+  ): Promise<'dismissed' | 'settled'> => {
+    while (!isSettled()) {
+      await sleep(POPUP_POLL_INTERVAL_MS);
+      if (isSettled()) break;
+      if (popup.closed) return 'dismissed';
+    }
+
+    return 'settled';
   };
   const watchPopupLogin = (input: {
     popup: ConnectPopupWindow;
@@ -594,9 +612,30 @@ export function createSuperRareClient(
           );
         }
 
+        let creationSettled = false;
+        const creation = createLoginIntent(params, {
+          signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
+        }).finally(() => {
+          creationSettled = true;
+        });
+
         let started: StartedLoginIntent;
         try {
-          started = await createLoginIntent(params);
+          const raced = popup === null
+            ? { created: await creation }
+            : await Promise.race([
+              creation.then((created) => ({ created })),
+              watchPopupDismissal(popup, () => creationSettled).then(
+                (dismissal) => ({ dismissal }),
+              ),
+            ]);
+
+          if ('dismissal' in raced && raced.dismissal === 'dismissed') {
+            popup?.close();
+            return { status: 'cancelled' };
+          }
+
+          started = 'created' in raced ? raced.created : await creation;
         } catch (error) {
           popup?.close();
           throw error;
@@ -654,7 +693,9 @@ export function createSuperRareClient(
   return {
     auth: {
       async login(params = {}): Promise<ConnectIntentCreation> {
-        const { intent, pendingAuth } = await createLoginIntent(params);
+        const { intent, pendingAuth } = await createLoginIntent(params, {
+          signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
+        });
         // Guard before anything is stored, so a rejected URL leaves no
         // pending record behind.
         requireNavigableHostedUrl(intent.url);
@@ -857,6 +898,12 @@ const POPUP_LOGIN_FALLBACK_TIMEOUT_MS = 15 * 60_000;
  * from a hang.
  */
 const POPUP_LOGIN_COMPLETION_TIMEOUT_MS = 20_000;
+/**
+ * Creating the intent is the one call the caller waits on before anything is
+ * watching, so it is bounded too — generously, since it happens before the
+ * user has invested anything in the flow.
+ */
+const LOGIN_INTENT_TIMEOUT_MS = 30_000;
 
 /** `AbortSignal.timeout` where the browser has it; undefined elsewhere. */
 const createRequestTimeoutSignal = (

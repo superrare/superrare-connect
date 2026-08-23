@@ -172,6 +172,7 @@ const getConnectCheckoutStatusResponseSchema = z.object({
 
 export async function createConnectIntent(input: {
   request: CreateConnectIntentRequest;
+  signal?: AbortSignal;
 } & ConnectAuthApiOptions): Promise<ConnectIntentCreation> {
   const body = await requestConnectApiJson({
     path: connectIntentsPath,
@@ -179,6 +180,7 @@ export async function createConnectIntent(input: {
     apiUrl: input.apiUrl,
     fetch: input.fetch,
     body: input.request,
+    signal: input.signal,
   });
   const parsedResponse = createConnectIntentResponseSchema.safeParse(body);
   if (!parsedResponse.success) {
@@ -190,6 +192,7 @@ export async function createConnectIntent(input: {
 
 export async function createConnectLoginIntent(input: {
   request: CreateConnectLoginIntentRequest;
+  signal?: AbortSignal;
 } & ConnectAuthApiOptions): Promise<ConnectIntentCreation> {
   return await createConnectIntent(input);
 }
