@@ -3,10 +3,13 @@ export {
   ConnectAuthPendingError,
   ConnectReturnPathError,
   ConnectSessionRequiredError,
+  ConnectSessionSupersededError,
   createSuperRareClient,
   type SuperRareConnectActionsNamespace,
   type ConnectAuthLoginParams,
   type ConnectNavigation,
+  type ConnectPopupMessageEvent,
+  type ConnectPopupMessageEvents,
   type ConnectSessionChangeCallback,
   type SuperRareConnectAuthNamespace,
   type SuperRareConnectCheckoutNamespace,
@@ -84,6 +87,9 @@ export {
   type ConnectPopupSize,
   type ConnectPopupWindow,
 } from './popup-core.js';
+export {
+  type ConnectPopupLoginResult,
+} from './popup-login-core.js';
 export {
   normalizeReturnPath,
   type ReturnPathNormalizationResult,

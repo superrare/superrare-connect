@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ConnectAuthCallbackError,
   ConnectAuthPendingError,
+  ConnectSessionSupersededError,
   createSuperRareClient,
   type ConnectNavigation,
 } from '../src/client.js';
@@ -896,6 +897,92 @@ describe('createSuperRareClient', () => {
     }
   });
 
+  it('refuses to navigate to a non-web intent URL in popup and redirect modes', async () => {
+    // The hosted URL comes from Rare API, but it is the last thing standing
+    // between the SDK and a real navigation: an executable URL must never
+    // reach location.replace or location.assign.
+    const executableIntentResponse = (): Response => jsonResponse({
+      data: {
+        intentId: 'connect_intent_buy',
+        url: 'javascript:alert(1)',
+        expiresAt: '2026-06-22T00:00:00.000Z',
+      },
+    });
+    const buyParams = {
+      target: directListingTarget,
+      expected: { currency: 'ETH', price: '1.2' },
+      returnPath: '/buy/complete',
+    } as const;
+
+    const replacedUrls: string[] = [];
+    const popup: ConnectPopupWindow = {
+      closed: false,
+      close(): void {
+        popup.closed = true;
+      },
+      location: {
+        replace(url: string): void {
+          replacedUrls.push(url);
+        },
+      },
+    };
+    const popupClient = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_popup',
+      display: 'popup',
+      popup: { open: () => popup },
+      fetch: async () => executableIntentResponse(),
+      navigation: false,
+      sessionStorage: false,
+    });
+
+    await expect(popupClient.actions.buy(buyParams)).rejects.toThrow('Invalid Connect intent URL');
+    expect(replacedUrls).toEqual([]);
+    expect(popup.closed).toBe(true);
+
+    const assignedUrls: string[] = [];
+    const redirectClient = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_redirect',
+      fetch: async () => executableIntentResponse(),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: false,
+    });
+
+    await expect(redirectClient.actions.buy(buyParams)).rejects.toThrow('Invalid Connect intent URL');
+    expect(assignedUrls).toEqual([]);
+  });
+
+  it('refuses a non-web login intent URL without storing pending auth', async () => {
+    const storage = createMemoryStorage();
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      fetch: async () => jsonResponse({
+        data: {
+          intentId: 'connect_intent_login',
+          url: 'data:text/html,<script>alert(1)</script>',
+          expiresAt: '2027-01-01T00:00:00.000Z',
+        },
+      }),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.login({ returnPath: '/account' })).rejects.toThrow('Invalid Connect intent URL');
+    expect(assignedUrls).toEqual([]);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
   it('falls back to redirect navigation when the popup is blocked', async () => {
     const assignedUrls: string[] = [];
     const client = createSuperRareClient({
@@ -921,6 +1008,1419 @@ describe('createSuperRareClient', () => {
     expect(assignedUrls).toEqual([
       'https://connect.superrare.test/intents/connect_intent_buy',
     ]);
+  });
+});
+
+describe('auth.loginWithPopup', () => {
+  type EmittedMessage = { origin: string; data: unknown };
+
+  function createMessageEmitter(): {
+    messageEvents: { subscribe: (listener: (event: EmittedMessage) => void) => () => void };
+    emit: (event: EmittedMessage) => void;
+    listenerCount: () => number;
+  } {
+    const listeners = new Set<(event: EmittedMessage) => void>();
+
+    return {
+      messageEvents: {
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
+        },
+      },
+      emit(event) {
+        listeners.forEach((listener) => {
+          listener(event);
+        });
+      },
+      listenerCount: () => listeners.size,
+    };
+  }
+
+  function createPopupStub(): ConnectPopupWindow & { replacedUrls: string[] } {
+    const replacedUrls: string[] = [];
+    const popup = {
+      closed: false,
+      replacedUrls,
+      close(): void {
+        popup.closed = true;
+      },
+      location: {
+        replace(url: string): void {
+          replacedUrls.push(url);
+        },
+      },
+    };
+    return popup;
+  }
+
+  // Relative to the clock so real-timer tests never expire a login on a fixed
+  // future date (the deadline logic compares expiresAt against Date.now()).
+  const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
+
+  function loginIntentCreationResponse(): Response {
+    return jsonResponse({
+      data: {
+        intentId: 'connect_intent_login',
+        url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+        expiresAt: futureExpiry(),
+      },
+    });
+  }
+
+  it('exchanges the posted callback, stores the session, and resolves with the user', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const requestedPaths: string[] = [];
+    const sessionChanges: Array<string | undefined> = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestedPaths.push(new URL(request.url).pathname);
+
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          expect(await request.json()).toEqual({
+            intentId: 'connect_intent_login',
+            state: 'state_login',
+            code: 'connect_auth_code_login',
+          });
+          return jsonResponse({
+            data: {
+              session: {
+                sessionId: 'connect_session_login',
+                userId: 'user_login',
+                address: '0x0000000000000000000000000000000000000009',
+                expiresAt: '2027-01-01T00:00:00.000Z',
+              },
+            },
+          });
+        }
+
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          expect(request.headers.get('Authorization')).toBe('Bearer connect_session_login');
+          return jsonResponse({
+            data: {
+              address: '0x0000000000000000000000000000000000000009',
+              username: 'collector',
+              fullName: 'Collector One',
+              avatarUri: null,
+            },
+          });
+        }
+
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: storage,
+    });
+    client.auth.onChange((session) => {
+      sessionChanges.push(session?.sessionId);
+    });
+
+    const resultPromise = client.auth.loginWithPopup({ returnPath: '/auth/callback' });
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    expect(popup.replacedUrls).toEqual([
+      'https://connect.superrare.test/login?intentId=connect_intent_login&display=popup',
+    ]);
+
+    // Foreign-origin and unrelated messages are ignored.
+    emitter.emit({
+      origin: 'https://evil.test',
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_login',
+        code: 'stolen',
+      },
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: { type: 'other' } });
+
+    emitter.emit({
+      origin: 'https://connect.superrare.test',
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_login',
+        code: 'connect_auth_code_login',
+      },
+    });
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    if (result.status !== 'authenticated') throw new Error('unreachable');
+    expect(result.session.sessionId).toBe('connect_session_login');
+    expect(result.session.address).toBe('0x0000000000000000000000000000000000000009');
+    expect(result.user?.username).toBe('collector');
+    expect(popup.closed).toBe(true);
+    expect(emitter.listenerCount()).toBe(0);
+    expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+    expect(sessionChanges).toEqual(['connect_session_login']);
+    expect(requestedPaths).toEqual([
+      '/v1/connect/intents',
+      '/v1/connect/auth/exchange',
+      '/v1/connect/users/me',
+    ]);
+  });
+
+  it('still resolves authenticated when the profile lookup fails', async () => {
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          return jsonResponse({
+            data: {
+              session: {
+                sessionId: 'connect_session_login',
+                userId: 'user_login',
+                address: '0x0000000000000000000000000000000000000009',
+                expiresAt: '2027-01-01T00:00:00.000Z',
+              },
+            },
+          });
+        }
+
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'boom' }, { status: 500 });
+        }
+
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({
+      origin: 'https://connect.superrare.test',
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_login',
+        code: 'connect_auth_code_login',
+      },
+    });
+
+    const result = await resultPromise;
+    expect(result).toMatchObject({ status: 'authenticated', user: undefined });
+  });
+
+  it('resolves cancelled when the popup is closed before completing', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async () => loginIntentCreationResponse(),
+        navigation: false,
+        sessionStorage: storage,
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
+      // A popup login verifies against its own in-memory record, so it never
+      // writes the shared key that redirect logins own.
+      expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+      expect(emitter.listenerCount()).toBe(0);
+      // A cancelled popup releases its pending record: nothing can complete it.
+      expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolves expired once the login intent deadline passes with no callback', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
+    try {
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async () => jsonResponse({
+          data: {
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            // Four seconds out, so the watcher's 2s poll passes it.
+            expiresAt: '2026-06-01T00:00:04.000Z',
+          },
+        }),
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
+      // No callback ever arrives; the deadline passes and the watcher closes.
+      await vi.advanceTimersByTimeAsync(6000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'expired' });
+      expect(popup.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects and closes the popup when the callback does not match the pending auth', async () => {
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({
+      origin: 'https://connect.superrare.test',
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_other',
+        code: 'connect_auth_code_login',
+      },
+    });
+
+    await expect(resultPromise).rejects.toMatchObject({ code: 'state_mismatch' });
+    expect(popup.closed).toBe(true);
+    expect(emitter.listenerCount()).toBe(0);
+  });
+
+  it('falls back to redirect login when the popup is blocked', async () => {
+    const emitter = createMessageEmitter();
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => null, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const result = await client.auth.loginWithPopup();
+    expect(result).toMatchObject({
+      status: 'redirected',
+      intent: { intentId: 'connect_intent_login' },
+    });
+    expect(assignedUrls).toEqual([
+      'https://connect.superrare.test/login?intentId=connect_intent_login',
+    ]);
+  });
+
+  const authCallbackMessage = {
+    type: 'superrare-connect:auth-callback',
+    intentId: 'connect_intent_login',
+    state: 'state_login',
+    code: 'connect_auth_code_login',
+  };
+
+  const sessionResponse = (): Response => jsonResponse({
+    data: {
+      session: {
+        sessionId: 'connect_session_login',
+        userId: 'user_login',
+        address: '0x0000000000000000000000000000000000000009',
+        expiresAt: '2027-01-01T00:00:00.000Z',
+      },
+    },
+  });
+
+  it('completes with browser storage disabled by verifying the callback against its own pending record', async () => {
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: false,
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: 'authenticated',
+      session: { sessionId: 'connect_session_login' },
+    });
+  });
+
+  it('joins the login already in flight instead of starting a second one', async () => {
+    // The SDK holds a single session, so two concurrent logins could only
+    // race for the same slot. A second call joins the first.
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const openedTargets: string[] = [];
+    let intentRequests = 0;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: {
+        open: (_url, target) => {
+          openedTargets.push(target);
+          return popup;
+        },
+        messageEvents: emitter.messageEvents,
+      },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        intentRequests += 1;
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const firstPromise = client.auth.loginWithPopup();
+    const secondPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+
+    // One window, one intent — the second call opened nothing.
+    expect(openedTargets).toHaveLength(1);
+    expect(intentRequests).toBe(1);
+
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    const [firstResult, secondResult] = await Promise.all([firstPromise, secondPromise]);
+    expect(firstResult).toMatchObject({ status: 'authenticated' });
+    expect(secondResult).toBe(firstResult);
+  });
+
+  it('releases the in-flight login once it settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const emitter = createMessageEmitter();
+      const popups: Array<ReturnType<typeof createPopupStub>> = [];
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: {
+          open: () => {
+            const openedPopup = createPopupStub();
+            popups.push(openedPopup);
+            return openedPopup;
+          },
+          messageEvents: emitter.messageEvents,
+        },
+        fetch: async () => loginIntentCreationResponse(),
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
+
+      const closePopupAt = (index: number): void => {
+        const openedPopup = popups[index];
+        if (openedPopup === undefined) {
+          throw new Error(`expected a popup at index ${index}`);
+        }
+        openedPopup.closed = true;
+      };
+
+      const firstPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(popups).toHaveLength(1);
+      });
+      closePopupAt(0);
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(firstPromise).resolves.toEqual({ status: 'cancelled' });
+
+      // The lock is gone: a later login starts its own window.
+      const secondPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(popups).toHaveLength(2);
+      });
+      closePopupAt(1);
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels when the popup is closed while the intent is still being created', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        // The intent request never settles: nothing else can end this login.
+        fetch: async () => await new Promise<Response>(() => {}),
+        navigation: false,
+        sessionStorage: storage,
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      await vi.advanceTimersByTimeAsync(0);
+      // Closed before the login watcher exists — the gap this covers.
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+      expect(popup.replacedUrls).toEqual([]);
+      expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forwards an abort signal to every request the caller waits on', async () => {
+    // The timeouts are only real if the signal actually reaches fetch.
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const signalsByPath = new Map<string, AbortSignal | null | undefined>();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        signalsByPath.set(new URL(request.url).pathname, init?.signal);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({
+            data: {
+              address: '0x0000000000000000000000000000000000000009',
+              username: 'collector',
+              fullName: null,
+              avatarUri: null,
+            },
+          });
+        }
+
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+
+    for (const path of [
+      '/v1/connect/intents',
+      '/v1/connect/auth/exchange',
+      '/v1/connect/users/me',
+    ]) {
+      expect(signalsByPath.get(path)).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('times out a completion the backend never answers', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const sessionChanges: Array<string | undefined> = [];
+      let releaseExchange: (() => void) | undefined;
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/exchange')) {
+            await new Promise<void>((resolve) => {
+              releaseExchange = resolve;
+            });
+            return sessionResponse();
+          }
+
+          return loginIntentCreationResponse();
+        },
+        navigation: false,
+        sessionStorage: storage,
+      });
+      client.auth.onChange((session) => {
+        sessionChanges.push(session?.sessionId);
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      // Capture the outcome now: the rejection lands while the test is still
+      // advancing timers, and an unobserved rejection is reported as an
+      // unhandled error. Real callers await the call immediately.
+      const outcome = resultPromise.catch((error: unknown) => error);
+      // Advance rather than vi.waitFor: with fake timers, waitFor polls on a
+      // faked timer nobody is advancing and deadlocks.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(popup.replacedUrls).toHaveLength(1);
+
+      emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(releaseExchange).toBeDefined();
+
+      // The hosted window already closed itself, so only the clock can end
+      // this: without it the caller would wait forever.
+      await vi.advanceTimersByTimeAsync(21_000);
+      await expect(outcome).resolves.toMatchObject({
+        message: 'Timed out completing the Connect login.',
+      });
+
+      // A response that lands after the timeout must not write a session.
+      releaseExchange?.();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(client.auth.getSession()).toBeUndefined();
+      expect(sessionChanges).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops a stale exchange when the session changed while it was in flight', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    let releaseExchange: (() => void) | undefined;
+    const sessionChanges: Array<string | undefined> = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          await new Promise<void>((resolve) => {
+            releaseExchange = resolve;
+          });
+          return sessionResponse();
+        }
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: storage,
+    });
+    client.auth.onChange((session) => {
+      sessionChanges.push(session?.sessionId);
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(releaseExchange).toBeDefined();
+    });
+
+    // The user logs out while the exchange is still pending.
+    client.auth.logout();
+    releaseExchange?.();
+
+    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+    expect(client.auth.getSession()).toBeUndefined();
+    expect(sessionChanges).toEqual([undefined]);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
+  it('does not let one client instance suppress another client\'s in-flight exchange', async () => {
+    // Two clients with independent session storage are independent sessions; a
+    // logout on one must not drop an exchange committing on the other. The
+    // exchange is the shared code path (popup and redirect both use it).
+    let releaseExchangeB: (() => void) | undefined;
+    const storageB = createMemoryStorage();
+    storageB.setItem('sr.b.pending', JSON.stringify({
+      intentId: 'connect_intent_login',
+      state: 'state_login',
+      expiresAt: '2027-01-01T00:00:00.000Z',
+    }));
+    const buildClient = (
+      key: string,
+      storage: ConnectSessionStorage,
+      hangExchange: boolean,
+    ): ReturnType<typeof createSuperRareClient> =>
+      createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/exchange')) {
+            if (hangExchange) {
+              await new Promise<void>((resolve) => {
+                releaseExchangeB = resolve;
+              });
+            }
+            return sessionResponse();
+          }
+          return loginIntentCreationResponse();
+        },
+        navigation: false,
+        sessionStorageKey: key,
+        pendingAuthStorageKey: `${key}.pending`,
+        sessionStorage: storage,
+      });
+
+    const clientA = buildClient('sr.a', createMemoryStorage(), false);
+    const clientB = buildClient('sr.b', storageB, true);
+
+    // B's exchange is in flight and hangs.
+    const bPromise = clientB.auth.exchangeCallback(new URLSearchParams({
+      intentId: 'connect_intent_login',
+      state: 'state_login',
+      code: 'connect_auth_code_login',
+    }));
+    await vi.waitFor(() => {
+      expect(releaseExchangeB).toBeDefined();
+    });
+
+    // A commits and clears its own session — moving A's generation, not B's.
+    clientA.auth.logout();
+
+    // B's exchange finally resolves: it must still commit its own session.
+    releaseExchangeB?.();
+    await expect(bPromise).resolves.toMatchObject({ sessionId: 'connect_session_login' });
+    expect(clientB.auth.getSession()?.sessionId).toBe('connect_session_login');
+  });
+
+  it('delivers and unsubscribes through the default browser message adapter', async () => {
+    // Every other popup test injects a fake messageEvents; this one exercises
+    // the real globalThis.addEventListener/removeEventListener adapter.
+    const listeners = new Map<string, (event: unknown) => void>();
+    const addEventListener = vi.fn((type: string, handler: (event: unknown) => void) => {
+      listeners.set(type, handler);
+    });
+    const removeEventListener = vi.fn((type: string) => {
+      listeners.delete(type);
+    });
+    vi.stubGlobal('addEventListener', addEventListener);
+    vi.stubGlobal('removeEventListener', removeEventListener);
+    try {
+      const popup = createPopupStub();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        // No messageEvents override → the default browser adapter is used.
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+          if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+          return loginIntentCreationResponse();
+        },
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(listeners.has('message')).toBe(true);
+      });
+
+      // Deliver a message the way the browser would, through the adapter.
+      listeners.get('message')?.({
+        origin: 'https://connect.superrare.test',
+        data: authCallbackMessage,
+      });
+
+      await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+      // The adapter unsubscribed its own listener on settle.
+      expect(removeEventListener).toHaveBeenCalledWith('message', expect.any(Function));
+      expect(listeners.has('message')).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not time out a committed login when the profile lookup is slow', async () => {
+    // The central invariant of the redesign: once the session is committed the
+    // completion deadline stops applying, so a slow (not failed) /users/me
+    // cannot turn a succeeded login into a timeout rejection.
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      let releaseProfile: (() => void) | undefined;
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+          if (request.url.endsWith('/v1/connect/users/me')) {
+            await new Promise<void>((resolve) => {
+              releaseProfile = resolve;
+            });
+            return jsonResponse({
+              data: {
+                address: '0x0000000000000000000000000000000000000009',
+                username: 'collector',
+                fullName: null,
+                avatarUri: null,
+              },
+            });
+          }
+          return loginIntentCreationResponse();
+        },
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      let settledStatus: string | undefined;
+      void resultPromise.then((result) => {
+        settledStatus = result.status;
+      });
+
+      await vi.advanceTimersByTimeAsync(1);
+      emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+      // Let the exchange resolve and commit; the profile lookup then hangs.
+      await vi.waitFor(() => {
+        expect(releaseProfile).toBeDefined();
+      });
+      // The session is committed even though the promise has not resolved yet.
+      expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+
+      // Well past the 20s completion deadline — a committed login must NOT be
+      // timed out. If the `!committed` guard regressed, this would reject.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(settledStatus).toBeUndefined();
+
+      releaseProfile?.();
+      await expect(resultPromise).resolves.toMatchObject({
+        status: 'authenticated',
+        user: { username: 'collector' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('completes the blocked-popup fallback through exchangeCallback', async () => {
+    // The fallback persists a pending record and redirects; a real user's
+    // callback must then complete via exchangeCallback end-to-end.
+    const storage = createMemoryStorage();
+    const emitter = createMessageEmitter();
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => null, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        return loginIntentCreationResponse();
+      },
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: storage,
+    });
+
+    const result = await client.auth.loginWithPopup({ returnPath: '/callback' });
+    expect(result).toMatchObject({ status: 'redirected' });
+    expect(assignedUrls).toHaveLength(1);
+
+    // The persisted pending record makes the redirect callback verifiable.
+    const session = await client.auth.exchangeCallback(new URLSearchParams({
+      intentId: 'connect_intent_login',
+      state: 'state_login',
+      code: 'connect_auth_code_login',
+    }));
+    expect(session.sessionId).toBe('connect_session_login');
+    expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
+  it('settles even if closing the popup throws while finishing the login', async () => {
+    // An integrator-supplied window whose close() throws must not leave the
+    // login promise pending forever (which would also wedge the serialization
+    // lock).
+    const emitter = createMessageEmitter();
+    const popup: ConnectPopupWindow = {
+      closed: false,
+      close(): void {
+        throw new Error('window already gone');
+      },
+      location: {
+        replace(): void {},
+      },
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(emitter.listenerCount()).toBe(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+  });
+
+  it('exchanges an in-hand callback even when the intent expiry is behind the client clock', async () => {
+    // Client clock ahead of the server: the intent's expiresAt is already in
+    // the past locally, but a callback in hand must still be exchanged — the
+    // server, not the client clock, decides expiry. (Regression: the handler
+    // used to discard the callback as `expired`.)
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const exchangeRequests: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          exchangeRequests.push(request.url);
+          return sessionResponse();
+        }
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        return jsonResponse({
+          data: {
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            expiresAt: '2020-01-01T00:00:00.000Z',
+          },
+        });
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+    expect(exchangeRequests).toHaveLength(1);
+  });
+
+  it('falls back to a bounded deadline when the intent expiry is unparseable', async () => {
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async () => jsonResponse({
+          data: {
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            expiresAt: 'not-a-date',
+          },
+        }),
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
+      await vi.advanceTimersByTimeAsync(14 * 60_000);
+      expect(popup.closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'expired' });
+      expect(popup.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a newer redirect login\'s pending record when a popup login commits', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const states = ['state_first', 'state_second'];
+    const assignedUrls: string[] = [];
+    let intentCount = 0;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => states.shift() ?? 'state_extra',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        intentCount += 1;
+        const intentId = intentCount === 1 ? 'connect_intent_first' : 'connect_intent_second';
+        return jsonResponse({
+          data: {
+            intentId,
+            url: `https://connect.superrare.test/login?intentId=${intentId}`,
+            expiresAt: futureExpiry(),
+          },
+        });
+      },
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: storage,
+    });
+
+    const popupPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    // A redirect login starts before the popup callback lands; its pending
+    // record is now the stored one.
+    await client.auth.login({ returnPath: '/account' });
+    expect(assignedUrls).toHaveLength(1);
+
+    emitter.emit({
+      origin: 'https://connect.superrare.test',
+      data: { ...authCallbackMessage, intentId: 'connect_intent_first', state: 'state_first' },
+    });
+    await expect(popupPromise).resolves.toMatchObject({ status: 'authenticated' });
+
+    // The popup commit must not have consumed the redirect login's record.
+    const storedPending: unknown = JSON.parse(
+      storage.getItem('superrare.connect.pendingAuth') ?? 'null',
+    );
+    expect(storedPending).toMatchObject({
+      intentId: 'connect_intent_second',
+      state: 'state_second',
+    });
+    await expect(client.auth.exchangeCallback(new URLSearchParams({
+      intentId: 'connect_intent_second',
+      state: 'state_second',
+      code: 'connect_auth_code_login',
+    }))).resolves.toMatchObject({ sessionId: 'connect_session_login' });
+  });
+
+  it('drops the login when logout happens before the callback arrives', async () => {
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    client.auth.logout();
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+
+    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+    expect(client.auth.getSession()).toBeUndefined();
+  });
+
+  it('keeps the login authenticated when logout happens during the profile lookup', async () => {
+    // Once the session is committed the login has succeeded; a logout during
+    // the best-effort profile lookup is a later event (login, then logout),
+    // not a reason to report the login as failed.
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    let releaseProfile: (() => void) | undefined;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          await new Promise<void>((resolve) => {
+            releaseProfile = resolve;
+          });
+          return jsonResponse({
+            data: {
+              address: '0x0000000000000000000000000000000000000009',
+              username: 'collector',
+              fullName: null,
+              avatarUri: null,
+            },
+          });
+        }
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(releaseProfile).toBeDefined();
+    });
+
+    // The session was committed before the profile lookup; logout now.
+    client.auth.logout();
+    releaseProfile?.();
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+    // The login succeeded, but the later logout cleared the session.
+    expect(client.auth.getSession()).toBeUndefined();
+  });
+
+  it('gives each client instance its own named browsing context', async () => {
+    const openedTargets: string[] = [];
+    const openedPopups: Array<ReturnType<typeof createPopupStub>> = [];
+    const emitter = createMessageEmitter();
+    const buildClient = (): ReturnType<typeof createSuperRareClient> =>
+      createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: {
+          open: (_url, target) => {
+            openedTargets.push(target);
+            const openedPopup = createPopupStub();
+            openedPopups.push(openedPopup);
+            return openedPopup;
+          },
+          messageEvents: emitter.messageEvents,
+        },
+        fetch: async () => loginIntentCreationResponse(),
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
+
+    // Serialization is per client, so two clients on one page can still have
+    // a login each — they must not share a window name.
+    const firstPromise = buildClient().auth.loginWithPopup();
+    const secondPromise = buildClient().auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(openedTargets).toHaveLength(2);
+    });
+
+    expect(new Set(openedTargets).size).toBe(2);
+
+    // Settle both so neither watcher outlives the test.
+    openedPopups.forEach((openedPopup) => {
+      openedPopup.closed = true;
+    });
+    await expect(firstPromise).resolves.toEqual({ status: 'cancelled' });
+    await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
+  });
+
+  it('refuses the redirect fallback when the popup is blocked and storage is disabled', async () => {
+    const emitter = createMessageEmitter();
+    const assignedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => null, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: false,
+    });
+
+    // Redirecting would strand the user: the callback could never verify.
+    await expect(client.auth.loginWithPopup()).rejects.toThrow(
+      'requires session storage',
+    );
+    expect(assignedUrls).toEqual([]);
+  });
+
+  it('refuses to navigate a popup to a non-web intent URL', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => jsonResponse({
+        data: {
+          intentId: 'connect_intent_login',
+          url: 'javascript:alert(1)',
+          expiresAt: '2027-01-01T00:00:00.000Z',
+        },
+      }),
+      navigation: false,
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.loginWithPopup()).rejects.toThrow('Invalid Connect intent URL');
+    expect(popup.replacedUrls).toEqual([]);
+    expect(popup.closed).toBe(true);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
+  it('leaves an in-flight redirect login\'s pending record untouched', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const states = ['state_redirect', 'state_popup'];
+    let intentCount = 0;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => states.shift() ?? 'state_extra',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => {
+        intentCount += 1;
+        const intentId = intentCount === 1 ? 'connect_intent_redirect' : 'connect_intent_popup';
+        return jsonResponse({
+          data: {
+            intentId,
+            url: `https://connect.superrare.test/login?intentId=${intentId}`,
+            expiresAt: futureExpiry(),
+          },
+        });
+      },
+      navigation: { assign() {} },
+      sessionStorage: storage,
+    });
+
+    // A redirect login is awaiting its callback...
+    await client.auth.login({ returnPath: '/account' });
+    const redirectPending = storage.getItem('superrare.connect.pendingAuth');
+
+    // ...and a popup login starts alongside it.
+    const popupPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBe(redirectPending);
+
+    popup.closed = true;
+    await expect(popupPromise).resolves.toEqual({ status: 'cancelled' });
+    // Cancelling the popup must not consume the redirect login's record.
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBe(redirectPending);
+  });
+
+  it('cancels the blocked-popup fallback when logout lands while the intent is created', async () => {
+    const storage = createMemoryStorage();
+    const emitter = createMessageEmitter();
+    const assignedUrls: string[] = [];
+    let releaseIntent: (() => void) | undefined;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => null, messageEvents: emitter.messageEvents },
+      fetch: async () => {
+        await new Promise<void>((resolve) => {
+          releaseIntent = resolve;
+        });
+        return loginIntentCreationResponse();
+      },
+      navigation: {
+        assign(url) {
+          assignedUrls.push(url);
+        },
+      },
+      sessionStorage: storage,
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(releaseIntent).toBeDefined();
+    });
+    client.auth.logout();
+    releaseIntent?.();
+
+    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+    expect(assignedUrls).toEqual([]);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
+  it('rejects a late redirect exchange as superseded instead of overwriting a committed popup session', async () => {
+    const storage = createMemoryStorage();
+    storage.setItem('superrare.connect.pendingAuth', JSON.stringify({
+      intentId: 'connect_intent_redirect',
+      state: 'state_redirect',
+      expiresAt: '2027-01-01T00:00:00.000Z',
+    }));
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    let releaseRedirectExchange: (() => void) | undefined;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          const body: unknown = await request.json();
+          const isRedirect =
+            typeof body === 'object' && body !== null && 'state' in body &&
+            body.state === 'state_redirect';
+          if (isRedirect) {
+            await new Promise<void>((resolve) => {
+              releaseRedirectExchange = resolve;
+            });
+            return jsonResponse({
+              data: {
+                session: {
+                  sessionId: 'connect_session_redirect',
+                  userId: 'user_redirect',
+                  address: '0x0000000000000000000000000000000000000001',
+                  expiresAt: '2027-01-01T00:00:00.000Z',
+                },
+              },
+            });
+          }
+          return sessionResponse();
+        }
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: storage,
+    });
+
+    // A redirect exchange is in flight...
+    const redirectPromise = client.auth.exchangeCallback(new URLSearchParams({
+      intentId: 'connect_intent_redirect',
+      state: 'state_redirect',
+      code: 'connect_auth_code_redirect',
+    }));
+    await vi.waitFor(() => {
+      expect(releaseRedirectExchange).toBeDefined();
+    });
+
+    // ...while a popup login completes.
+    const popupPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    await expect(popupPromise).resolves.toMatchObject({ status: 'authenticated' });
+
+    releaseRedirectExchange?.();
+    // The late redirect exchange must not return a phantom session: it rejects
+    // as superseded and leaves no stale pending record to replay.
+    await expect(redirectPromise).rejects.toBeInstanceOf(ConnectSessionSupersededError);
+    expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
+  it('releases the popup and pending record when popup navigation throws', async () => {
+    const storage = createMemoryStorage();
+    const emitter = createMessageEmitter();
+    const popup = createPopupStub();
+    popup.location.replace = (): never => {
+      throw new Error('navigation blocked');
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      navigation: false,
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.loginWithPopup()).rejects.toThrow('navigation blocked');
+    expect(popup.closed).toBe(true);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+    expect(emitter.listenerCount()).toBe(0);
+  });
+
+  it('releases the popup and pending record when the intent URL is malformed', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => jsonResponse({
+        data: {
+          intentId: 'connect_intent_login',
+          url: 'not a url',
+          expiresAt: '2027-01-01T00:00:00.000Z',
+        },
+      }),
+      navigation: false,
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.loginWithPopup()).rejects.toThrow('Invalid Connect intent URL');
+    expect(popup.closed).toBe(true);
+    expect(popup.replacedUrls).toEqual([]);
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+    expect(emitter.listenerCount()).toBe(0);
   });
 });
 
