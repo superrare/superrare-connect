@@ -211,9 +211,15 @@ await superrare.auth.login({
 Callback page:
 
 ```ts
-const session = await superrare.auth.exchangeCallback(
-  new URLSearchParams(window.location.search),
-);
+try {
+  const session = await superrare.auth.exchangeCallback(
+    new URLSearchParams(window.location.search),
+  );
+} catch (error) {
+  // `ConnectSessionSupersededError` — a logout or newer login on this client
+  // landed while the exchange was in flight; the session was not stored.
+  // Other errors: invalid/expired callback (see Errors below).
+}
 ```
 
 Flow sequence:
@@ -224,7 +230,7 @@ Flow sequence:
 4. Browser redirects to SuperRare Connect.
 5. SuperRare Connect redirects back to the integrator `returnPath` with `intentId`, `state`, and `code`.
 6. Integrator calls `auth.exchangeCallback(new URLSearchParams(window.location.search))`.
-7. SDK validates pending `state` and `intentId`, exchanges the code for a Connect session, stores the session, and notifies listeners.
+7. SDK validates pending `state` and `intentId`, exchanges the code for a Connect session, stores the session, and notifies listeners. If a logout or a newer login on this client lands while the exchange is in flight, `exchangeCallback` throws `ConnectSessionSupersededError` and stores nothing, rather than returning a session that was superseded.
 
 ## Popup Login
 
@@ -242,7 +248,7 @@ if (result.status === 'authenticated') {
 Call it directly from a click handler so the browser does not block the popup. Possible results:
 
 - `authenticated` — the session is stored and `auth.onChange` listeners fired; `user` carries `address`, `username`, `fullName`, and `avatarUri` when the profile lookup succeeds.
-- `cancelled` — the user closed the popup before signing in, or the session changed underneath the login (a logout while it was running).
+- `cancelled` — the user closed the popup before signing in, or a logout/newer login on this client landed before the session was committed. (A logout *after* the session was committed — e.g. during the profile lookup — resolves `authenticated`; the login succeeded and the later logout clears the session.)
 - `expired` — the login intent expired while the popup was open.
 - `redirected` — the popup was blocked, so the SDK fell back to the redirect login; the callback lands on `returnPath` as in the flow above.
 
@@ -301,7 +307,7 @@ const superrare = createSuperRareClient({
 });
 ```
 
-Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. Use `navigation: false` to create hosted intents without assigning `window.location`. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `navigation`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
+Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `navigation: false` to create hosted intents without assigning `window.location`. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `navigation`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
 
 ## Popup Checkout
 

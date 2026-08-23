@@ -263,16 +263,18 @@ export function createSuperRareClient(
   };
   const exchangeCode = async (params: ConnectAuthCallbackParams): Promise<ConnectSession> => {
     const generation = sessionCommitGeneration;
-    const session = await exchangeConnectAuthCode(params, {
-      ...apiOptions,
-      signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
-    });
+    const session = await exchangeConnectAuthCode(params, apiOptions);
     if (generation !== sessionCommitGeneration) {
       // A logout or newer login landed on this client during the exchange, so
       // the stale session must not be written. Drop the now-consumed pending
-      // record too, so replaying this callback fails locally instead of
-      // sending the spent code to the backend.
-      removePendingAuthFromStorage(storage, pendingAuthStorageKey);
+      // record too — but only if it is still THIS callback's, since a
+      // concurrent redirect login may have replaced it — so replaying this
+      // callback fails locally instead of sending the spent code to the backend.
+      const storedPendingAuth = readPendingAuthFromStorage(storage, pendingAuthStorageKey);
+      if (storedPendingAuth?.intentId === params.intentId) {
+        removePendingAuthFromStorage(storage, pendingAuthStorageKey);
+      }
+
       throw new ConnectSessionSupersededError();
     }
 
@@ -335,7 +337,9 @@ export function createSuperRareClient(
   const requireNavigableHostedUrl = (url: string): string => {
     const hostedUrl = resolveConnectHostedUrl(url);
     if (!hostedUrl.ok) {
-      throw new Error('Invalid Connect intent URL.');
+      // Carry the reason: `unsupported_protocol` (a rejected downgrade/executable
+      // scheme) is a distinct, security-relevant signal from `unparseable`.
+      throw new Error(`Invalid Connect intent URL (${hostedUrl.error}).`);
     }
 
     return hostedUrl.origin;
@@ -356,6 +360,9 @@ export function createSuperRareClient(
 
     // The popup must open before the first await to stay inside the user
     // gesture; otherwise browsers block it. It navigates once the intent exists.
+    // NOTE: uses the default window name (not a per-operation one like the login
+    // popup) — concurrent action/checkout popup naming is part of the separate
+    // checkout-hardening follow-up, not an oversight here.
     const popup = options.display === 'popup' ? openPopupWindow() : null;
     let intent: ConnectIntentCreation;
     try {
@@ -465,6 +472,17 @@ export function createSuperRareClient(
     }).catch((): undefined => undefined);
     return { status: 'authenticated', session, user };
   };
+  // A custom window (an integrator-supplied `popup.open`) could have a
+  // `closed` getter that throws; treat that as still-open so a throwing getter
+  // cannot crash a poll loop and leave the login unsettled — the deadline
+  // still ends it.
+  const isPopupClosed = (popup: ConnectPopupWindow): boolean => {
+    try {
+      return popup.closed;
+    } catch {
+      return false;
+    }
+  };
   // Nothing watches the popup while its intent is being created, so a window
   // closed during that gap would leave the caller unanswered. This covers it.
   const watchPopupDismissal = async (
@@ -474,7 +492,7 @@ export function createSuperRareClient(
     while (!isSettled()) {
       await sleep(POPUP_POLL_INTERVAL_MS);
       if (isSettled()) break;
-      if (popup.closed) return 'dismissed';
+      if (isPopupClosed(popup)) return 'dismissed';
     }
 
     return 'settled';
@@ -506,7 +524,7 @@ export function createSuperRareClient(
         settled = true;
         try {
           unsubscribe();
-          if (!input.popup.closed) input.popup.close();
+          if (!isPopupClosed(input.popup)) input.popup.close();
         } catch {
           // The window/emitter is already gone; nothing left to release.
         }
@@ -581,7 +599,7 @@ export function createSuperRareClient(
             continue;
           }
 
-          if (input.popup.closed) {
+          if (isPopupClosed(input.popup)) {
             settle(() => {
               resolve({ status: 'cancelled' });
             });
@@ -936,11 +954,16 @@ const createRequestTimeoutSignal = (
   }
 
   const controller = new AbortController();
-  // The timer fires the abort even without `AbortSignal.timeout`; on a request
-  // that resolves first the abort is a no-op and the timer clears itself.
-  setTimeout(() => {
+  // The timer always fires at `milliseconds`; aborting an already-settled
+  // request is a harmless no-op. `unref` (Node) keeps a pending timer from
+  // holding the process open after the work is done.
+  const timer: unknown = setTimeout(() => {
     controller.abort();
   }, milliseconds);
+  if (typeof timer === 'object' && timer !== null && 'unref' in timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+
   return controller.signal;
 };
 
