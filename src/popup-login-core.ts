@@ -21,8 +21,6 @@ const connectAuthCallbackMessageSchema = z.object({
   code: z.string().min(1),
 });
 
-export type ConnectAuthCallbackMessage = z.infer<typeof connectAuthCallbackMessageSchema>;
-
 export type ConnectAuthCallbackMessageParseResult =
   | { ok: true; params: ConnectAuthCallbackParams }
   | { ok: false; error: 'origin_mismatch' | 'not_auth_callback' | 'malformed_message' };
@@ -96,28 +94,40 @@ export type ConnectPopupLoginResult =
   };
 
 /**
- * Deadline for the popup watcher, in epoch milliseconds. An unparseable
- * `expiresAt` falls back to `now + fallbackMs`, so the watcher always has a
- * deterministic end instead of waiting on the user to close the popup.
+ * Deadline for the popup watcher, in epoch milliseconds. The server's
+ * `expiresAt` is compared against the CLIENT clock, so a deadline that is
+ * unparseable — or already in the past, which on a fresh intent means the
+ * client clock is skewed ahead of the server — falls back to
+ * `now + fallbackMilliseconds`. The watcher then always has a deterministic
+ * end without a skewed clock expiring logins the server still accepts.
  */
 export function getConnectPopupLoginDeadline(input: {
   expiresAt: string;
   now: number;
-  fallbackMs: number;
+  fallbackMilliseconds: number;
 }): number {
   const deadline = Date.parse(input.expiresAt);
-  return Number.isNaN(deadline) ? input.now + input.fallbackMs : deadline;
+  if (Number.isNaN(deadline) || deadline <= input.now) {
+    return input.now + input.fallbackMilliseconds;
+  }
+
+  return deadline;
 }
 
 export type ConnectHostedUrlResult =
   | { ok: true; origin: string }
   | { ok: false; error: 'unparseable' | 'unsupported_protocol' };
 
+const loopbackHostnames = new Set(['localhost', '127.0.0.1', '[::1]']);
+
 /**
  * Validates a hosted URL before the SDK navigates a window to it. The URL
  * comes from Rare API, but this is the last boundary before an actual
- * navigation, and only web URLs may cross it: a `javascript:` or `data:` URL
- * would otherwise execute in the opened window.
+ * navigation: a `javascript:` or `data:` URL would execute in the opened
+ * window, and a plaintext `http:` page could be swapped by an on-path
+ * attacker — and its origin would then be the one the SDK trusts for the
+ * auth callback. Plain `http:` is therefore allowed only for loopback hosts
+ * (local development), mirroring Rare API's own origin policy.
  */
 export function resolveConnectHostedUrl(url: string): ConnectHostedUrlResult {
   let parsedUrl: URL;
@@ -127,9 +137,13 @@ export function resolveConnectHostedUrl(url: string): ConnectHostedUrlResult {
     return { ok: false, error: 'unparseable' };
   }
 
-  if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
-    return { ok: false, error: 'unsupported_protocol' };
+  if (parsedUrl.protocol === 'https:') {
+    return { ok: true, origin: parsedUrl.origin };
   }
 
-  return { ok: true, origin: parsedUrl.origin };
+  if (parsedUrl.protocol === 'http:' && loopbackHostnames.has(parsedUrl.hostname)) {
+    return { ok: true, origin: parsedUrl.origin };
+  }
+
+  return { ok: false, error: 'unsupported_protocol' };
 }

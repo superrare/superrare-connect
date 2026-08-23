@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ConnectAuthCallbackError,
   ConnectAuthPendingError,
+  ConnectSessionSupersededError,
   createSuperRareClient,
   type ConnectNavigation,
 } from '../src/client.js';
@@ -1055,12 +1056,16 @@ describe('auth.loginWithPopup', () => {
     return popup;
   }
 
+  // Relative to the clock so real-timer tests never expire a login on a fixed
+  // future date (the deadline logic compares expiresAt against Date.now()).
+  const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
+
   function loginIntentCreationResponse(): Response {
     return jsonResponse({
       data: {
         intentId: 'connect_intent_login',
         url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
-        expiresAt: '2027-01-01T00:00:00.000Z',
+        expiresAt: futureExpiry(),
       },
     });
   }
@@ -1251,8 +1256,9 @@ describe('auth.loginWithPopup', () => {
     }
   });
 
-  it('resolves expired once the login intent deadline passes', async () => {
+  it('resolves expired once the login intent deadline passes with no callback', async () => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
     try {
       const popup = createPopupStub();
       const emitter = createMessageEmitter();
@@ -1264,7 +1270,8 @@ describe('auth.loginWithPopup', () => {
           data: {
             intentId: 'connect_intent_login',
             url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
-            expiresAt: '2020-01-01T00:00:00.000Z',
+            // Four seconds out, so the watcher's 2s poll passes it.
+            expiresAt: '2026-06-01T00:00:04.000Z',
           },
         }),
         navigation: false,
@@ -1275,7 +1282,8 @@ describe('auth.loginWithPopup', () => {
       await vi.waitFor(() => {
         expect(popup.replacedUrls).toHaveLength(1);
       });
-      await vi.advanceTimersByTimeAsync(2000);
+      // No callback ever arrives; the deadline passes and the watcher closes.
+      await vi.advanceTimersByTimeAsync(6000);
 
       await expect(resultPromise).resolves.toEqual({ status: 'expired' });
       expect(popup.closed).toBe(true);
@@ -1453,11 +1461,19 @@ describe('auth.loginWithPopup', () => {
         sessionStorage: createMemoryStorage(),
       });
 
+      const closePopupAt = (index: number): void => {
+        const openedPopup = popups[index];
+        if (openedPopup === undefined) {
+          throw new Error(`expected a popup at index ${index}`);
+        }
+        openedPopup.closed = true;
+      };
+
       const firstPromise = client.auth.loginWithPopup();
       await vi.waitFor(() => {
         expect(popups).toHaveLength(1);
       });
-      popups[0]!.closed = true;
+      closePopupAt(0);
       await vi.advanceTimersByTimeAsync(2000);
       await expect(firstPromise).resolves.toEqual({ status: 'cancelled' });
 
@@ -1466,7 +1482,7 @@ describe('auth.loginWithPopup', () => {
       await vi.waitFor(() => {
         expect(popups).toHaveLength(2);
       });
-      popups[1]!.closed = true;
+      closePopupAt(1);
       await vi.advanceTimersByTimeAsync(2000);
       await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
     } finally {
@@ -1657,7 +1673,107 @@ describe('auth.loginWithPopup', () => {
     expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
   });
 
-  it('resolves expired for a callback that arrives after the deadline', async () => {
+  it('does not let one client instance suppress another client\'s in-flight exchange', async () => {
+    // Two clients with independent session storage are independent sessions; a
+    // logout on one must not drop an exchange committing on the other. The
+    // exchange is the shared code path (popup and redirect both use it).
+    let releaseExchangeB: (() => void) | undefined;
+    const storageB = createMemoryStorage();
+    storageB.setItem('sr.b.pending', JSON.stringify({
+      intentId: 'connect_intent_login',
+      state: 'state_login',
+      expiresAt: '2027-01-01T00:00:00.000Z',
+    }));
+    const buildClient = (
+      key: string,
+      storage: ConnectSessionStorage,
+      hangExchange: boolean,
+    ): ReturnType<typeof createSuperRareClient> =>
+      createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/exchange')) {
+            if (hangExchange) {
+              await new Promise<void>((resolve) => {
+                releaseExchangeB = resolve;
+              });
+            }
+            return sessionResponse();
+          }
+          return loginIntentCreationResponse();
+        },
+        navigation: false,
+        sessionStorageKey: key,
+        pendingAuthStorageKey: `${key}.pending`,
+        sessionStorage: storage,
+      });
+
+    const clientA = buildClient('sr.a', createMemoryStorage(), false);
+    const clientB = buildClient('sr.b', storageB, true);
+
+    // B's exchange is in flight and hangs.
+    const bPromise = clientB.auth.exchangeCallback(new URLSearchParams({
+      intentId: 'connect_intent_login',
+      state: 'state_login',
+      code: 'connect_auth_code_login',
+    }));
+    await vi.waitFor(() => {
+      expect(releaseExchangeB).toBeDefined();
+    });
+
+    // A commits and clears its own session — moving A's generation, not B's.
+    clientA.auth.logout();
+
+    // B's exchange finally resolves: it must still commit its own session.
+    releaseExchangeB?.();
+    await expect(bPromise).resolves.toMatchObject({ sessionId: 'connect_session_login' });
+    expect(clientB.auth.getSession()?.sessionId).toBe('connect_session_login');
+  });
+
+  it('settles even if closing the popup throws while finishing the login', async () => {
+    // An integrator-supplied window whose close() throws must not leave the
+    // login promise pending forever (which would also wedge the serialization
+    // lock).
+    const emitter = createMessageEmitter();
+    const popup: ConnectPopupWindow = {
+      closed: false,
+      close(): void {
+        throw new Error('window already gone');
+      },
+      location: {
+        replace(): void {},
+      },
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        return loginIntentCreationResponse();
+      },
+      navigation: false,
+      sessionStorage: createMemoryStorage(),
+    });
+
+    const resultPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(emitter.listenerCount()).toBe(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+  });
+
+  it('exchanges an in-hand callback even when the intent expiry is behind the client clock', async () => {
+    // Client clock ahead of the server: the intent's expiresAt is already in
+    // the past locally, but a callback in hand must still be exchanged — the
+    // server, not the client clock, decides expiry. (Regression: the handler
+    // used to discard the callback as `expired`.)
     const popup = createPopupStub();
     const emitter = createMessageEmitter();
     const exchangeRequests: string[] = [];
@@ -1671,6 +1787,7 @@ describe('auth.loginWithPopup', () => {
           exchangeRequests.push(request.url);
           return sessionResponse();
         }
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
         return jsonResponse({
           data: {
             intentId: 'connect_intent_login',
@@ -1689,9 +1806,8 @@ describe('auth.loginWithPopup', () => {
     });
     emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
 
-    await expect(resultPromise).resolves.toEqual({ status: 'expired' });
-    expect(exchangeRequests).toEqual([]);
-    expect(popup.closed).toBe(true);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+    expect(exchangeRequests).toHaveLength(1);
   });
 
   it('falls back to a bounded deadline when the intent expiry is unparseable', async () => {
@@ -1750,7 +1866,7 @@ describe('auth.loginWithPopup', () => {
           data: {
             intentId,
             url: `https://connect.superrare.test/login?intentId=${intentId}`,
-            expiresAt: '2027-01-01T00:00:00.000Z',
+            expiresAt: futureExpiry(),
           },
         });
       },
@@ -1778,11 +1894,13 @@ describe('auth.loginWithPopup', () => {
     await expect(popupPromise).resolves.toMatchObject({ status: 'authenticated' });
 
     // The popup commit must not have consumed the redirect login's record.
-    expect(storage.getItem('superrare.connect.pendingAuth')).toBe(JSON.stringify({
+    const storedPending: unknown = JSON.parse(
+      storage.getItem('superrare.connect.pendingAuth') ?? 'null',
+    );
+    expect(storedPending).toMatchObject({
       intentId: 'connect_intent_second',
       state: 'state_second',
-      expiresAt: '2027-01-01T00:00:00.000Z',
-    }));
+    });
     await expect(client.auth.exchangeCallback(new URLSearchParams({
       intentId: 'connect_intent_second',
       state: 'state_second',
@@ -1817,7 +1935,10 @@ describe('auth.loginWithPopup', () => {
     expect(client.auth.getSession()).toBeUndefined();
   });
 
-  it('drops the login when logout happens during the profile lookup', async () => {
+  it('keeps the login authenticated when logout happens during the profile lookup', async () => {
+    // Once the session is committed the login has succeeded; a logout during
+    // the best-effort profile lookup is a later event (login, then logout),
+    // not a reason to report the login as failed.
     const popup = createPopupStub();
     const emitter = createMessageEmitter();
     let releaseProfile: (() => void) | undefined;
@@ -1856,10 +1977,12 @@ describe('auth.loginWithPopup', () => {
       expect(releaseProfile).toBeDefined();
     });
 
+    // The session was committed before the profile lookup; logout now.
     client.auth.logout();
     releaseProfile?.();
 
-    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+    await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
+    // The login succeeded, but the later logout cleared the session.
     expect(client.auth.getSession()).toBeUndefined();
   });
 
@@ -1968,7 +2091,7 @@ describe('auth.loginWithPopup', () => {
           data: {
             intentId,
             url: `https://connect.superrare.test/login?intentId=${intentId}`,
-            expiresAt: '2027-01-01T00:00:00.000Z',
+            expiresAt: futureExpiry(),
           },
         });
       },
@@ -2029,7 +2152,7 @@ describe('auth.loginWithPopup', () => {
     expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
   });
 
-  it('does not let a late redirect exchange overwrite a committed popup session', async () => {
+  it('rejects a late redirect exchange as superseded instead of overwriting a committed popup session', async () => {
     const storage = createMemoryStorage();
     storage.setItem('superrare.connect.pendingAuth', JSON.stringify({
       intentId: 'connect_intent_redirect',
@@ -2093,9 +2216,11 @@ describe('auth.loginWithPopup', () => {
     await expect(popupPromise).resolves.toMatchObject({ status: 'authenticated' });
 
     releaseRedirectExchange?.();
-    await expect(redirectPromise).resolves.toMatchObject({ sessionId: 'connect_session_redirect' });
-    // The newer popup login stands; the late exchange did not clobber it.
+    // The late redirect exchange must not return a phantom session: it rejects
+    // as superseded and leaves no stale pending record to replay.
+    await expect(redirectPromise).rejects.toBeInstanceOf(ConnectSessionSupersededError);
     expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+    expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
   });
 
   it('releases the popup and pending record when popup navigation throws', async () => {

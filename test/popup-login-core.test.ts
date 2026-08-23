@@ -65,11 +65,11 @@ describe('parseConnectAuthCallbackMessage', () => {
 });
 
 describe('getConnectPopupLoginDeadline', () => {
-  it('parses an ISO expiry into epoch milliseconds', () => {
+  it('parses a future ISO expiry into epoch milliseconds', () => {
     expect(getConnectPopupLoginDeadline({
       expiresAt: '2027-01-01T00:00:00.000Z',
       now: 1_000,
-      fallbackMs: 60_000,
+      fallbackMilliseconds: 60_000,
     })).toBe(Date.parse('2027-01-01T00:00:00.000Z'));
   });
 
@@ -77,17 +77,44 @@ describe('getConnectPopupLoginDeadline', () => {
     expect(getConnectPopupLoginDeadline({
       expiresAt: 'not-a-date',
       now: 1_000,
-      fallbackMs: 60_000,
+      fallbackMilliseconds: 60_000,
     })).toBe(61_000);
+  });
+
+  it('treats an already-past expiry as clock skew and uses the fallback window', () => {
+    // A fresh intent whose expiry is behind the client clock means the client
+    // is running ahead; using the parsed deadline would expire a valid login.
+    expect(getConnectPopupLoginDeadline({
+      expiresAt: '2020-01-01T00:00:00.000Z',
+      now: Date.parse('2026-01-01T00:00:00.000Z'),
+      fallbackMilliseconds: 60_000,
+    })).toBe(Date.parse('2026-01-01T00:00:00.000Z') + 60_000);
   });
 });
 
 describe('resolveConnectHostedUrl', () => {
-  it('accepts http and https hosted URLs and reports their origin', () => {
+  it('accepts https and reports its origin', () => {
     expect(resolveConnectHostedUrl('https://connect.superrare.test/login?intentId=a'))
       .toEqual({ ok: true, origin: 'https://connect.superrare.test' });
-    expect(resolveConnectHostedUrl('http://localhost:5004/login'))
-      .toEqual({ ok: true, origin: 'http://localhost:5004' });
+  });
+
+  it('accepts plaintext http only for loopback hosts (local development)', () => {
+    for (const url of [
+      'http://localhost:5004/login',
+      'http://127.0.0.1:5004/login',
+      'http://[::1]:5004/login',
+    ]) {
+      expect(resolveConnectHostedUrl(url)).toEqual({ ok: true, origin: new URL(url).origin });
+    }
+  });
+
+  it('rejects plaintext http for a non-loopback host (downgrade / on-path swap)', () => {
+    for (const url of [
+      'http://connect.superrare.com/login',
+      'http://evil.test/login',
+    ]) {
+      expect(resolveConnectHostedUrl(url)).toEqual({ ok: false, error: 'unsupported_protocol' });
+    }
   });
 
   it('rejects executable and non-web protocols', () => {

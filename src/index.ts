@@ -3,6 +3,7 @@ export {
   ConnectAuthPendingError,
   ConnectReturnPathError,
   ConnectSessionRequiredError,
+  ConnectSessionSupersededError,
   createSuperRareClient,
   type SuperRareConnectActionsNamespace,
   type ConnectAuthLoginParams,

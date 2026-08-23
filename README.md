@@ -271,7 +271,7 @@ createSuperRareClient({
 
 Both default to the browser's own `window.open` and `window.addEventListener('message', ...)`. When the popup cannot be opened, the SDK falls back to the redirect login — that fallback needs session storage, so `loginWithPopup` throws instead of redirecting when storage is disabled and no popup is available.
 
-Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it also works with `sessionStorage: false` and with overlapping logins), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran in the meantime resolves `cancelled` instead of resurrecting the session.
+Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A popup login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session; the redirect `exchangeCallback` throws `ConnectSessionSupersededError` in the same situation, so a superseded exchange is never mistaken for a live session.
 
 ## Session And User
 
