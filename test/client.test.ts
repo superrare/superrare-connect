@@ -1388,55 +1388,151 @@ describe('auth.loginWithPopup', () => {
     });
   });
 
-  it('keeps overlapping popup logins independent of each other', async () => {
+  it('joins the login already in flight instead of starting a second one', async () => {
+    // The SDK holds a single session, so two concurrent logins could only
+    // race for the same slot. A second call joins the first.
     const popup = createPopupStub();
     const emitter = createMessageEmitter();
-    const states = ['state_first', 'state_second'];
-    let intentCount = 0;
+    const openedTargets: string[] = [];
+    let intentRequests = 0;
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
-      createState: () => states.shift() ?? 'state_extra',
-      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      createState: () => 'state_login',
+      popup: {
+        open: (_url, target) => {
+          openedTargets.push(target);
+          return popup;
+        },
+        messageEvents: emitter.messageEvents,
+      },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
-        if (request.url.endsWith('/v1/connect/auth/exchange')) {
-          expect(await request.json()).toMatchObject({ intentId: 'connect_intent_first', state: 'state_first' });
-          return sessionResponse();
-        }
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
         if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
-        intentCount += 1;
-        const intentId = intentCount === 1 ? 'connect_intent_first' : 'connect_intent_second';
-        return jsonResponse({
-          data: {
-            intentId,
-            url: `https://connect.superrare.test/login?intentId=${intentId}`,
-            expiresAt: '2027-01-01T00:00:00.000Z',
-          },
-        });
+        intentRequests += 1;
+        return loginIntentCreationResponse();
       },
       navigation: false,
       sessionStorage: createMemoryStorage(),
     });
 
     const firstPromise = client.auth.loginWithPopup();
+    const secondPromise = client.auth.loginWithPopup();
     await vi.waitFor(() => {
       expect(popup.replacedUrls).toHaveLength(1);
     });
-    // The second login overwrites the stored pending record...
-    const secondPromise = client.auth.loginWithPopup();
-    await vi.waitFor(() => {
-      expect(popup.replacedUrls).toHaveLength(2);
-    });
 
-    // ...yet the first popup's callback still verifies against its own.
-    emitter.emit({
-      origin: 'https://connect.superrare.test',
-      data: { ...authCallbackMessage, intentId: 'connect_intent_first', state: 'state_first' },
-    });
+    // One window, one intent — the second call opened nothing.
+    expect(openedTargets).toHaveLength(1);
+    expect(intentRequests).toBe(1);
 
-    await expect(firstPromise).resolves.toMatchObject({ status: 'authenticated' });
-    popup.closed = true;
-    await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+    const [firstResult, secondResult] = await Promise.all([firstPromise, secondPromise]);
+    expect(firstResult).toMatchObject({ status: 'authenticated' });
+    expect(secondResult).toBe(firstResult);
+  });
+
+  it('releases the in-flight login once it settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const emitter = createMessageEmitter();
+      const popups: Array<ReturnType<typeof createPopupStub>> = [];
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: {
+          open: () => {
+            const openedPopup = createPopupStub();
+            popups.push(openedPopup);
+            return openedPopup;
+          },
+          messageEvents: emitter.messageEvents,
+        },
+        fetch: async () => loginIntentCreationResponse(),
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
+
+      const firstPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(popups).toHaveLength(1);
+      });
+      popups[0]!.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(firstPromise).resolves.toEqual({ status: 'cancelled' });
+
+      // The lock is gone: a later login starts its own window.
+      const secondPromise = client.auth.loginWithPopup();
+      await vi.waitFor(() => {
+        expect(popups).toHaveLength(2);
+      });
+      popups[1]!.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('times out a completion the backend never answers', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const sessionChanges: Array<string | undefined> = [];
+      let releaseExchange: (() => void) | undefined;
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/exchange')) {
+            await new Promise<void>((resolve) => {
+              releaseExchange = resolve;
+            });
+            return sessionResponse();
+          }
+
+          return loginIntentCreationResponse();
+        },
+        navigation: false,
+        sessionStorage: storage,
+      });
+      client.auth.onChange((session) => {
+        sessionChanges.push(session?.sessionId);
+      });
+
+      const resultPromise = client.auth.loginWithPopup();
+      // Capture the outcome now: the rejection lands while the test is still
+      // advancing timers, and an unobserved rejection is reported as an
+      // unhandled error. Real callers await the call immediately.
+      const outcome = resultPromise.catch((error: unknown) => error);
+      // Advance rather than vi.waitFor: with fake timers, waitFor polls on a
+      // faked timer nobody is advancing and deadlocks.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(popup.replacedUrls).toHaveLength(1);
+
+      emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(releaseExchange).toBeDefined();
+
+      // The hosted window already closed itself, so only the clock can end
+      // this: without it the caller would wait forever.
+      await vi.advanceTimersByTimeAsync(21_000);
+      await expect(outcome).resolves.toMatchObject({
+        message: 'Timed out completing the Connect login.',
+      });
+
+      // A response that lands after the timeout must not write a session.
+      releaseExchange?.();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(client.auth.getSession()).toBeUndefined();
+      expect(sessionChanges).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('drops a stale exchange when the session changed while it was in flight', async () => {
@@ -1691,29 +1787,32 @@ describe('auth.loginWithPopup', () => {
     expect(client.auth.getSession()).toBeUndefined();
   });
 
-  it('opens each popup login in its own named browsing context', async () => {
+  it('gives each client instance its own named browsing context', async () => {
     const openedTargets: string[] = [];
     const openedPopups: Array<ReturnType<typeof createPopupStub>> = [];
     const emitter = createMessageEmitter();
-    const client = createSuperRareClient({
-      apiUrl: 'https://rare-api.test',
-      createState: () => 'state_login',
-      popup: {
-        open: (_url, target) => {
-          openedTargets.push(target);
-          const openedPopup = createPopupStub();
-          openedPopups.push(openedPopup);
-          return openedPopup;
+    const buildClient = (): ReturnType<typeof createSuperRareClient> =>
+      createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: {
+          open: (_url, target) => {
+            openedTargets.push(target);
+            const openedPopup = createPopupStub();
+            openedPopups.push(openedPopup);
+            return openedPopup;
+          },
+          messageEvents: emitter.messageEvents,
         },
-        messageEvents: emitter.messageEvents,
-      },
-      fetch: async () => loginIntentCreationResponse(),
-      navigation: false,
-      sessionStorage: createMemoryStorage(),
-    });
+        fetch: async () => loginIntentCreationResponse(),
+        navigation: false,
+        sessionStorage: createMemoryStorage(),
+      });
 
-    const firstPromise = client.auth.loginWithPopup();
-    const secondPromise = client.auth.loginWithPopup();
+    // Serialization is per client, so two clients on one page can still have
+    // a login each — they must not share a window name.
+    const firstPromise = buildClient().auth.loginWithPopup();
+    const secondPromise = buildClient().auth.loginWithPopup();
     await vi.waitFor(() => {
       expect(openedTargets).toHaveLength(2);
     });

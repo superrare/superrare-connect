@@ -370,6 +370,7 @@ export function createSuperRareClient(
     });
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
+  let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
   const createLoginIntent = async (
     params: ConnectAuthLoginParams,
   ): Promise<StartedLoginIntent> => {
@@ -405,8 +406,18 @@ export function createSuperRareClient(
   const completePopupLogin = async (input: {
     params: ConnectAuthCallbackParams;
     operationGeneration: number;
+    // True once the watcher gave up on this login (timed out); a response
+    // that arrives afterwards must not write a session behind its back.
+    isAbandoned: () => boolean;
   }): Promise<ConnectPopupLoginResult> => {
-    const session = await exchangeConnectAuthCode(input.params, apiOptions);
+    const session = await exchangeConnectAuthCode(input.params, {
+      ...apiOptions,
+      signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
+    });
+    if (input.isAbandoned()) {
+      return { status: 'cancelled' };
+    }
+
     if (input.operationGeneration !== sessionCommitGeneration) {
       // Logout or another login landed since this operation began; the stale
       // session is dropped rather than written over the current state.
@@ -424,6 +435,7 @@ export function createSuperRareClient(
     const user = await getConnectCurrentUser({
       ...apiOptions,
       sessionId: session.sessionId,
+      signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
     }).catch((): undefined => undefined);
     if (sessionCommitGeneration !== committedGeneration) {
       // Logged out (or replaced) while the profile was loading — the caller
@@ -444,8 +456,12 @@ export function createSuperRareClient(
     new Promise<ConnectPopupLoginResult>((resolve, reject) => {
       let settled = false;
       // The hosted page closes itself right after posting the callback, so
-      // the close-watcher must stand down once an exchange is in flight.
+      // the close-watcher must stand down once an exchange is in flight. The
+      // DEADLINE keeps running throughout — that is what stops an
+      // unresponsive backend from hanging the caller forever.
       let exchanging = false;
+      let completionDeadline = 0;
+      let abandoned = false;
       let unsubscribe: () => void = () => {};
       const settle = (finish: () => void): void => {
         if (settled) return;
@@ -453,6 +469,12 @@ export function createSuperRareClient(
         unsubscribe();
         if (!input.popup.closed) input.popup.close();
         finish();
+      };
+      // Settling without a login: a completion still in flight must not write
+      // a session after the caller was already told the login did not happen.
+      const abandon = (finish: () => void): void => {
+        abandoned = true;
+        settle(finish);
       };
 
       unsubscribe = input.messageEvents.subscribe((event) => {
@@ -474,23 +496,28 @@ export function createSuperRareClient(
           callbackParams: parsed.params,
         });
         if (!verification.ok) {
-          settle(() => {
+          abandon(() => {
             reject(new ConnectAuthPendingError(verification.error));
           });
           return;
         }
 
         if (Date.now() >= input.deadline) {
-          settle(() => {
+          abandon(() => {
             resolve({ status: 'expired' });
           });
           return;
         }
 
         exchanging = true;
+        completionDeadline = Math.min(
+          input.deadline,
+          Date.now() + POPUP_LOGIN_COMPLETION_TIMEOUT_MS,
+        );
         completePopupLogin({
           params: parsed.params,
           operationGeneration: input.operationGeneration,
+          isAbandoned: () => abandoned,
         }).then(
           (result) => {
             if (result.status === 'authenticated') {
@@ -500,51 +527,55 @@ export function createSuperRareClient(
               return;
             }
 
-            settle(() => {
+            abandon(() => {
               resolve(result);
             });
           },
           (error: unknown) => {
-            settle(() => {
+            abandon(() => {
               reject(toRejectionError(error));
             });
           },
         );
       });
 
-      const watchPopupClosed = async (): Promise<void> => {
+      const watchPopupLifetime = async (): Promise<void> => {
         while (!settled) {
           await sleep(POPUP_POLL_INTERVAL_MS);
-          if (settled || exchanging) continue;
+          if (settled) continue;
+
+          if (exchanging) {
+            // The window is gone by design; only the clock still applies.
+            if (Date.now() >= completionDeadline) {
+              abandon(() => {
+                reject(new Error('Timed out completing the Connect login.'));
+              });
+              return;
+            }
+
+            continue;
+          }
+
           if (input.popup.closed) {
-            settle(() => {
+            abandon(() => {
               resolve({ status: 'cancelled' });
             });
             return;
           }
           if (Date.now() >= input.deadline) {
-            settle(() => {
+            abandon(() => {
               resolve({ status: 'expired' });
             });
             return;
           }
         }
       };
-      void watchPopupClosed();
+      void watchPopupLifetime();
     });
 
-  return {
-    auth: {
-      async login(params = {}): Promise<ConnectIntentCreation> {
-        const { intent, pendingAuth } = await createLoginIntent(params);
-        // Guard before anything is stored, so a rejected URL leaves no
-        // pending record behind.
-        requireNavigableHostedUrl(intent.url);
-        persistPendingAuth(pendingAuth);
-        navigation?.assign(intent.url);
-        return intent;
-      },
-      async loginWithPopup(params = {}): Promise<ConnectPopupLoginResult> {
+  const runPopupLogin = async (
+    params: ConnectAuthLoginParams,
+  ): Promise<ConnectPopupLoginResult> => {
         // A logout or another login after this point invalidates the whole
         // operation, so its exchange can never resurrect a replaced session.
         const operationGeneration = sessionCommitGeneration;
@@ -618,6 +649,29 @@ export function createSuperRareClient(
           if (!popup.closed) popup.close();
           throw error;
         }
+      };
+
+  return {
+    auth: {
+      async login(params = {}): Promise<ConnectIntentCreation> {
+        const { intent, pendingAuth } = await createLoginIntent(params);
+        // Guard before anything is stored, so a rejected URL leaves no
+        // pending record behind.
+        requireNavigableHostedUrl(intent.url);
+        persistPendingAuth(pendingAuth);
+        navigation?.assign(intent.url);
+        return intent;
+      },
+      async loginWithPopup(params = {}): Promise<ConnectPopupLoginResult> {
+        // One login at a time: the SDK holds a single session, so a second
+        // concurrent login could only race the first for the same slot. A
+        // caller that asks again — a double click — joins the login already
+        // running instead of opening a second window.
+        inFlightPopupLogin ??= runPopupLogin(params).finally(() => {
+          inFlightPopupLogin = undefined;
+        });
+
+        return await inFlightPopupLogin;
       },
       parseCallback: parseConnectAuthCallbackSearchParams,
       async exchangeCallback(searchParams): Promise<ConnectSession> {
@@ -796,6 +850,21 @@ function readBrowserNavigation(): ConnectNavigation | undefined {
 const POPUP_POLL_INTERVAL_MS = 2000;
 /** Deadline for a popup login whose intent carries an unparseable expiry. */
 const POPUP_LOGIN_FALLBACK_TIMEOUT_MS = 15 * 60_000;
+/**
+ * Once the callback arrives the login is seconds away from done, so it gets a
+ * deadline of its own: the intent's expiry can be minutes out, and leaving the
+ * caller waiting that long on an unresponsive backend is indistinguishable
+ * from a hang.
+ */
+const POPUP_LOGIN_COMPLETION_TIMEOUT_MS = 20_000;
+
+/** `AbortSignal.timeout` where the browser has it; undefined elsewhere. */
+const createRequestTimeoutSignal = (
+  milliseconds: number,
+): AbortSignal | undefined =>
+  typeof AbortSignal === 'undefined' || typeof AbortSignal.timeout !== 'function'
+    ? undefined
+    : AbortSignal.timeout(milliseconds);
 
 type StartedLoginIntent = {
   intent: ConnectIntentCreation;

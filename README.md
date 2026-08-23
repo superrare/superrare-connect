@@ -242,9 +242,11 @@ if (result.status === 'authenticated') {
 Call it directly from a click handler so the browser does not block the popup. Possible results:
 
 - `authenticated` — the session is stored and `auth.onChange` listeners fired; `user` carries `address`, `username`, `fullName`, and `avatarUri` when the profile lookup succeeds.
-- `cancelled` — the user closed the popup before signing in.
+- `cancelled` — the user closed the popup before signing in, or the session changed underneath the login (a logout while it was running).
 - `expired` — the login intent expired while the popup was open.
 - `redirected` — the popup was blocked, so the SDK fell back to the redirect login; the callback lands on `returnPath` as in the flow above.
+
+Only one login runs at a time per client: the SDK holds a single session, so calling `loginWithPopup()` again while one is in flight joins the running login instead of opening a second window. If the backend stops responding after the callback arrives, the call rejects rather than hanging.
 
 For controlled environments (tests, non-browser hosts), `popup.open` and `popup.messageEvents` let you supply the window opener and the `message`-event source the popup login listens on:
 
@@ -253,9 +255,15 @@ createSuperRareClient({
   popup: {
     open: (url, target, features) => window.open(url, target, features),
     messageEvents: {
-      // Must deliver every `message` event as { origin, data }; the returned
-      // function unsubscribes.
-      subscribe: (listener) => { /* ... */ return () => { /* ... */ }; },
+      // Deliver every `message` event as { origin, data }; return the
+      // unsubscribe function.
+      subscribe: (listener) => {
+        const handler = (event: MessageEvent) => {
+          listener({ origin: event.origin, data: event.data });
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+      },
     },
   },
 });

@@ -213,7 +213,7 @@ export async function getConnectIntent(input: {
 
 export async function exchangeConnectAuthCode(
   params: ConnectAuthCallbackParams,
-  options: ConnectAuthApiOptions = {},
+  options: ConnectAuthApiOptions & { signal?: AbortSignal } = {},
 ): Promise<ConnectSession> {
   const body = await requestConnectApiJson({
     path: connectAuthExchangePath,
@@ -221,6 +221,7 @@ export async function exchangeConnectAuthCode(
     apiUrl: options.apiUrl,
     fetch: options.fetch,
     body: params,
+    signal: options.signal,
   });
   const parsedResponse = exchangeConnectAuthResponseSchema.safeParse(body);
   if (!parsedResponse.success) {
@@ -250,6 +251,7 @@ export async function getConnectSession(input: {
 
 export async function getConnectCurrentUser(input: {
   sessionId: string;
+  signal?: AbortSignal;
 } & ConnectAuthApiOptions): Promise<ConnectCurrentUser> {
   const body = await requestConnectApiJson({
     path: connectCurrentUserPath,
@@ -257,6 +259,7 @@ export async function getConnectCurrentUser(input: {
     apiUrl: input.apiUrl,
     fetch: input.fetch,
     sessionId: input.sessionId,
+    signal: input.signal,
   });
   const parsedResponse = getConnectCurrentUserResponseSchema.safeParse(body);
   if (!parsedResponse.success) {
@@ -290,6 +293,7 @@ async function requestConnectApiJson(input: {
   method: 'GET' | 'POST';
   body?: unknown;
   sessionId?: string;
+  signal?: AbortSignal;
 }): Promise<unknown> {
   const fetchImplementation = input.fetch ?? globalThis.fetch;
   const response = await fetchImplementation(
@@ -308,11 +312,13 @@ function buildRequestInit(input: {
   method: 'GET' | 'POST';
   body?: unknown;
   sessionId?: string;
+  signal?: AbortSignal;
 }): RequestInit {
   return {
     method: input.method,
     headers: buildRequestHeaders(input.sessionId),
     ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
   };
 }
 
