@@ -319,7 +319,10 @@ const superrare = createSuperRareClient({
   popup: { width: 480, height: 720 },
   onIntentSettled: (intent) => {
     // Fires when the intent reaches a terminal status, and with the latest
-    // known state if the buyer closes the popup early.
+    // known state if the buyer closes the popup early or the SDK stops
+    // watching at the intent's expiry. The last two can hand you a status
+    // that is not terminal, so check `intent.status` before treating the
+    // flow as finished.
     refreshArtwork(intent);
   },
 });
