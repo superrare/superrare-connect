@@ -821,7 +821,9 @@ describe('createSuperRareClient', () => {
 
       expect(opened).toHaveLength(1);
       expect(opened[0]?.url).toBe('about:blank');
-      expect(opened[0]?.target).toBe('superrare-connect');
+      // Each action popup gets its own window name so a second action cannot
+      // reuse (and its watcher close) the window of the first.
+      expect(opened[0]?.target).toMatch(/^superrare-connect-intent-.+/);
       expect(opened[0]?.features).toContain('popup=yes');
       expect(opened[0]?.features).toContain('width=400');
       expect(opened[0]?.features).toContain('height=640');
@@ -981,6 +983,157 @@ describe('createSuperRareClient', () => {
     await expect(client.auth.login({ returnPath: '/account' })).rejects.toThrow('Invalid Connect intent URL');
     expect(assignedUrls).toEqual([]);
     expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
+  });
+
+  it('stops watching an action popup once the intent can no longer change', async () => {
+    // Regression: the watcher used to poll forever. A buyer who walks away with
+    // the window open kept the integrator's page hitting Rare API every 2s.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'requires_user',
+                returnPath: '/buy/complete',
+                // Already expired: the deadline plus its grace is in the past.
+                expiresAt: '2020-01-01T00:00:00.000Z',
+              },
+            });
+          }
+
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_buy',
+              url: 'https://connect.superrare.test/intents/connect_intent_buy',
+              expiresAt: '2020-01-01T00:00:00.000Z',
+            },
+          });
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      // An unparseable/past expiry falls back to a bounded window, so the
+      // watcher runs — but it does not run forever.
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
+      const requestsAfterDeadline = statusRequests;
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+      expect(statusRequests).toBe(requestsAfterDeadline);
+      expect(popup.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops watching when the intent can no longer be read', async () => {
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            // Gone for good: retrying cannot make it readable.
+            return jsonResponse({ error: 'Connect intent not found' }, { status: 404 });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(statusRequests).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(statusRequests).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives each concurrent action popup its own window', async () => {
+    const openedTargets: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_popup',
+      display: 'popup',
+      popup: {
+        open: (_url, target) => {
+          openedTargets.push(target);
+          return {
+            closed: false,
+            close: () => undefined,
+            location: { replace: () => undefined },
+          };
+        },
+      },
+      fetch: async () => connectIntentCreationResponse('connect_intent_buy'),
+      navigation: false,
+      sessionStorage: false,
+    });
+
+    await client.actions.buy({
+      target: directListingTarget,
+      expected: { currency: 'ETH', price: '1.2' },
+      returnPath: '/buy/complete',
+    });
+    await client.actions.buy({
+      target: directListingTarget,
+      expected: { currency: 'ETH', price: '1.2' },
+      returnPath: '/buy/complete',
+    });
+
+    expect(openedTargets).toHaveLength(2);
+    // Two buys must not share a browsing context: the first watcher would
+    // otherwise close the window the second is being paid in.
+    expect(new Set(openedTargets).size).toBe(2);
   });
 
   it('falls back to redirect navigation when the popup is blocked', async () => {

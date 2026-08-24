@@ -69,3 +69,35 @@ const settledStatuses: ReadonlySet<ConnectIntentStatus> = new Set([
 /** Terminal intent statuses — the popup can be closed once one is reached. */
 export const isConnectIntentSettled = (status: ConnectIntentStatus): boolean =>
   settledStatuses.has(status);
+
+/**
+ * Deadline for a popup watcher, in epoch milliseconds. An expiry that cannot be
+ * parsed — or that is already in the past, which means the client clock is
+ * skewed rather than the intent being dead — falls back to `now + fallbackMs`,
+ * so a watcher always has a deterministic end.
+ */
+export function getConnectPopupDeadline(input: {
+  expiresAt: string;
+  now: number;
+  fallbackMilliseconds: number;
+}): number {
+  const deadline = Date.parse(input.expiresAt);
+  if (Number.isNaN(deadline) || deadline <= input.now) {
+    return input.now + input.fallbackMilliseconds;
+  }
+
+  return deadline;
+}
+
+/**
+ * Whether a failed status poll is worth retrying. A 4xx means the intent is
+ * gone, expired or forbidden and will not become readable by asking again;
+ * timeouts and rate limits are the exceptions that do resolve on their own.
+ */
+export function isRetryableConnectApiStatus(status: number): boolean {
+  if (status === 408 || status === 429) {
+    return true;
+  }
+
+  return status < 400 || status >= 500;
+}

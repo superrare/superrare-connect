@@ -93,27 +93,6 @@ export type ConnectPopupLoginResult =
     intent: ConnectIntentCreation;
   };
 
-/**
- * Deadline for the popup watcher, in epoch milliseconds. The server's
- * `expiresAt` is compared against the CLIENT clock, so a deadline that is
- * unparseable — or already in the past, which on a fresh intent means the
- * client clock is skewed ahead of the server — falls back to
- * `now + fallbackMilliseconds`. The watcher then always has a deterministic
- * end without a skewed clock expiring logins the server still accepts.
- */
-export function getConnectPopupLoginDeadline(input: {
-  expiresAt: string;
-  now: number;
-  fallbackMilliseconds: number;
-}): number {
-  const deadline = Date.parse(input.expiresAt);
-  if (Number.isNaN(deadline) || deadline <= input.now) {
-    return input.now + input.fallbackMilliseconds;
-  }
-
-  return deadline;
-}
-
 export type ConnectHostedUrlResult =
   | { ok: true; origin: string }
   | { ok: false; error: 'unparseable' | 'unsupported_protocol' };

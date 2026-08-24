@@ -44,6 +44,7 @@ import {
   buildConnectCheckoutIntentRequest,
   type CheckoutStartParams,
 } from './checkout-flow-core.js';
+import { SuperRareConnectApiError } from './errors.js';
 import {
   readConnectSessionFromStorage,
   removeConnectSessionFromStorage,
@@ -53,14 +54,15 @@ import {
 } from './session-storage-core.js';
 import {
   appendConnectPopupDisplay,
+  getConnectPopupDeadline,
   getConnectPopupFeatures,
   isConnectIntentSettled,
+  isRetryableConnectApiStatus,
   type ConnectPopupOpener,
   type ConnectPopupSize,
   type ConnectPopupWindow,
 } from './popup-core.js';
 import {
-  getConnectPopupLoginDeadline,
   parseConnectAuthCallbackMessage,
   resolveConnectHostedUrl,
   type ConnectPopupLoginResult,
@@ -298,35 +300,64 @@ export function createSuperRareClient(
       }),
     );
   };
-  const watchPopupIntent = async (
-    popup: ConnectPopupWindow,
-    intentId: string,
-  ): Promise<void> => {
+  const watchPopupIntent = async (input: {
+    popup: ConnectPopupWindow;
+    intentId: string;
+    deadline: number;
+  }): Promise<void> => {
+    // Kept across ticks: a transient poll failure must not erase the state we
+    // already know, or an early close would have nothing to report.
+    let lastIntent: ConnectIntent | undefined;
+    const settleWatch = (): void => {
+      if (!isPopupClosed(input.popup)) input.popup.close();
+      if (lastIntent !== undefined) options.onIntentSettled?.(lastIntent);
+    };
+
     for (;;) {
       await sleep(POPUP_POLL_INTERVAL_MS);
-      let intent: ConnectIntent | undefined;
       try {
-        intent = await getConnectIntent({ ...apiOptions, intentId });
-      } catch {
-        // Transient fetch failure — keep watching while the popup is open.
+        lastIntent = await getConnectIntent({
+          ...apiOptions,
+          intentId: input.intentId,
+          signal: createRequestTimeoutSignal(POPUP_INTENT_POLL_TIMEOUT_MS),
+        });
+      } catch (error) {
+        // A 4xx means the intent is gone, expired or forbidden and will not
+        // become readable by asking again; anything else is worth another tick.
+        if (
+          error instanceof SuperRareConnectApiError &&
+          !isRetryableConnectApiStatus(error.status)
+        ) {
+          settleWatch();
+          return;
+        }
       }
 
-      if (intent !== undefined && isConnectIntentSettled(intent.status)) {
-        if (!popup.closed) popup.close();
-        options.onIntentSettled?.(intent);
+      if (lastIntent !== undefined && isConnectIntentSettled(lastIntent.status)) {
+        settleWatch();
         return;
       }
 
-      if (popup.closed) {
-        // The user dismissed the popup; report the latest known state.
-        if (intent === undefined) {
-          try {
-            intent = await getConnectIntent({ ...apiOptions, intentId });
-          } catch {
-            return;
-          }
+      if (isPopupClosed(input.popup)) {
+        // The user dismissed the popup; report the latest known state. If the
+        // popup closed before any poll landed there is nothing known yet, so
+        // one bounded read backs the documented "latest state" contract.
+        if (lastIntent === undefined) {
+          lastIntent = await getConnectIntent({
+            ...apiOptions,
+            intentId: input.intentId,
+            signal: createRequestTimeoutSignal(POPUP_INTENT_POLL_TIMEOUT_MS),
+          }).catch((): undefined => undefined);
         }
-        options.onIntentSettled?.(intent);
+
+        settleWatch();
+        return;
+      }
+
+      if (Date.now() >= input.deadline) {
+        // The intent can no longer change server-side, so polling past here
+        // would run for the life of the page.
+        settleWatch();
         return;
       }
     }
@@ -360,10 +391,12 @@ export function createSuperRareClient(
 
     // The popup must open before the first await to stay inside the user
     // gesture; otherwise browsers block it. It navigates once the intent exists.
-    // NOTE: uses the default window name (not a per-operation one like the login
-    // popup) — concurrent action/checkout popup naming is part of the separate
-    // checkout-hardening follow-up, not an oversight here.
-    const popup = options.display === 'popup' ? openPopupWindow() : null;
+    // Each action gets its own window name: a shared one lets a second action
+    // reuse the first's window, so one watcher could close the window a buyer
+    // is paying in.
+    const popup = options.display === 'popup'
+      ? openPopupWindow(`superrare-connect-intent-${createConnectPopupName()}`)
+      : null;
     let intent: ConnectIntentCreation;
     try {
       intent = resolveHostedIntent(await createConnectIntent({
@@ -384,7 +417,19 @@ export function createSuperRareClient(
 
     if (popup !== null) {
       popup.location.replace(appendConnectPopupDisplay(intent.url));
-      void watchPopupIntent(popup, intent.intentId);
+      void watchPopupIntent({
+        popup,
+        intentId: intent.intentId,
+        deadline: getConnectPopupDeadline({
+          expiresAt: intent.expiresAt,
+          now: Date.now(),
+          fallbackMilliseconds: POPUP_INTENT_FALLBACK_TIMEOUT_MS,
+        }) + POPUP_INTENT_DEADLINE_GRACE_MS,
+      }).catch(() => {
+        // The watcher owns its own cleanup; a throwing collaborator (a custom
+        // window, or the integrator's onIntentSettled) must not surface as an
+        // unhandled rejection.
+      });
     } else {
       navigation?.assign(intent.url);
     }
@@ -696,7 +741,7 @@ export function createSuperRareClient(
     }
 
     const popupUrl = appendConnectPopupDisplay(intent.url);
-    const deadline = getConnectPopupLoginDeadline({
+    const deadline = getConnectPopupDeadline({
       expiresAt: intent.expiresAt,
       now: Date.now(),
       fallbackMilliseconds: POPUP_LOGIN_FALLBACK_TIMEOUT_MS,
@@ -919,6 +964,15 @@ function readBrowserNavigation(): ConnectNavigation | undefined {
 }
 
 const POPUP_POLL_INTERVAL_MS = 2000;
+/** Bounds one status poll so a hung request cannot stall the whole watcher. */
+const POPUP_INTENT_POLL_TIMEOUT_MS = 15_000;
+/** Deadline for an action popup whose intent carries an unusable expiry. */
+const POPUP_INTENT_FALLBACK_TIMEOUT_MS = 15 * 60_000;
+/**
+ * Keep polling a little past the intent's expiry so the server's own terminal
+ * `expired` status is what gets reported, rather than a synthetic client stop.
+ */
+const POPUP_INTENT_DEADLINE_GRACE_MS = 30_000;
 /** Deadline for a popup login whose intent carries an unparseable expiry. */
 const POPUP_LOGIN_FALLBACK_TIMEOUT_MS = 15 * 60_000;
 /**
