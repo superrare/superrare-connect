@@ -320,7 +320,7 @@ example's `workspace:*` dependency with the GitHub package reference for the
 committed Connect build head, for example:
 
 ```json
-"@rareprotocol/connect": "github:superrare/superrare-connect#<connect-build-head-sha>"
+"@rareprotocol/connect": "github:superrare/superrare-connect#7529633"
 ```
 
 Hosted URLs contain only the short-lived opaque intent identifier. Completion
