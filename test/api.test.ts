@@ -441,6 +441,15 @@ describe('Connect API client', () => {
     expect(fetchImplementation).toHaveBeenCalledTimes(2);
   });
 
+  it('surfaces nested Rare API validation messages', async () => {
+    await expect(createConnectProduct({
+      apiUrl: 'https://rare-api.test',
+      fetch: async () => jsonResponse({ error: { code: 'validation_error', message: 'Title is required' } }, { status: 400 }),
+      product: { slug: 'artist-work', metadata: { title: '' } },
+      sessionId: 'connect_session_123',
+    })).rejects.toThrow('Title is required');
+  });
+
   it('uses the Rare API candidate path and persistence-page variant response', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);

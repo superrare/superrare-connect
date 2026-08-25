@@ -315,12 +315,11 @@ await superrare.seller.openListingManager({
 The `examples/react` application in this repository is an integrator example for
 these APIs. It calls the authenticated Product methods and hosted seller
 launchers directly from `@rareprotocol/connect`; it does not import or proxy
-`connect-com`. When consuming this package from another repository, replace the
-example's `workspace:*` dependency with the GitHub package reference for the
-committed Connect build head, for example:
+`connect-com`. When consuming this package from another repository, use the
+GitHub package reference for a committed Connect build head, for example:
 
 ```json
-"@rareprotocol/connect": "github:superrare/superrare-connect#7529633"
+"@rareprotocol/connect": "github:superrare/superrare-connect#1c77ed9e8d61c8dcb3b8231e1b3376c1f45d913a"
 ```
 
 Hosted URLs contain only the short-lived opaque intent identifier. Completion
