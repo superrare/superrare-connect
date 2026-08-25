@@ -1,5 +1,7 @@
 export type ConnectActionType =
   | 'login'
+  | 'seller-product-manager'
+  | 'seller-listing-manager'
   | 'checkout'
   | 'bid'
   | 'buy'
@@ -18,9 +20,37 @@ export type ConnectIntentStatus =
   | 'cancelled'
   | 'expired';
 
+export type ConnectSellerCompletion =
+  | {
+    kind: 'product-manager';
+    productId?: string;
+  }
+  | {
+    cartAddress: string;
+    chainId: number;
+    kind: 'listing-manager';
+    listingDigests: string[];
+    productId: string;
+    rootDigest: string;
+  };
+
+export type ConnectIntentPayment = {
+  email?: string;
+  method?: 'card';
+  recipient?: string;
+  recipientBoundByCheckout?: boolean;
+};
+
 export type ConnectIntentResult = {
   approvalTxHash?: string;
+  cartAddress?: string;
+  chainId?: number;
+  listingDigests?: string[];
+  paymentId?: string;
+  productId?: string;
   referenceId?: string;
+  rootDigest?: string;
+  sellerCompletion?: ConnectSellerCompletion;
   sessionId?: string;
   transactionHash?: string;
 };
@@ -66,6 +96,7 @@ export type ConnectIntent = {
   initiatingOrigin?: string;
   returnPath: string;
   expiresAt: string;
+  payment?: ConnectIntentPayment;
   resolvedActionSnapshot?: ConnectResolvedActionSnapshot;
   result?: ConnectIntentResult;
   error?: {

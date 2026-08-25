@@ -2,10 +2,17 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createConnectIntent,
   createConnectLoginIntent,
+  createConnectProduct,
   getConnectCheckoutStatus,
   getConnectCurrentUser,
+  getConnectProductMine,
   getConnectIntent,
   getConnectSession,
+  listConnectProductCandidates,
+  listConnectProductsMine,
+  addConnectProductVariants,
+  restoreConnectProductToDraft,
+  publishConnectProduct,
 } from '../src/api.js';
 import type { ConnectErc1155CheckoutTarget } from '../src/auth-flow-core.js';
 
@@ -129,6 +136,61 @@ describe('Connect API client', () => {
     })).resolves.toMatchObject({
       intentId: 'connect_intent_123',
       status: 'completed',
+    });
+  });
+
+  it('preserves seller completion and payment fields in intent status', async () => {
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+
+      expect(request.method).toBe('GET');
+      expect(request.url).toBe('https://rare-api.test/v1/connect/intents/seller_listing_intent');
+
+      return jsonResponse({
+        data: {
+          intentId: 'seller_listing_intent',
+          type: 'seller-listing-manager',
+          status: 'completed',
+          returnPath: '/inventory',
+          expiresAt: '2026-06-22T00:00:00.000Z',
+          payment: {
+            method: 'card',
+            recipient: '0x0000000000000000000000000000000000000001',
+            recipientBoundByCheckout: true,
+          },
+          result: {
+            paymentId: 'coinflow_payment_123',
+            sellerCompletion: {
+              kind: 'listing-manager',
+              productId: '123',
+              chainId: 11155111,
+              cartAddress: '0x0000000000000000000000000000000000000002',
+              rootDigest: '0xroot',
+              listingDigests: ['0xlisting'],
+            },
+          },
+        },
+      });
+    });
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'seller_listing_intent',
+    })).resolves.toMatchObject({
+      payment: {
+        method: 'card',
+        recipientBoundByCheckout: true,
+      },
+      result: {
+        paymentId: 'coinflow_payment_123',
+        sellerCompletion: {
+          kind: 'listing-manager',
+          productId: '123',
+          chainId: 11155111,
+          listingDigests: ['0xlisting'],
+        },
+      },
     });
   });
 
@@ -321,7 +383,134 @@ describe('Connect API client', () => {
       avatarUri: null,
     });
   });
+
+  it('lists account-owned Products with the Connect session', async () => {
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+
+      expect(request.method).toBe('GET');
+      expect(request.url).toBe('https://rare-api.test/v1/cart/products/mine?page=2&perPage=10');
+      expect(request.headers.get('authorization')).toBe('Bearer connect_session_123');
+
+      return jsonResponse({
+        data: [productFixture],
+        hasNextPage: false,
+      });
+    });
+
+    await expect(listConnectProductsMine({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      page: 2,
+      perPage: 10,
+      sessionId: 'connect_session_123',
+    })).resolves.toEqual({ data: [productFixture], hasNextPage: false });
+  });
+
+  it('creates and publishes Products through account-scoped endpoints', async () => {
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      expect(request.headers.get('authorization')).toBe('Bearer connect_session_123');
+
+      if (request.url === 'https://rare-api.test/v1/cart/products') {
+        expect(request.url).toBe('https://rare-api.test/v1/cart/products');
+        expect(await request.json()).toEqual({
+          slug: 'artist-work',
+          metadata: { title: 'Artist Work' },
+        });
+      } else {
+        expect(request.method).toBe('POST');
+        expect(request.url).toBe('https://rare-api.test/v1/cart/products/123/publish');
+      }
+
+      return jsonResponse({ data: productFixture });
+    });
+
+    await expect(createConnectProduct({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      product: { slug: 'artist-work', metadata: { title: 'Artist Work' } },
+      sessionId: 'connect_session_123',
+    })).resolves.toEqual(productFixture);
+    await expect(publishConnectProduct({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      productId: '123',
+      sessionId: 'connect_session_123',
+    })).resolves.toEqual(productFixture);
+    expect(fetchImplementation).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the Rare API candidate path and persistence-page variant response', async () => {
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      expect(request.headers.get('authorization')).toBe('Bearer connect_session_123');
+      if (request.method === 'GET') {
+        expect(request.url).toBe('https://rare-api.test/v1/cart/products/variant-candidates?page=1&perPage=20&productId=123');
+      } else {
+        expect(request.url).toBe('https://rare-api.test/v1/cart/products/123/variants');
+        expect(await request.json()).toEqual({ universalTokenIds: ['11155111-0xcontract-42'] });
+      }
+
+      return request.method === 'GET'
+        ? jsonResponse({
+          records: [{
+            resourceType: 'cart_nft_candidate',
+            id: '1',
+            record: { universal_token_id: '11155111-0xcontract-42', sku: null, is_attached: false },
+          }],
+          hasNextPage: false,
+        })
+        : jsonResponse({ data: productFixture });
+    });
+
+    await expect(listConnectProductCandidates({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      productId: '123',
+      sessionId: 'connect_session_123',
+    })).resolves.toMatchObject({ records: [{ resourceType: 'cart_nft_candidate' }] });
+    await expect(addConnectProductVariants({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      product: { productId: '123', universalTokenIds: ['11155111-0xcontract-42'] },
+      sessionId: 'connect_session_123',
+    })).resolves.toEqual(productFixture);
+  });
+
+  it('uses the owner Product detail and restore routes', async () => {
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      expect(request.headers.get('authorization')).toBe('Bearer connect_session_123');
+      expect(request.url).toMatch(/https:\/\/rare-api\.test\/v1\/cart\/products(?:\/mine\/123|\/123\/restore)$/);
+      return jsonResponse({ data: productFixture });
+    });
+
+    await expect(getConnectProductMine({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      productId: '123',
+      sessionId: 'connect_session_123',
+    })).resolves.toEqual(productFixture);
+    await expect(restoreConnectProductToDraft({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      productId: '123',
+      sessionId: 'connect_session_123',
+    })).resolves.toEqual(productFixture);
+  });
 });
+
+const productFixture = {
+  id: '123',
+  userId: '456',
+  slug: 'artist-work',
+  status: 'DRAFT' as const,
+  metadata: { title: 'Artist Work', displayMode: 'gallery' },
+  variants: [],
+  createdAt: '2026-06-22T00:00:00.000Z',
+  updatedAt: '2026-06-22T00:00:00.000Z',
+};
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {

@@ -2,10 +2,22 @@ import {
   createConnectIntent,
   createConnectLoginIntent,
   exchangeConnectAuthCode,
+  addConnectProductVariants,
+  archiveConnectProduct,
+  createConnectProduct,
   getConnectCheckoutStatus,
   getConnectCurrentUser,
   getConnectIntent,
+  getConnectProductMine,
   getConnectSession,
+  listConnectProductCandidates,
+  listConnectProductsMine,
+  publishConnectProduct,
+  removeConnectProductVariant,
+  reorderConnectProductVariants,
+  restoreConnectProductToDraft,
+  setConnectProductVariantVisibility,
+  updateConnectProduct,
   type ConnectAuthApiOptions,
   type ConnectCurrentUser,
   type ConnectIntentCreation,
@@ -39,6 +51,25 @@ import {
   type CheckoutStartParams,
 } from './checkout-flow-core.js';
 import { SuperRareConnectApiError } from './errors.js';
+import {
+  buildConnectSellerListingIntentRequest,
+  buildConnectSellerProductIntentRequest,
+  type SellerListingManagerParams,
+  type SellerManagerParams,
+} from './seller-flow-core.js';
+import type {
+  AddProductVariantsParams,
+  Product,
+  ProductCandidateListParams,
+  ProductListParams,
+  ProductPage,
+  ProductRecordPage,
+  ProductUpdateParams,
+  ProductWriteParams,
+  RemoveProductVariantParams,
+  ReorderProductVariantsParams,
+  SetProductVariantVisibilityParams,
+} from './product-flow-core.js';
 import {
   readConnectSessionFromStorage,
   removeConnectSessionFromStorage,
@@ -147,6 +178,33 @@ export type SuperRareConnectOffersNamespace = {
   getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
+export type SuperRareConnectCartProductsNamespace = {
+  listMine: (params?: ProductListParams) => Promise<ProductPage<Product>>;
+  getMine: (params: { productId: string }) => Promise<Product>;
+  create: (params: ProductWriteParams) => Promise<Product>;
+  update: (params: { productId: string } & ProductUpdateParams) => Promise<Product>;
+  publish: (params: { productId: string }) => Promise<Product>;
+  archive: (params: { productId: string }) => Promise<Product>;
+  restoreToDraft: (params: { productId: string }) => Promise<Product>;
+  variants: {
+    listCandidates: (params?: ProductCandidateListParams) => Promise<ProductRecordPage>;
+    addMany: (params: AddProductVariantsParams) => Promise<Product>;
+    remove: (params: RemoveProductVariantParams) => Promise<Product>;
+    reorder: (params: ReorderProductVariantsParams) => Promise<Product>;
+    setVisibility: (params: SetProductVariantVisibilityParams) => Promise<Product>;
+  };
+};
+
+export type SuperRareConnectCartHostedNamespace = {
+  openProductManager: (params?: SellerManagerParams) => Promise<ConnectIntentCreation>;
+  openListingManager: (params: SellerListingManagerParams) => Promise<ConnectIntentCreation>;
+};
+
+export type SuperRareConnectCartNamespace = {
+  products: SuperRareConnectCartProductsNamespace;
+  hosted: SuperRareConnectCartHostedNamespace;
+};
+
 export type SuperRareConnectIntentsNamespace = {
   get: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
@@ -157,6 +215,7 @@ export type SuperRareConnectClient = {
   checkout: SuperRareConnectCheckoutNamespace;
   actions: SuperRareConnectActionsNamespace;
   offers: SuperRareConnectOffersNamespace;
+  cart: SuperRareConnectCartNamespace;
   intents: SuperRareConnectIntentsNamespace;
 };
 
@@ -183,6 +242,24 @@ export class ConnectSessionRequiredError extends Error {
   constructor() {
     super('A Connect session is required.');
     this.name = 'ConnectSessionRequiredError';
+  }
+}
+
+export class ConnectAuthenticationRequiredError extends Error {
+  readonly code = 'authentication_required';
+
+  constructor() {
+    super('Connect authentication is required.');
+    this.name = 'ConnectAuthenticationRequiredError';
+  }
+}
+
+export class ConnectProductIdError extends Error {
+  readonly code = 'invalid_product_id';
+
+  constructor() {
+    super('A Product ID is required.');
+    this.name = 'ConnectProductIdError';
   }
 }
 
@@ -236,6 +313,31 @@ export function createSuperRareClient(
     sessionCommitGeneration += 1;
     writeConnectSessionToStorage(storage, storageKey, session);
     notifySessionListeners(sessionListeners, session);
+  };
+  const clearStoredSession = (): void => {
+    sessionCommitGeneration += 1;
+    removeConnectSessionFromStorage(storage, storageKey);
+    notifySessionListeners(sessionListeners, undefined);
+  };
+  const requireSessionId = (): string => {
+    const session = readConnectSessionFromStorage(storage, storageKey);
+    if (session === undefined) {
+      throw new ConnectSessionRequiredError();
+    }
+
+    return session.sessionId;
+  };
+  const accountRequest = async <T>(request: () => Promise<T>): Promise<T> => {
+    try {
+      return await request();
+    } catch (error) {
+      if (error instanceof SuperRareConnectApiError && error.status === 401) {
+        clearStoredSession();
+        throw new ConnectAuthenticationRequiredError();
+      }
+
+      throw error;
+    }
   };
   const openPopupWindow = (
     target = 'superrare-connect',
@@ -387,9 +489,14 @@ export function createSuperRareClient(
       | ReturnType<typeof buildConnectMintIntentRequest>
       | ReturnType<typeof buildConnectMakeOfferIntentRequest>
       | ReturnType<typeof buildConnectAcceptOfferIntentRequest>
-      | ReturnType<typeof buildConnectCancelOfferIntentRequest>,
+      | ReturnType<typeof buildConnectCancelOfferIntentRequest>
+      | ReturnType<typeof buildConnectSellerProductIntentRequest>
+      | ReturnType<typeof buildConnectSellerListingIntentRequest>,
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
+      if (requestResult.error === 'invalid_product_id') {
+        throw new ConnectProductIdError();
+      }
       throw new ConnectReturnPathError();
     }
 
@@ -434,15 +541,10 @@ export function createSuperRareClient(
     return intent;
   };
   const me = async (): Promise<ConnectCurrentUser> => {
-    const session = readConnectSessionFromStorage(storage, storageKey);
-    if (session === undefined) {
-      throw new ConnectSessionRequiredError();
-    }
-
-    return await getConnectCurrentUser({
+    return await accountRequest(() => getConnectCurrentUser({
       ...apiOptions,
-      sessionId: session.sessionId,
-    });
+      sessionId: requireSessionId(),
+    }));
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
   let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
@@ -777,12 +879,10 @@ export function createSuperRareClient(
         return await me();
       },
       clearSession(): void {
-        sessionCommitGeneration += 1;
-        removeConnectSessionFromStorage(storage, storageKey);
-        notifySessionListeners(sessionListeners, undefined);
+        clearStoredSession();
       },
       logout(): void {
-        this.clearSession();
+        clearStoredSession();
       },
       onChange(callback): () => void {
         sessionListeners.add(callback);
@@ -872,6 +972,114 @@ export function createSuperRareClient(
           ...apiOptions,
           intentId: params.intentId,
         });
+      },
+    },
+    cart: {
+      products: {
+        async listMine(params = {}): Promise<ProductPage<Product>> {
+          return await accountRequest(() => listConnectProductsMine({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async getMine(params): Promise<Product> {
+          return await accountRequest(() => getConnectProductMine({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async create(params): Promise<Product> {
+          return await accountRequest(() => createConnectProduct({
+            ...apiOptions,
+            product: params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async update(params): Promise<Product> {
+          const { productId, ...product } = params;
+          return await accountRequest(() => updateConnectProduct({
+            ...apiOptions,
+            productId,
+            product,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async publish(params): Promise<Product> {
+          return await accountRequest(() => publishConnectProduct({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async archive(params): Promise<Product> {
+          return await accountRequest(() => archiveConnectProduct({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async restoreToDraft(params): Promise<Product> {
+          return await accountRequest(() => restoreConnectProductToDraft({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        variants: {
+          async listCandidates(params = {}): Promise<ProductRecordPage> {
+            return await accountRequest(() => listConnectProductCandidates({
+              ...apiOptions,
+              ...params,
+              sessionId: requireSessionId(),
+            }));
+          },
+          async addMany(params): Promise<Product> {
+            return await accountRequest(() => addConnectProductVariants({
+              ...apiOptions,
+              product: params,
+              sessionId: requireSessionId(),
+            }));
+          },
+          async remove(params): Promise<Product> {
+            return await accountRequest(() => removeConnectProductVariant({
+              ...apiOptions,
+              variant: params,
+              sessionId: requireSessionId(),
+            }));
+          },
+          async reorder(params): Promise<Product> {
+            return await accountRequest(() => reorderConnectProductVariants({
+              ...apiOptions,
+              variants: params,
+              sessionId: requireSessionId(),
+            }));
+          },
+          async setVisibility(params): Promise<Product> {
+            return await accountRequest(() => setConnectProductVariantVisibility({
+              ...apiOptions,
+              variant: params,
+              sessionId: requireSessionId(),
+            }));
+          },
+        },
+      },
+      hosted: {
+        async openProductManager(params = {}): Promise<ConnectIntentCreation> {
+          return await startIntent(buildConnectSellerProductIntentRequest({
+            ...params,
+            state: createState(),
+            initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+          }));
+        },
+        async openListingManager(params): Promise<ConnectIntentCreation> {
+          return await startIntent(buildConnectSellerListingIntentRequest({
+            ...params,
+            state: createState(),
+            initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+          }));
+        },
       },
     },
     intents: {
@@ -1117,4 +1325,3 @@ function resolveHostedConnectUrl(input: {
   hostedUrl.password = connectUrl.password;
   return hostedUrl.toString();
 }
-

@@ -1,6 +1,8 @@
 export {
+  ConnectAuthenticationRequiredError,
   ConnectAuthPendingError,
   ConnectPopupBlockedError,
+  ConnectProductIdError,
   ConnectReturnPathError,
   ConnectSessionRequiredError,
   createSuperRareClient,
@@ -10,6 +12,9 @@ export {
   type ConnectPopupMessageEvents,
   type ConnectSessionChangeCallback,
   type SuperRareConnectAuthNamespace,
+  type SuperRareConnectCartHostedNamespace,
+  type SuperRareConnectCartNamespace,
+  type SuperRareConnectCartProductsNamespace,
   type SuperRareConnectCheckoutNamespace,
   type SuperRareConnectClient,
   type SuperRareConnectClientOptions,
@@ -68,6 +73,41 @@ export {
 export {
   type CheckoutStartParams,
 } from './checkout-flow-core.js';
+export {
+  productCandidateListResponseSchema,
+  productListResponseSchema,
+  productMediaSchema,
+  productMetadataSchema,
+  productPersistenceRecordSchema,
+  productResponseSchema,
+  productSchema,
+  productVariantSchema,
+  type AddProductVariantsParams,
+  type Product,
+  type ProductCandidate,
+  type ProductCandidateListParams,
+  type ProductListParams,
+  type ProductMedia,
+  type ProductMetadata,
+  type ProductPage,
+  type ProductPersistenceRecord,
+  type ProductRecordPage,
+  type ProductUpdateParams,
+  type ProductVariant,
+  type ProductWriteParams,
+  type RemoveProductVariantParams,
+  type ReorderProductVariantsParams,
+  type SetProductVariantVisibilityParams,
+} from './product-flow-core.js';
+export {
+  buildConnectSellerListingIntentRequest,
+  buildConnectSellerProductIntentRequest,
+  type BuildConnectSellerIntentRequestInput,
+  type BuildConnectSellerIntentRequestResult,
+  type BuildConnectSellerListingIntentRequestInput,
+  type SellerListingManagerParams,
+  type SellerManagerParams,
+} from './seller-flow-core.js';
 export {
   SuperRareConnectApiError,
 } from './errors.js';

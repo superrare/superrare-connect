@@ -212,6 +212,8 @@ export type ConnectCancelOfferTarget =
 
 export type ConnectActionInput =
   | { type: 'login' }
+  | { type: 'seller-product-manager' }
+  | { type: 'seller-listing-manager'; productId: string }
   | {
     type: 'buy';
     target: ConnectErc721DirectListingTarget | ConnectErc721BatchListingTarget;
