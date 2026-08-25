@@ -210,6 +210,20 @@ export type SuperRareConnectCartProductsNamespace = {
   };
 };
 
+export type ConnectSellerProductManagerResult = {
+  status: 'completed' | 'cancelled';
+  productId?: string;
+};
+
+export type ConnectSellerListingManagerResult = {
+  status: 'completed' | 'cancelled';
+  productId?: string;
+  chainId?: number;
+  cartAddress?: string;
+  rootDigest?: string;
+  listingDigests?: string[];
+};
+
 export type SuperRareConnectCartHostedNamespace = {
   openProductManager: (params?: SellerManagerParams) => Promise<ConnectIntentCreation>;
   openListingManager: (params: SellerListingManagerParams) => Promise<ConnectIntentCreation>;

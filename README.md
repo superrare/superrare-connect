@@ -269,6 +269,65 @@ Both default to the browser's own `window.open` and `window.addEventListener('me
 
 Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session.
 
+## Account-Scoped Products And Hosted Seller Flows
+
+Product management requires an authenticated Connect session. The SDK sends the opaque session as a Bearer token to Rare API; it does not persist or own Product data. Public Product search and detail remain anonymous protocol operations.
+
+```ts
+const products = await superrare.products.listMine();
+
+const product = await superrare.products.create({
+  metadata: {
+    title: 'A New Work',
+    description: 'Optional presentation copy',
+  },
+});
+
+await superrare.products.variants.addMany({
+  productId: product.id,
+  universalTokenIds: ['11155111-0x1234567890123456789012345678901234567890-42'],
+});
+
+await superrare.products.publish({ productId: product.id });
+```
+
+The account-scoped namespace also provides `getMine`, `update`, `archive`,
+`restoreToDraft`, and variant `listCandidates`, `remove`, `reorder`, and
+`setVisibility`. If the session is absent or invalid, Rare API returns the
+standard `401` response and the client reports that authentication is required.
+
+Integrations can supply their own Product and Listing UI or launch the hosted
+SuperRare seller experiences. Launching a hosted manager does not require a
+pre-existing session; the hosted application authenticates before reading or
+mutating account-owned data.
+
+```ts
+await superrare.seller.openProductManager({
+  returnPath: '/inventory',
+});
+
+await superrare.seller.openListingManager({
+  productId: product.id,
+  returnPath: `/products/${product.id}`,
+});
+```
+
+The `examples/react` application in this repository is an integrator example for
+these APIs. It calls the authenticated Product methods and hosted seller
+launchers directly from `@rareprotocol/connect`; it does not import or proxy
+`connect-com`. When consuming this package from another repository, replace the
+example's `workspace:*` dependency with the GitHub package reference for the
+committed Connect build head, for example:
+
+```json
+"@rareprotocol/connect": "github:superrare/superrare-connect#<connect-build-head-sha>"
+```
+
+Hosted URLs contain only the short-lived opaque intent identifier. Completion
+status and the narrow Product/Listing result are read through the existing
+intent status APIs; reusable Connect sessions and wallet payloads never cross
+through a URL or hosted-flow result.
+
 ## Session And User
 
 ```ts

@@ -30,6 +30,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "pnpm typecheck && tsup",
+    "prepare": "pnpm build",
     "test": "pnpm build && pnpm --dir examples/react typecheck && vitest run",
     "prepublishOnly": "pnpm build && pnpm test"
   },
