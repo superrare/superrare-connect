@@ -28,8 +28,8 @@ importers:
   examples/react:
     dependencies:
       '@rareprotocol/connect':
-        specifier: github:superrare/superrare-connect#1c77ed9e8d61c8dcb3b8231e1b3376c1f45d913a
-        version: https://codeload.github.com/superrare/superrare-connect/tar.gz/1c77ed9e8d61c8dcb3b8231e1b3376c1f45d913a
+        specifier: github:superrare/superrare-connect#e4cf1d7
+        version: https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7
       '@rareprotocol/rare-cli':
         specifier: ^1.4.0
         version: 1.4.0(typescript@5.9.3)
@@ -368,8 +368,8 @@ packages:
   '@oxc-project/types@0.133.0':
     resolution: {integrity: sha512-KzkdCd6Uxqnf6l3HOw1xfatAlUURA0g14cvBYFyJ5SaNOQbOUvBr9PKArcPcrNIeRsBdgcUzOGrhKveVpvOIGA==}
 
-  '@rareprotocol/connect@https://codeload.github.com/superrare/superrare-connect/tar.gz/1c77ed9e8d61c8dcb3b8231e1b3376c1f45d913a':
-    resolution: {tarball: https://codeload.github.com/superrare/superrare-connect/tar.gz/1c77ed9e8d61c8dcb3b8231e1b3376c1f45d913a}
+  '@rareprotocol/connect@https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7':
+    resolution: {tarball: https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7}
     version: 0.3.0
 
   '@rareprotocol/rare-cli@1.4.0':
@@ -1918,7 +1918,7 @@ snapshots:
 
   '@oxc-project/types@0.133.0': {}
 
-  '@rareprotocol/connect@https://codeload.github.com/superrare/superrare-connect/tar.gz/1c77ed9e8d61c8dcb3b8231e1b3376c1f45d913a':
+  '@rareprotocol/connect@https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7':
     dependencies:
       zod: 4.4.3
 

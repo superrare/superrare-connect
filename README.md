@@ -319,7 +319,7 @@ launchers directly from `@rareprotocol/connect`; it does not import or proxy
 GitHub package reference for a committed Connect build head, for example:
 
 ```json
-"@rareprotocol/connect": "github:superrare/superrare-connect#1c77ed9e8d61c8dcb3b8231e1b3376c1f45d913a"
+"@rareprotocol/connect": "github:superrare/superrare-connect#e4cf1d7"
 ```
 
 Hosted URLs contain only the short-lived opaque intent identifier. Completion
