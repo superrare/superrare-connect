@@ -1188,6 +1188,138 @@ describe('createSuperRareClient', () => {
     }
   });
 
+  it('breaks the gone streak when a retryable failure interrupts it', async () => {
+    // 404 → 503 → 404 is not "two consecutive" gone answers: the 503 says the
+    // server is having a moment, so the count starts over — and a healthy
+    // answer afterwards proves the watcher was right to keep going.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1 || statusRequests === 3) {
+              return jsonResponse({ error: 'not found' }, { status: 404 });
+            }
+            if (statusRequests === 2) {
+              return jsonResponse({ error: 'unavailable' }, { status: 503 });
+            }
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: futureExpiry(),
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(statusRequests).toBe(4);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('completed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not replay a stale snapshot when the close-tick reread says gone', async () => {
+    // processing seen, then the buyer closes on a tick that 410s, and the
+    // bounded reread 410s too: reporting the old `processing` would tell the
+    // integrator a disowned intent is still in flight. The 410 is the expiry
+    // and is reported as such.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'processing',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            popup.closed = true;
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('expired');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('re-reads before reporting an early close whose last poll failed', async () => {
     // People close the window right when the status changes. If the tick that
     // saw the close also failed, the known state is 2s old — a success would

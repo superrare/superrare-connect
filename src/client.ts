@@ -347,9 +347,13 @@ export function createSuperRareClient(
       } catch (error) {
         lastPollFailed = true;
         if (
-          error instanceof SuperRareConnectApiError &&
-          !isRetryableConnectApiStatus(error.status)
+          !(error instanceof SuperRareConnectApiError) ||
+          isRetryableConnectApiStatus(error.status)
         ) {
+          // A retryable failure between two gone answers breaks the streak:
+          // the threshold means consecutive, or it means nothing.
+          consecutiveGoneResponses = 0;
+        } else {
           // One 4xx can be edge infrastructure having a moment; two in a row
           // is the server's answer. Rare API never writes an `expired` status
           // to the intent itself — expiry IS this 410 — so that answer is
@@ -376,8 +380,23 @@ export function createSuperRareClient(
         // read backs the documented contract when nothing is known yet or the
         // known state predates a failed tick.
         if (lastIntent === undefined || lastPollFailed) {
-          const freshIntent = await pollIntent().catch((): undefined => undefined);
-          lastIntent = freshIntent ?? lastIntent;
+          try {
+            lastIntent = await pollIntent();
+          } catch (rereadError) {
+            if (
+              rereadError instanceof SuperRareConnectApiError &&
+              !isRetryableConnectApiStatus(rereadError.status)
+            ) {
+              // Same policy as the loop above: a disowned intent must not be
+              // replayed as still in flight from a stale snapshot. 410 IS the
+              // expiry; anything else gone leaves nothing honest to report.
+              if (rereadError.status === 410 && lastIntent !== undefined) {
+                options.onIntentSettled?.({ ...lastIntent, status: 'expired' });
+              }
+              return;
+            }
+            // A retryable blip: the last known state is the best we have.
+          }
         }
 
         if (lastIntent !== undefined) options.onIntentSettled?.(lastIntent);
