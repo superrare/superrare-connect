@@ -354,16 +354,21 @@ export function createSuperRareClient(
           // the threshold means consecutive, or it means nothing.
           consecutiveGoneResponses = 0;
         } else {
-          // One 4xx can be edge infrastructure having a moment; two in a row
-          // is the server's answer. Rare API never writes an `expired` status
-          // to the intent itself — expiry IS this 410 — so that answer is
-          // reported as the terminal state it means. A 404 (evicted, unknown)
-          // leaves nothing honest to report.
-          consecutiveGoneResponses += 1;
-          if (consecutiveGoneResponses >= POPUP_INTENT_GONE_CONFIRMATIONS) {
-            if (error.status === 410 && lastIntent !== undefined) {
+          // Rare API never writes an `expired` status to the intent itself —
+          // expiry IS a 410, and nothing at the edge fakes that status — so a
+          // single one is definitive and is reported as the terminal state it
+          // means. The ambiguous 4xxs (a 403 from a WAF, a 404 off a stale
+          // replica) get one benefit of the doubt: two in a row is the
+          // server's answer, and a 404 leaves nothing honest to report.
+          if (error.status === 410) {
+            if (lastIntent !== undefined) {
               options.onIntentSettled?.({ ...lastIntent, status: 'expired' });
             }
+            return;
+          }
+
+          consecutiveGoneResponses += 1;
+          if (consecutiveGoneResponses >= POPUP_INTENT_GONE_CONFIRMATIONS) {
             return;
           }
         }

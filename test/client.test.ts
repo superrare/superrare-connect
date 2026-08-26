@@ -1178,7 +1178,9 @@ describe('createSuperRareClient', () => {
 
       await vi.advanceTimersByTimeAsync(6000);
 
-      expect(statusRequests).toBe(3);
+      // One 410 is definitive: rare-api only answers it for expiry, so the
+      // watcher does not spend a confirmation tick on it.
+      expect(statusRequests).toBe(2);
       expect(popup.closed).toBe(false);
       expect(settled).toHaveLength(1);
       expect(settled[0]?.status).toBe('expired');
