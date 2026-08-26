@@ -1058,7 +1058,9 @@ describe('createSuperRareClient', () => {
       await vi.advanceTimersByTimeAsync(10 * 60_000);
 
       expect(statusRequests).toBe(requestsAfterDeadline);
-      expect(popup.closed).toBe(true);
+      // Only a KNOWN terminal outcome closes the buyer's window; a fallback
+      // stop leaves it to the hosted page, which may be mid-payment.
+      expect(popup.closed).toBe(false);
       // The documented deadline contract: the integrator hears about the stop,
       // and the payload can be non-terminal — their code must check status.
       expect(settled).toHaveLength(1);
@@ -1106,20 +1108,24 @@ describe('createSuperRareClient', () => {
         returnPath: '/buy/complete',
       });
 
-      await vi.advanceTimersByTimeAsync(2000);
-      expect(statusRequests).toBe(1);
+      // One 4xx can be edge infrastructure having a moment; the watcher only
+      // believes the second consecutive one.
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(statusRequests).toBe(2);
 
       await vi.advanceTimersByTimeAsync(10_000);
-      expect(statusRequests).toBe(1);
+      expect(statusRequests).toBe(2);
+      expect(popup.closed).toBe(false);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('does not report a stale non-terminal state when the intent vanishes', async () => {
-    // requires_user followed by 410: the server has disowned the intent, so
-    // handing the integrator the old requires_user as "settled" would read as
-    // a flow still in progress. Close and stay silent instead.
+  it('reports expired when the server says the intent expired', async () => {
+    // Rare API never writes an `expired` status to the intent — expiry IS the
+    // 410. Handing back the old requires_user would read as a flow still in
+    // progress; the honest terminal answer is expired. The window stays open:
+    // only the hosted page knows whether closing mid-payment is safe.
     vi.useFakeTimers();
     try {
       let statusRequests = 0;
@@ -1170,11 +1176,91 @@ describe('createSuperRareClient', () => {
         returnPath: '/buy/complete',
       });
 
-      await vi.advanceTimersByTimeAsync(4000);
+      await vi.advanceTimersByTimeAsync(6000);
 
-      expect(statusRequests).toBe(2);
-      expect(popup.closed).toBe(true);
-      expect(settled).toEqual([]);
+      expect(statusRequests).toBe(3);
+      expect(popup.closed).toBe(false);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('expired');
+      expect(settled[0]?.intentId).toBe('connect_intent_buy');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('re-reads before reporting an early close whose last poll failed', async () => {
+    // People close the window right when the status changes. If the tick that
+    // saw the close also failed, the known state is 2s old — a success would
+    // be reported as `processing`. The close branch re-reads first.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'processing',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            if (statusRequests === 2) {
+              // The buyer closes on the tick whose poll also fails: the known
+              // state is now one interval old.
+              popup.closed = true;
+              return jsonResponse({ error: 'flaky edge' }, { status: 503 });
+            }
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: futureExpiry(),
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(statusRequests).toBe(3);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('completed');
     } finally {
       vi.useRealTimers();
     }
