@@ -89,7 +89,11 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   };
   /**
    * Popup mode only: called once the intent reaches a terminal status, or with
-   * the latest intent state when the user closes the popup early.
+   * the latest known intent state when the user closes the popup early or the
+   * SDK stops watching at the intent's expiry. The last two can carry a
+   * non-terminal status, so check `intent.status` before treating the flow as
+   * finished. Not called when the server disowns the intent (404/410) before
+   * any terminal state was seen.
    */
   onIntentSettled?: (intent: ConnectIntent) => void;
   sessionStorage?: ConnectSessionStorage | false;
@@ -328,7 +332,17 @@ export function createSuperRareClient(
           error instanceof SuperRareConnectApiError &&
           !isRetryableConnectApiStatus(error.status)
         ) {
-          settleWatch();
+          // The server has disowned the intent, so a non-terminal last-known
+          // state is stale noise, not a result: reporting `processing` for an
+          // intent that no longer exists would read as a payment in flight.
+          // Close and stop; only a terminal state is worth handing over.
+          if (!isPopupClosed(input.popup)) input.popup.close();
+          if (
+            lastIntent !== undefined &&
+            isConnectIntentSettled(lastIntent.status)
+          ) {
+            options.onIntentSettled?.(lastIntent);
+          }
           return;
         }
       }
