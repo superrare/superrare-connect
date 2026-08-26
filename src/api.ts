@@ -199,12 +199,14 @@ export async function createConnectLoginIntent(input: {
 
 export async function getConnectIntent(input: {
   intentId: string;
+  signal?: AbortSignal;
 } & ConnectAuthApiOptions): Promise<ConnectIntent> {
   const body = await requestConnectApiJson({
     path: `${connectIntentsPath}/${encodeURIComponent(input.intentId)}`,
     method: 'GET',
     apiUrl: input.apiUrl,
     fetch: input.fetch,
+    signal: input.signal,
   });
   const parsedResponse = getConnectIntentResponseSchema.safeParse(body);
   if (!parsedResponse.success) {

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONNECT_AUTH_CALLBACK_MESSAGE_TYPE,
-  getConnectPopupLoginDeadline,
   parseConnectAuthCallbackMessage,
   resolveConnectHostedUrl,
 } from '../src/popup-login-core.js';
@@ -61,34 +60,6 @@ describe('parseConnectAuthCallbackMessage', () => {
         expectedOrigin,
       })).toEqual({ ok: false, error: 'malformed_message' });
     }
-  });
-});
-
-describe('getConnectPopupLoginDeadline', () => {
-  it('parses a future ISO expiry into epoch milliseconds', () => {
-    expect(getConnectPopupLoginDeadline({
-      expiresAt: '2027-01-01T00:00:00.000Z',
-      now: 1_000,
-      fallbackMilliseconds: 60_000,
-    })).toBe(Date.parse('2027-01-01T00:00:00.000Z'));
-  });
-
-  it('falls back to now plus the fallback window for an unparseable expiry', () => {
-    expect(getConnectPopupLoginDeadline({
-      expiresAt: 'not-a-date',
-      now: 1_000,
-      fallbackMilliseconds: 60_000,
-    })).toBe(61_000);
-  });
-
-  it('treats an already-past expiry as clock skew and uses the fallback window', () => {
-    // A fresh intent whose expiry is behind the client clock means the client
-    // is running ahead; using the parsed deadline would expire a valid login.
-    expect(getConnectPopupLoginDeadline({
-      expiresAt: '2020-01-01T00:00:00.000Z',
-      now: Date.parse('2026-01-01T00:00:00.000Z'),
-      fallbackMilliseconds: 60_000,
-    })).toBe(Date.parse('2026-01-01T00:00:00.000Z') + 60_000);
   });
 });
 

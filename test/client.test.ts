@@ -15,6 +15,7 @@ import type {
   ConnectErc721ReserveAuctionTarget,
 } from '../src/auth-flow-core.js';
 import type { SuperRareConnectApiError } from '../src/errors.js';
+import type { ConnectIntent } from '../src/status-core.js';
 import type { ConnectPopupWindow } from '../src/popup-core.js';
 import type { ConnectSessionStorage } from '../src/session-storage-core.js';
 
@@ -66,6 +67,10 @@ const batchOfferTarget: ConnectErc721BatchOfferTarget = {
   creator: '0x2222222222222222222222222222222222222222',
   root: '0xroot',
 };
+
+// Relative to the clock so tests never expire an intent on a fixed future
+// date (the deadline logic compares expiresAt against Date.now()).
+const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
 
 describe('createSuperRareClient', () => {
   it('creates hosted login intents, stores pending auth, and navigates to the hosted URL', async () => {
@@ -821,7 +826,9 @@ describe('createSuperRareClient', () => {
 
       expect(opened).toHaveLength(1);
       expect(opened[0]?.url).toBe('about:blank');
-      expect(opened[0]?.target).toBe('superrare-connect');
+      // Each action popup gets its own window name so a second action cannot
+      // reuse (and its watcher close) the window of the first.
+      expect(opened[0]?.target).toMatch(/^superrare-connect-intent-.+/);
       expect(opened[0]?.features).toContain('popup=yes');
       expect(opened[0]?.features).toContain('width=400');
       expect(opened[0]?.features).toContain('height=640');
@@ -983,6 +990,479 @@ describe('createSuperRareClient', () => {
     expect(storage.getItem('superrare.connect.pendingAuth')).toBeNull();
   });
 
+  it('stops watching an action popup once the intent can no longer change', async () => {
+    // Regression: the watcher used to poll forever. A buyer who walks away with
+    // the window open kept the integrator's page hitting Rare API every 2s.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      let pollsWithoutDeadline = 0;
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const settled: ConnectIntent[] = [];
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            // Each poll must carry its own request deadline; one hung fetch
+            // otherwise stalls the whole watcher.
+            if (!(init?.signal instanceof AbortSignal)) pollsWithoutDeadline += 1;
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'requires_user',
+                returnPath: '/buy/complete',
+                // Already expired: the deadline plus its grace is in the past.
+                expiresAt: '2020-01-01T00:00:00.000Z',
+              },
+            });
+          }
+
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_buy',
+              url: 'https://connect.superrare.test/intents/connect_intent_buy',
+              expiresAt: '2020-01-01T00:00:00.000Z',
+            },
+          });
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      // An unparseable/past expiry falls back to a bounded window, so the
+      // watcher runs — but it does not run forever.
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
+      const requestsAfterDeadline = statusRequests;
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+      expect(statusRequests).toBe(requestsAfterDeadline);
+      // Only a KNOWN terminal outcome closes the buyer's window; a fallback
+      // stop leaves it to the hosted page, which may be mid-payment.
+      expect(popup.closed).toBe(false);
+      // The documented deadline contract: the integrator hears about the stop,
+      // and the payload can be non-terminal — their code must check status.
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('requires_user');
+      expect(pollsWithoutDeadline).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops watching when the intent can no longer be read', async () => {
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            // Gone for good: retrying cannot make it readable.
+            return jsonResponse({ error: 'Connect intent not found' }, { status: 404 });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      // One 4xx can be edge infrastructure having a moment; the watcher only
+      // believes the second consecutive one.
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(statusRequests).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(statusRequests).toBe(2);
+      expect(popup.closed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports expired when the server says the intent expired', async () => {
+    // Rare API never writes an `expired` status to the intent — expiry IS the
+    // 410. Handing back the old requires_user would read as a flow still in
+    // progress; the honest terminal answer is expired. The window stays open:
+    // only the hosted page knows whether closing mid-payment is safe.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'requires_user',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(6000);
+
+      // One 410 is definitive: rare-api only answers it for expiry, so the
+      // watcher does not spend a confirmation tick on it.
+      expect(statusRequests).toBe(2);
+      expect(popup.closed).toBe(false);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('expired');
+      expect(settled[0]?.intentId).toBe('connect_intent_buy');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('breaks the gone streak when a retryable failure interrupts it', async () => {
+    // 404 → 503 → 404 is not "two consecutive" gone answers: the 503 says the
+    // server is having a moment, so the count starts over — and a healthy
+    // answer afterwards proves the watcher was right to keep going.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1 || statusRequests === 3) {
+              return jsonResponse({ error: 'not found' }, { status: 404 });
+            }
+            if (statusRequests === 2) {
+              return jsonResponse({ error: 'unavailable' }, { status: 503 });
+            }
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: futureExpiry(),
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(statusRequests).toBe(4);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('completed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not replay a stale snapshot when the close-tick reread says gone', async () => {
+    // processing seen, then the buyer closes on a tick that 410s, and the
+    // bounded reread 410s too: reporting the old `processing` would tell the
+    // integrator a disowned intent is still in flight. The 410 is the expiry
+    // and is reported as such.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'processing',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            popup.closed = true;
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('expired');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('re-reads before reporting an early close whose last poll failed', async () => {
+    // People close the window right when the status changes. If the tick that
+    // saw the close also failed, the known state is 2s old — a success would
+    // be reported as `processing`. The close branch re-reads first.
+    vi.useFakeTimers();
+    try {
+      let statusRequests = 0;
+      const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'processing',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            if (statusRequests === 2) {
+              // The buyer closes on the tick whose poll also fails: the known
+              // state is now one interval old.
+              popup.closed = true;
+              return jsonResponse({ error: 'flaky edge' }, { status: 503 });
+            }
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: futureExpiry(),
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(statusRequests).toBe(3);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.status).toBe('completed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives each concurrent action popup its own window', async () => {
+    // Fake timers + terminal poll responses: both watchers settle inside the
+    // test instead of polling in the background until their fallback deadline.
+    vi.useFakeTimers();
+    try {
+      const openedTargets: string[] = [];
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        display: 'popup',
+        popup: {
+          open: (_url, target) => {
+            openedTargets.push(target);
+            return {
+              closed: false,
+              close: () => undefined,
+              location: { replace: () => undefined },
+            };
+          },
+        },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: futureExpiry(),
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        navigation: false,
+        sessionStorage: false,
+      });
+
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+
+      expect(openedTargets).toHaveLength(2);
+      // Two buys must not share a browsing context: the first watcher would
+      // otherwise close the window the second is being paid in.
+      expect(new Set(openedTargets).size).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('falls back to redirect navigation when the popup is blocked', async () => {
     const assignedUrls: string[] = [];
     const client = createSuperRareClient({
@@ -1055,10 +1535,6 @@ describe('auth.loginWithPopup', () => {
     };
     return popup;
   }
-
-  // Relative to the clock so real-timer tests never expire a login on a fixed
-  // future date (the deadline logic compares expiresAt against Date.now()).
-  const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
 
   function loginIntentCreationResponse(): Response {
     return jsonResponse({
