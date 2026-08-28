@@ -17,6 +17,7 @@ import type {
   ConnectMintTarget,
   ConnectOfferTerms,
   ConnectPurchaseTerms,
+  ConnectIntentPayment,
   CreateConnectIntentRequest,
 } from './auth-flow-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
@@ -24,6 +25,12 @@ import { normalizeReturnPath, type ReturnPathNormalizationResult } from './retur
 type ActionParamsBase = {
   returnPath?: string;
   initiatingOrigin?: string;
+  /**
+   * Set `{ method: 'wallet' }` for sales that must never offer card payment —
+   * required for custom settlement contracts that key on the receiving
+   * wallet. See {@link ConnectIntentPayment}.
+   */
+  payment?: ConnectIntentPayment;
 };
 
 type Erc721BuyActionParams = ActionParamsBase & {
@@ -125,6 +132,7 @@ export function buildConnectBuyIntentRequest(
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }
@@ -170,6 +178,7 @@ export function buildConnectBidIntentRequest(
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }
@@ -190,6 +199,7 @@ export function buildConnectSettleIntentRequest(
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }
@@ -211,6 +221,7 @@ export function buildConnectMintIntentRequest(
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }
@@ -228,6 +239,7 @@ export function buildConnectMakeOfferIntentRequest(
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }
@@ -273,6 +285,7 @@ export function buildConnectAcceptOfferIntentRequest(
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }
@@ -290,6 +303,7 @@ export function buildConnectCancelOfferIntentRequest(
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }

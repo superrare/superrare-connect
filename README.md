@@ -166,6 +166,27 @@ await superrare.actions.mint({
 
 The SDK never accepts arbitrary calldata, contract instructions, private keys, API secrets, or wallet-provider objects from integrators.
 
+## Payment Methods
+
+Every action accepts an optional `payment` hint. Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
+
+**Wallet-only is required when the sale settles on a custom contract whose mint or transfer logic depends on the receiving wallet** — for example a mint that binds a pre-registered artwork to the collector's address. Card settlement executes through a SuperRare buy-proxy that receives the asset itself and re-transfers it to the buyer, so the on-chain receiver is the proxy, not the buyer; such sales revert only after the card was charged. If your contract keys anything on the `mintTo` / transfer receiver, always create its intents wallet-only:
+
+```ts
+await superrare.actions.mint({
+  target: {
+    kind: 'erc721-release',
+    chainId: 11155111,
+    contract: '0xb15272403dfd1e5efbe6f2dec12516d7947e2a1e',
+  },
+  purchase: { quantity: '1', currency: 'ETH', unitPrice: '0.042' },
+  payment: { method: 'wallet' },
+  returnPath: '/mint/complete',
+});
+```
+
+Omit `payment` to let the hosted checkout offer every method the listing supports.
+
 ## Anonymous Auction Settlement
 
 Settling an ended reserve auction is permissionless: anyone can trigger it, and the outcome (winning bidder, amount, transfer) is already fixed on-chain, so no expected terms are supplied. Rare API resolves the ended auction across both auction houses and pins the settlement details into the hosted intent; the hosted page submits the `settleAuction` transaction from the connected wallet.

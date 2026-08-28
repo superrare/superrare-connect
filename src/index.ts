@@ -56,6 +56,7 @@ export {
   type ConnectExpectedPriceTerms,
   type ConnectExpectedUnitPriceTerms,
   type ConnectMakeOfferTarget,
+  type ConnectIntentPayment,
   type ConnectMintTarget,
   type ConnectOfferTerms,
   type ConnectPurchaseTerms,
