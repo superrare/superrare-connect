@@ -10,6 +10,13 @@ import {
   getConnectIntent,
   getConnectProductMine,
   getConnectSession,
+  createConnectSavedCart,
+  deleteConnectSavedCart,
+  getConnectSavedCart,
+  listConnectSavedCarts,
+  putConnectSavedCartItem,
+  removeConnectSavedCartItem,
+  updateConnectSavedCart,
   listConnectProductCandidates,
   listConnectProductsMine,
   publishConnectProduct,
@@ -93,6 +100,14 @@ import {
   type ConnectPopupLoginResult,
 } from './popup-login-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
+import type {
+  SavedCart,
+  SavedCartCreateParams,
+  SavedCartItemParams,
+  SavedCartItemPutParams,
+  SavedCartListParams,
+  SavedCartUpdateParams,
+} from './saved-cart-flow-core.js';
 
 export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   connectUrl?: string;
@@ -200,8 +215,24 @@ export type SuperRareConnectCartHostedNamespace = {
   openListingManager: (params: SellerListingManagerParams) => Promise<ConnectIntentCreation>;
 };
 
+export type SuperRareConnectSavedCartsNamespace = {
+  list: (params?: SavedCartListParams) => Promise<{
+    data: SavedCart[];
+    hasNextPage: boolean;
+  }>;
+  get: (params: { cartId: string }) => Promise<SavedCart>;
+  create: (params: SavedCartCreateParams) => Promise<SavedCart>;
+  update: (params: SavedCartUpdateParams) => Promise<SavedCart>;
+  delete: (params: { cartId: string }) => Promise<SavedCart>;
+  items: {
+    put: (params: SavedCartItemPutParams) => Promise<SavedCart>;
+    remove: (params: SavedCartItemParams) => Promise<SavedCart>;
+  };
+};
+
 export type SuperRareConnectCartNamespace = {
   products: SuperRareConnectCartProductsNamespace;
+  savedCarts: SuperRareConnectSavedCartsNamespace;
   hosted: SuperRareConnectCartHostedNamespace;
 };
 
@@ -1060,6 +1091,62 @@ export function createSuperRareClient(
             return await accountRequest(() => setConnectProductVariantVisibility({
               ...apiOptions,
               variant: params,
+              sessionId: requireSessionId(),
+            }));
+          },
+        },
+      },
+      savedCarts: {
+        async list(params = {}): Promise<{
+          data: SavedCart[];
+          hasNextPage: boolean;
+        }> {
+          return await accountRequest(() => listConnectSavedCarts({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async get(params): Promise<SavedCart> {
+          return await accountRequest(() => getConnectSavedCart({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async create(params): Promise<SavedCart> {
+          return await accountRequest(() => createConnectSavedCart({
+            ...apiOptions,
+            cart: params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async update(params): Promise<SavedCart> {
+          return await accountRequest(() => updateConnectSavedCart({
+            ...apiOptions,
+            cart: params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        async delete(params): Promise<SavedCart> {
+          return await accountRequest(() => deleteConnectSavedCart({
+            ...apiOptions,
+            ...params,
+            sessionId: requireSessionId(),
+          }));
+        },
+        items: {
+          async put(params): Promise<SavedCart> {
+            return await accountRequest(() => putConnectSavedCartItem({
+              ...apiOptions,
+              ...params,
+              sessionId: requireSessionId(),
+            }));
+          },
+          async remove(params): Promise<SavedCart> {
+            return await accountRequest(() => removeConnectSavedCartItem({
+              ...apiOptions,
+              ...params,
               sessionId: requireSessionId(),
             }));
           },

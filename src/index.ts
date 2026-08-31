@@ -15,6 +15,7 @@ export {
   type SuperRareConnectCartHostedNamespace,
   type SuperRareConnectCartNamespace,
   type SuperRareConnectCartProductsNamespace,
+  type SuperRareConnectSavedCartsNamespace,
   type SuperRareConnectCheckoutNamespace,
   type SuperRareConnectClient,
   type SuperRareConnectClientOptions,
@@ -134,6 +135,19 @@ export {
   type ConnectSession,
   type ConnectSessionStorage,
 } from './session-storage-core.js';
+export {
+  savedCartItemSchema,
+  savedCartListResponseSchema,
+  savedCartResponseSchema,
+  savedCartSchema,
+  type SavedCart,
+  type SavedCartCreateParams,
+  type SavedCartItem,
+  type SavedCartItemParams,
+  type SavedCartItemPutParams,
+  type SavedCartListParams,
+  type SavedCartUpdateParams,
+} from './saved-cart-flow-core.js';
 export {
   resolveConnectIntentOutcome,
   type ConnectActionType,

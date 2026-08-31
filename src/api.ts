@@ -17,6 +17,14 @@ import {
   type SetProductVariantVisibilityParams,
 } from './product-flow-core.js';
 import { connectSessionSchema, type ConnectSession } from './session-storage-core.js';
+import {
+  savedCartListResponseSchema,
+  savedCartResponseSchema,
+  type SavedCart,
+  type SavedCartCreateParams,
+  type SavedCartListParams,
+  type SavedCartUpdateParams,
+} from './saved-cart-flow-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
 
 export type ConnectAuthApiOptions = {
@@ -34,6 +42,7 @@ const connectCurrentUserPath = '/v1/connect/users/me';
 // paths land; no hosted UI or connect-com import is needed here.
 const cartProductsMinePath = '/v1/cart/products/mine';
 const cartProductsPath = '/v1/cart/products';
+const savedCartsPath = '/v1/cart/saved-carts';
 
 export type ConnectIntentCreation = {
   intentId: string;
@@ -494,6 +503,110 @@ export async function getConnectCheckoutStatus(input: {
   return parsedResponse.data.data;
 }
 
+export async function listConnectSavedCarts(input: {
+  sessionId: string;
+} & SavedCartListParams & ConnectAuthApiOptions): Promise<{
+  data: SavedCart[];
+  hasNextPage: boolean;
+}> {
+  const body = await requestConnectApiJson({
+    path: buildPagePath(savedCartsPath, input.page, input.perPage),
+    method: 'GET',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  });
+  return savedCartListResponseSchema.parse(body);
+}
+
+export async function getConnectSavedCart(input: {
+  sessionId: string;
+  cartId: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}`,
+    method: 'GET',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+export async function createConnectSavedCart(input: {
+  sessionId: string;
+  cart: SavedCartCreateParams;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: savedCartsPath,
+    method: 'POST',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: input.cart,
+  }));
+}
+
+export async function updateConnectSavedCart(input: {
+  sessionId: string;
+  cart: SavedCartUpdateParams;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cart.cartId)}`,
+    method: 'PATCH',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: { purchaseCurrency: input.cart.purchaseCurrency },
+  }));
+}
+
+export async function deleteConnectSavedCart(input: {
+  sessionId: string;
+  cartId: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}`,
+    method: 'DELETE',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+export async function putConnectSavedCartItem(input: {
+  sessionId: string;
+  cartId: string;
+  listingDigest: string;
+  quantity: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}/items/${encodeURIComponent(input.listingDigest)}`,
+    method: 'PUT',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: { quantity: input.quantity },
+  }));
+}
+
+export async function removeConnectSavedCartItem(input: {
+  sessionId: string;
+  cartId: string;
+  listingDigest: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}/items/${encodeURIComponent(input.listingDigest)}`,
+    method: 'DELETE',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+async function parseSavedCartResponse(body: unknown): Promise<SavedCart> {
+  return savedCartResponseSchema.parse(body).data;
+}
+
 function parseProductResponse(body: unknown): Product {
   const parsedResponse = productResponseSchema.safeParse(body);
   if (!parsedResponse.success) {
@@ -552,7 +665,7 @@ async function requestConnectApiJson(input: {
   apiUrl?: string;
   fetch?: typeof fetch;
   path: string;
-  method: 'DELETE' | 'GET' | 'PATCH' | 'POST';
+  method: 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT';
   body?: unknown;
   sessionId?: string;
   signal?: AbortSignal;
@@ -571,7 +684,7 @@ async function requestConnectApiJson(input: {
 }
 
 function buildRequestInit(input: {
-  method: 'DELETE' | 'GET' | 'PATCH' | 'POST';
+  method: 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT';
   body?: unknown;
   sessionId?: string;
   signal?: AbortSignal;

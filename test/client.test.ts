@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  ConnectAuthenticationRequiredError,
   ConnectPopupBlockedError,
+  ConnectSessionRequiredError,
   createSuperRareClient,
 } from '../src/client.js';
 import type {
@@ -157,6 +159,87 @@ function completedIntentStatusResponse(request: Request): Response {
 }
 
 describe('createSuperRareClient', () => {
+  it('requires a Connect session for authenticated Cart resources', async () => {
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      fetch: async () => jsonResponse({ data: [] }),
+      sessionStorage: false,
+    });
+
+    await expect(client.cart.products.listMine()).rejects.toBeInstanceOf(
+      ConnectSessionRequiredError,
+    );
+    await expect(client.cart.savedCarts.list()).rejects.toBeInstanceOf(
+      ConnectSessionRequiredError,
+    );
+  });
+
+  it('creates and updates Saved Cart items through authenticated Rare API routes', async () => {
+    const storage = createMemoryStorage();
+    storage.setItem('superrare.connect.session', JSON.stringify({
+      sessionId: 'connect_session_123',
+      userId: '369665',
+      address: '0x0000000000000000000000000000000000000001',
+      expiresAt: '2027-01-01T00:00:00.000Z',
+    }));
+    const requests: Request[] = [];
+    const cart = {
+      id: '1',
+      chainId: '11155111',
+      cartAddress: '0x0000000000000000000000000000000000000002',
+      purchaseCurrency: null,
+      items: [],
+      createdAt: '2026-08-31T12:00:00.000Z',
+      updatedAt: '2026-08-31T12:00:00.000Z',
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      fetch: async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return jsonResponse({ data: cart });
+      },
+      sessionStorage: storage,
+    });
+
+    await client.cart.savedCarts.create({
+      chainId: cart.chainId,
+      cartAddress: cart.cartAddress,
+    });
+    await client.cart.savedCarts.items.put({
+      cartId: cart.id,
+      listingDigest: `0x${'ab'.repeat(32)}`,
+      quantity: '2',
+    });
+
+    expect(requests.map((request) => [request.method, request.url])).toEqual([
+      ['POST', 'https://rare-api.test/v1/cart/saved-carts'],
+      ['PUT', `https://rare-api.test/v1/cart/saved-carts/1/items/0x${'ab'.repeat(32)}`],
+    ]);
+    expect(requests.every(
+      (request) => request.headers.get('Authorization') === 'Bearer connect_session_123',
+    )).toBe(true);
+  });
+
+  it('clears a rejected Cart session and reports authentication_required', async () => {
+    const storage = createMemoryStorage();
+    storage.setItem('superrare.connect.session', JSON.stringify({
+      sessionId: 'connect_session_rejected',
+      userId: '369665',
+      address: '0x0000000000000000000000000000000000000001',
+      expiresAt: '2027-01-01T00:00:00.000Z',
+    }));
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      fetch: async () => jsonResponse({ error: 'Unauthorized' }, { status: 401 }),
+      sessionStorage: storage,
+    });
+
+    await expect(client.cart.savedCarts.list()).rejects.toBeInstanceOf(
+      ConnectAuthenticationRequiredError,
+    );
+    expect(client.auth.getSession()).toBeUndefined();
+  });
+
   it('clears stored Connect sessions', async () => {
     const storage = createMemoryStorage();
     storage.setItem('superrare.connect.session', JSON.stringify({
