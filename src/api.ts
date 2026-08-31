@@ -40,14 +40,6 @@ const exchangeConnectAuthResponseSchema = z.object({
   }),
 });
 
-const createConnectIntentResponseSchema = z.object({
-  data: z.object({
-    intentId: z.string().min(1),
-    url: z.string().min(1),
-    expiresAt: z.string().min(1),
-  }),
-});
-
 const getConnectSessionResponseSchema = z.object({
   data: z.object({
     authenticated: z.boolean(),
@@ -169,33 +161,6 @@ const connectCheckoutStatusSchema = z.object({
 const getConnectCheckoutStatusResponseSchema = z.object({
   data: connectCheckoutStatusSchema,
 });
-
-export async function createConnectIntent(input: {
-  request: CreateConnectIntentRequest;
-  signal?: AbortSignal;
-} & ConnectAuthApiOptions): Promise<ConnectIntentCreation> {
-  const body = await requestConnectApiJson({
-    path: connectIntentsPath,
-    method: 'POST',
-    apiUrl: input.apiUrl,
-    fetch: input.fetch,
-    body: input.request,
-    signal: input.signal,
-  });
-  const parsedResponse = createConnectIntentResponseSchema.safeParse(body);
-  if (!parsedResponse.success) {
-    throw new Error('Invalid Connect intent response.');
-  }
-
-  return parsedResponse.data.data;
-}
-
-export async function createConnectLoginIntent(input: {
-  request: CreateConnectLoginIntentRequest;
-  signal?: AbortSignal;
-} & ConnectAuthApiOptions): Promise<ConnectIntentCreation> {
-  return await createConnectIntent(input);
-}
 
 export async function getConnectIntent(input: {
   intentId: string;
