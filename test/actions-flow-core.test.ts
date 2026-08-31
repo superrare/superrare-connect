@@ -146,6 +146,35 @@ describe('buildConnectMintIntentRequest', () => {
       },
     });
   });
+
+  it('carries a wallet-only payment hint into the intent request', () => {
+    const result = buildConnectMintIntentRequest({
+      target: releaseTarget,
+      purchase: { quantity: '1', currency: 'ETH', unitPrice: '0.042' },
+      payment: { method: 'wallet' },
+      returnPath: '/mint/complete',
+      state: 'state_123',
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.request.payment).toEqual({ method: 'wallet' });
+    }
+  });
+
+  it('omits the payment field when no hint is given', () => {
+    const result = buildConnectMintIntentRequest({
+      target: releaseTarget,
+      purchase: { quantity: '1', currency: 'ETH', unitPrice: '0.042' },
+      returnPath: '/mint/complete',
+      state: 'state_123',
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect('payment' in result.request).toBe(false);
+    }
+  });
 });
 
 describe('buildConnectMakeOfferIntentRequest', () => {

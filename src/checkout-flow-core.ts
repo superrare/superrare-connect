@@ -1,10 +1,20 @@
-import type { ConnectErc1155CheckoutTarget, CreateConnectIntentRequest } from './auth-flow-core.js';
+import type {
+  ConnectErc1155CheckoutTarget,
+  ConnectIntentPayment,
+  CreateConnectIntentRequest,
+} from './auth-flow-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
 
 export type CheckoutStartParams = {
   target: ConnectErc1155CheckoutTarget;
   returnPath?: string;
   initiatingOrigin?: string;
+  /**
+   * Set `{ method: 'wallet' }` for sales that must never offer card payment —
+   * required for custom settlement contracts that key on the receiving
+   * wallet. See {@link ConnectIntentPayment}.
+   */
+  payment?: ConnectIntentPayment;
 };
 
 export type BuildConnectCheckoutIntentRequestInput = CheckoutStartParams & {
@@ -33,6 +43,7 @@ export function buildConnectCheckoutIntentRequest(
       returnPath: returnPathResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
     },
   };
 }

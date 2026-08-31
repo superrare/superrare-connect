@@ -1,9 +1,29 @@
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
 
+/**
+ * Payment hints for the hosted checkout.
+ *
+ * Set `method: 'wallet'` to keep the checkout wallet-only: the hosted page
+ * never offers card payment and Rare API refuses card preparation for the
+ * intent. This is REQUIRED when the sale settles on a custom contract whose
+ * mint or transfer logic depends on the receiving wallet (for example a mint
+ * that binds a pre-registered artwork to the collector's address): card
+ * settlement executes through a SuperRare buy-proxy that receives the asset
+ * itself and re-transfers it, so the on-chain receiver is the proxy, not the
+ * buyer, and such sales revert only after the card was charged.
+ *
+ * Set `method: 'card'` to pre-select card checkout. Omit to let the hosted
+ * checkout offer every supported method.
+ */
+export type ConnectIntentPayment = {
+  method?: 'card' | 'wallet';
+};
+
 export type CreateConnectLoginIntentRequest = {
   action: ConnectActionInput;
   initiatingOrigin?: string;
+  payment?: ConnectIntentPayment;
   returnPath: string;
   state: string;
 };
