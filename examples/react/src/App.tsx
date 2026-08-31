@@ -17,7 +17,6 @@ const superrare = createSuperRareClient({
   apiUrl: import.meta.env.VITE_SUPERRARE_API_URL,
   connectUrl: import.meta.env.VITE_SUPERRARE_CONNECT_URL,
   fetch: fetchWithTimeout,
-  navigation: false,
 });
 
 const rare = createRareClient({
@@ -116,18 +115,6 @@ export function App(): JSX.Element {
   }, []);
 
   useEffect(() => {
-    if (window.location.search.length === 0) return;
-
-    client.auth.exchangeCallback(new URLSearchParams(window.location.search))
-      .then((sessionResult) => {
-        setMessage(`Signed in as ${sessionResult.address}`);
-      })
-      .catch((error: unknown) => {
-        setMessage(formatError(error));
-      });
-  }, [client]);
-
-  useEffect(() => {
     if (intentId.trim().length === 0) return;
 
     const intervalId = window.setInterval(() => {
@@ -178,7 +165,6 @@ export function App(): JSX.Element {
             void client.actions.buy({
               target: selectedArtwork.target,
               expected: selectedArtwork.expected,
-              returnPath: '/buy/complete',
             }).then((createdIntent) => {
               emitDebugEntry(
                 'SDK returned Connect intent',
@@ -248,7 +234,18 @@ export function App(): JSX.Element {
       <section>
         <h2>Optional session</h2>
         <pre>{formatSession(session)}</pre>
-        <button type="button" onClick={() => void client.auth.login({ returnPath: '/account' })}>
+        <button
+          type="button"
+          onClick={() => {
+            client.auth.login().then((result) => {
+              setMessage(result.status === 'authenticated'
+                ? `Signed in as ${result.session.address}`
+                : `Login ${result.status}`);
+            }).catch((error: unknown) => {
+              setMessage(formatError(error));
+            });
+          }}
+        >
           Log in with SuperRare
         </button>
         <button type="button" onClick={() => client.auth.logout()}>

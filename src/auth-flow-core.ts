@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
 
@@ -256,13 +255,16 @@ export type BuildConnectLoginIntentRequestResult =
   | { ok: true; request: CreateConnectLoginIntentRequest }
   | Extract<ReturnPathNormalizationResult, { ok: false }>;
 
-export const pendingConnectAuthSchema = z.object({
-  intentId: z.string().min(1),
-  state: z.string().min(1),
-  expiresAt: z.string().min(1),
-});
-
-export type PendingConnectAuth = z.infer<typeof pendingConnectAuthSchema>;
+/**
+ * A login's own record of the intent it started — held in memory by the
+ * client for the life of the popup, and matched against the callback the
+ * hosted page posts back.
+ */
+export type PendingConnectAuth = {
+  intentId: string;
+  state: string;
+  expiresAt: string;
+};
 
 export type ConnectAuthPendingVerificationError =
   | 'missing_pending_auth'
@@ -311,21 +313,3 @@ export function verifyConnectAuthCallbackAgainstPending(input: {
   return { ok: true };
 }
 
-export function serializePendingConnectAuth(pendingAuth: PendingConnectAuth): string {
-  return JSON.stringify(pendingAuth);
-}
-
-export function parseStoredPendingConnectAuth(serializedPendingAuth: string): PendingConnectAuth | undefined {
-  const parsedPendingAuth = parseJson(serializedPendingAuth);
-  const result = pendingConnectAuthSchema.safeParse(parsedPendingAuth);
-  return result.success ? result.data : undefined;
-}
-
-function parseJson(value: string): unknown {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return parsed;
-  } catch {
-    return undefined;
-  }
-}

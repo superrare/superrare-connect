@@ -1,15 +1,14 @@
 import { z } from 'zod';
-import type { ConnectCurrentUser, ConnectIntentCreation } from './api.js';
+import type { ConnectCurrentUser } from './api.js';
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import type { ConnectSession } from './session-storage-core.js';
 
 /**
- * Popup login: the hosted login page reports its auth callback to the opener
- * with a `postMessage` instead of redirecting. The message carries the same
- * one-time parameters the redirect callback would (`intentId`, `state`,
- * `code`); the SDK verifies them against the pending auth and exchanges the
- * code exactly like the redirect path — the wallet and user info are then
- * read from the exchanged session, never from the message itself.
+ * The hosted login page reports its auth callback to the opener with a
+ * `postMessage`. The message carries one-time parameters (`intentId`,
+ * `state`, `code`); the SDK verifies them against the pending auth it holds
+ * in memory and exchanges the code server-side — the wallet and user info
+ * are then read from the exchanged session, never from the message itself.
  */
 
 export const CONNECT_AUTH_CALLBACK_MESSAGE_TYPE = 'superrare-connect:auth-callback';
@@ -83,14 +82,6 @@ export type ConnectPopupLoginResult =
   | {
     /** The login intent expired while the popup was open. */
     status: 'expired';
-  }
-  | {
-    /**
-     * The popup could not be opened (blocked, or no message listener is
-     * available); the flow fell back to the redirect login.
-     */
-    status: 'redirected';
-    intent: ConnectIntentCreation;
   };
 
 export type ConnectHostedUrlResult =

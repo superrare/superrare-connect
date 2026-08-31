@@ -1,9 +1,9 @@
 import type { ConnectIntentStatus } from './status-core.js';
 
 /**
- * Popup display for hosted Connect flows: instead of redirecting the whole
- * page, the hosted URL opens in a small centered window (the pattern used by
- * Google sign-in and wallet providers) while the integrator's page stays put.
+ * The window every hosted Connect flow runs in: the hosted URL opens in a
+ * small centered window (the pattern used by Google sign-in and wallet
+ * providers) while the integrator's page stays put.
  */
 
 export const DEFAULT_CONNECT_POPUP_WIDTH = 480;

@@ -2,7 +2,7 @@
 
 Public browser SDK for starting SuperRare-hosted Connect flows from external websites.
 
-SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, redirect users, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, and status flows do not require an authenticated Connect session.
+SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, open them in their own window, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, and status flows do not require an authenticated Connect session.
 
 ## Install
 
@@ -202,42 +202,10 @@ const outcome = resolveConnectIntentOutcome(intent);
 
 Auth is available for integrations that need a Connect session or `user.me()`. It is not required for checkout, buy, bid, mint, or intent status.
 
-```ts
-await superrare.auth.login({
-  returnPath: '/account',
-});
-```
-
-Callback page:
+`auth.login()` runs the login in a small centered window: the user authenticates on SuperRare Connect, the window closes itself, and the promise resolves with the session — including the authenticated wallet address — plus the signed-in user's profile. Your page never navigates away.
 
 ```ts
-try {
-  const session = await superrare.auth.exchangeCallback(
-    new URLSearchParams(window.location.search),
-  );
-} catch (error) {
-  // `ConnectSessionSupersededError` — a logout or newer login on this client
-  // landed while the exchange was in flight; the session was not stored.
-  // Other errors: invalid/expired callback (see Errors below).
-}
-```
-
-Flow sequence:
-
-1. Site calls `auth.login({ returnPath })`.
-2. SDK creates a login intent through Rare API.
-3. SDK stores pending auth state in browser storage.
-4. Browser redirects to SuperRare Connect.
-5. SuperRare Connect redirects back to the integrator `returnPath` with `intentId`, `state`, and `code`.
-6. Integrator calls `auth.exchangeCallback(new URLSearchParams(window.location.search))`.
-7. SDK validates pending `state` and `intentId`, exchanges the code for a Connect session, stores the session, and notifies listeners. If a logout or a newer login on this client lands while the exchange is in flight, `exchangeCallback` throws `ConnectSessionSupersededError` and stores nothing, rather than returning a session that was superseded.
-
-## Popup Login
-
-`auth.loginWithPopup()` runs the same login in a small centered window instead of navigating away: the user authenticates on SuperRare Connect, the popup closes itself, and the promise resolves with the session — including the authenticated wallet address — plus the signed-in user's profile.
-
-```ts
-const result = await superrare.auth.loginWithPopup();
+const result = await superrare.auth.login();
 
 if (result.status === 'authenticated') {
   result.session.address; // the authenticated wallet
@@ -245,16 +213,17 @@ if (result.status === 'authenticated') {
 }
 ```
 
-Call it directly from a click handler so the browser does not block the popup. Possible results:
+Call it directly from a click handler so the browser allows the window. Possible results:
 
 - `authenticated` — the session is stored and `auth.onChange` listeners fired; `user` carries `address`, `username`, `fullName`, and `avatarUri` when the profile lookup succeeds.
-- `cancelled` — the user closed the popup before signing in, or a logout/newer login on this client landed before the session was committed. (A logout *after* the session was committed — e.g. during the profile lookup — resolves `authenticated`; the login succeeded and the later logout clears the session.)
-- `expired` — the login intent expired while the popup was open.
-- `redirected` — the popup was blocked, so the SDK fell back to the redirect login; the callback lands on `returnPath` as in the flow above.
+- `cancelled` — the user closed the window before signing in, or a logout/newer login on this client landed before the session was committed. (A logout *after* the session was committed — e.g. during the profile lookup — resolves `authenticated`; the login succeeded and the later logout clears the session.)
+- `expired` — the login intent expired while the window was open.
 
-Only one login runs at a time per client: the SDK holds a single session, so calling `loginWithPopup()` again while one is in flight joins the running login instead of opening a second window. If the backend stops responding after the callback arrives, the call rejects rather than hanging.
+When the window cannot be opened at all (a popup blocker, or a call outside a user gesture), `auth.login()` rejects with `ConnectPopupBlockedError` before any intent is created — there is no same-page fallback.
 
-For controlled environments (tests, non-browser hosts), `popup.open` and `popup.messageEvents` let you supply the window opener and the `message`-event source the popup login listens on:
+Only one login runs at a time per client: the SDK holds a single session, so calling `login()` again while one is in flight joins the running login instead of opening a second window. If the backend stops responding after the callback arrives, the call rejects rather than hanging. `auth.loginWithPopup()` remains as a deprecated alias of `auth.login()`.
+
+For controlled environments (tests, non-browser hosts), `popup.open` and `popup.messageEvents` let you supply the window opener and the `message`-event source the login listens on:
 
 ```ts
 createSuperRareClient({
@@ -275,9 +244,9 @@ createSuperRareClient({
 });
 ```
 
-Both default to the browser's own `window.open` and `window.addEventListener('message', ...)`. When the popup cannot be opened, the SDK falls back to the redirect login — that fallback needs session storage, so `loginWithPopup` throws instead of redirecting when storage is disabled and no popup is available.
+Both default to the browser's own `window.open` and `window.addEventListener('message', ...)`.
 
-Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A popup login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session; the redirect `exchangeCallback` throws `ConnectSessionSupersededError` in the same situation, so a superseded exchange is never mistaken for a live session.
+Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session.
 
 ## Session And User
 
@@ -307,28 +276,27 @@ const superrare = createSuperRareClient({
 });
 ```
 
-Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `navigation: false` to create hosted intents without assigning `window.location`. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `navigation`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
+Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
 
-## Popup Checkout
+## Hosted Windows
 
-By default a hosted action navigates the current page. Set `display: 'popup'` to open the hosted flow in a small centered window instead — the way wallet and social sign-in flows behave — so your page keeps its state while the buyer pays.
+Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
 
 ```ts
 const superrare = createSuperRareClient({
-  display: 'popup',
   popup: { width: 480, height: 720 },
   onIntentSettled: (intent) => {
     // Fires with the terminal status when the flow finishes (the SDK closes
     // the window), with `status: 'expired'` when the server reports the
     // intent expired (the window is left open), or with the latest known
-    // state if the buyer closes the popup early or the fallback deadline
+    // state if the buyer closes the window early or the fallback deadline
     // lapses — those two can be non-terminal, so check `intent.status`.
     refreshArtwork(intent);
   },
 });
 ```
 
-Call `actions.buy()` (or any other action) directly from the click handler: the popup opens synchronously inside the user gesture, so browsers do not block it. When a popup cannot be opened the SDK falls back to the redirect flow. `auth.login()` always redirects because the auth callback must return to your page; use `auth.loginWithPopup()` for the popup counterpart.
+Call `actions.buy()` (or any other action) directly from the click handler: the window opens synchronously inside the user gesture, so browsers allow it. When the window cannot be opened, the call rejects with `ConnectPopupBlockedError` before any intent is created — there is no same-page fallback.
 
 ## Return Path Safety
 
@@ -354,15 +322,15 @@ const result = normalizeReturnPath('/account');
 The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
-- `ConnectAuthCallbackError` for missing, duplicate, or malformed callback parameters.
-- `ConnectAuthPendingError` when callback `intentId` or `state` does not match pending auth.
+- `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
+- `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.
 - `SuperRareConnectApiError` for Rare API non-2xx responses, with `status` and `path`.
 
 ## Examples
 
 - `examples/vanilla` shows direct browser usage.
-- `examples/react` shows a React bundler app with login, callback exchange, session display, logout, Sepolia for-sale artwork discovery through `@rareprotocol/rare-cli`, buy intent creation, and intent polling.
+- `examples/react` shows a React bundler app with login, session display, logout, Sepolia for-sale artwork discovery through `@rareprotocol/rare-cli`, buy intent creation, and intent polling.
 
 ## Development
 
