@@ -1,6 +1,8 @@
 export {
+  ConnectAuthenticationRequiredError,
   ConnectAuthPendingError,
   ConnectPopupBlockedError,
+  ConnectProductIdError,
   ConnectReturnPathError,
   ConnectSessionRequiredError,
   createSuperRareClient,
@@ -10,6 +12,10 @@ export {
   type ConnectPopupMessageEvents,
   type ConnectSessionChangeCallback,
   type SuperRareConnectAuthNamespace,
+  type SuperRareConnectCartHostedNamespace,
+  type SuperRareConnectCartNamespace,
+  type SuperRareConnectCartProductsNamespace,
+  type SuperRareConnectSavedCartsNamespace,
   type SuperRareConnectCheckoutNamespace,
   type SuperRareConnectClient,
   type SuperRareConnectClientOptions,
@@ -69,6 +75,41 @@ export {
   type CheckoutStartParams,
 } from './checkout-flow-core.js';
 export {
+  productCandidateListResponseSchema,
+  productListResponseSchema,
+  productMediaSchema,
+  productMetadataSchema,
+  productPersistenceRecordSchema,
+  productResponseSchema,
+  productSchema,
+  productVariantSchema,
+  type AddProductVariantsParams,
+  type Product,
+  type ProductCandidate,
+  type ProductCandidateListParams,
+  type ProductListParams,
+  type ProductMedia,
+  type ProductMetadata,
+  type ProductPage,
+  type ProductPersistenceRecord,
+  type ProductRecordPage,
+  type ProductUpdateParams,
+  type ProductVariant,
+  type ProductWriteParams,
+  type RemoveProductVariantParams,
+  type ReorderProductVariantsParams,
+  type SetProductVariantVisibilityParams,
+} from './product-flow-core.js';
+export {
+  buildConnectSellerListingIntentRequest,
+  buildConnectSellerProductIntentRequest,
+  type BuildConnectSellerIntentRequestInput,
+  type BuildConnectSellerIntentRequestResult,
+  type BuildConnectSellerListingIntentRequestInput,
+  type SellerListingManagerParams,
+  type SellerManagerParams,
+} from './seller-flow-core.js';
+export {
   SuperRareConnectApiError,
 } from './errors.js';
 export {
@@ -94,6 +135,19 @@ export {
   type ConnectSession,
   type ConnectSessionStorage,
 } from './session-storage-core.js';
+export {
+  savedCartItemSchema,
+  savedCartListResponseSchema,
+  savedCartResponseSchema,
+  savedCartSchema,
+  type SavedCart,
+  type SavedCartCreateParams,
+  type SavedCartItem,
+  type SavedCartItemParams,
+  type SavedCartItemPutParams,
+  type SavedCartListParams,
+  type SavedCartUpdateParams,
+} from './saved-cart-flow-core.js';
 export {
   resolveConnectIntentOutcome,
   type ConnectActionType,

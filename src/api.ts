@@ -2,7 +2,29 @@ import { z } from 'zod';
 import type { CreateConnectIntentRequest, CreateConnectLoginIntentRequest } from './auth-flow-core.js';
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import { SuperRareConnectApiError } from './errors.js';
+import {
+  productCandidateListResponseSchema,
+  productListResponseSchema,
+  productResponseSchema,
+  type AddProductVariantsParams,
+  type Product,
+  type ProductRecordPage,
+  type ProductPage,
+  type ProductUpdateParams,
+  type ProductWriteParams,
+  type RemoveProductVariantParams,
+  type ReorderProductVariantsParams,
+  type SetProductVariantVisibilityParams,
+} from './product-flow-core.js';
 import { connectSessionSchema, type ConnectSession } from './session-storage-core.js';
+import {
+  savedCartListResponseSchema,
+  savedCartResponseSchema,
+  type SavedCart,
+  type SavedCartCreateParams,
+  type SavedCartListParams,
+  type SavedCartUpdateParams,
+} from './saved-cart-flow-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
 
 export type ConnectAuthApiOptions = {
@@ -15,6 +37,12 @@ const connectIntentsPath = '/v1/connect/intents';
 const connectAuthExchangePath = '/v1/connect/auth/exchange';
 const connectSessionPath = '/v1/connect/session';
 const connectCurrentUserPath = '/v1/connect/users/me';
+// These paths are the account-scoped Cart Product contract. Keeping them in
+// one adapter makes the SDK easy to align when Rare API's generated OpenAPI
+// paths land; no hosted UI or connect-com import is needed here.
+const cartProductsMinePath = '/v1/cart/products/mine';
+const cartProductsPath = '/v1/cart/products';
+const savedCartsPath = '/v1/cart/saved-carts';
 
 export type ConnectIntentCreation = {
   intentId: string;
@@ -64,9 +92,31 @@ const getConnectCurrentUserResponseSchema = z.object({
   }),
 });
 
+const connectSellerCompletionSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('product-manager'),
+    productId: z.string().min(1).optional(),
+  }),
+  z.object({
+    cartAddress: z.string().min(1),
+    chainId: z.number().int().positive(),
+    kind: z.literal('listing-manager'),
+    listingDigests: z.array(z.string().min(1)).min(1),
+    productId: z.string().min(1),
+    rootDigest: z.string().min(1),
+  }),
+]);
+
+const connectIntentPaymentSchema = z.object({
+  email: z.string().min(1).optional(),
+  method: z.literal('card').optional(),
+  recipient: z.string().min(1).optional(),
+  recipientBoundByCheckout: z.boolean().optional(),
+});
+
 const connectIntentSchema = z.object({
   intentId: z.string().min(1),
-  type: z.enum(['login', 'checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
+  type: z.enum(['login', 'seller-product-manager', 'seller-listing-manager', 'checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
   status: z.enum(['pending', 'requires_user', 'processing', 'completed', 'failed', 'cancelled', 'expired']),
   initiatingOrigin: z.string().optional(),
   returnPath: z.string(),
@@ -105,10 +155,18 @@ const connectIntentSchema = z.object({
   }).optional(),
   result: z.object({
     approvalTxHash: z.string().optional(),
+    cartAddress: z.string().optional(),
+    chainId: z.number().int().positive().optional(),
+    listingDigests: z.array(z.string()).optional(),
+    paymentId: z.string().min(1).optional(),
+    productId: z.string().optional(),
     referenceId: z.string().optional(),
+    rootDigest: z.string().optional(),
+    sellerCompletion: connectSellerCompletionSchema.optional(),
     sessionId: z.string().optional(),
     transactionHash: z.string().optional(),
   }).optional(),
+  payment: connectIntentPaymentSchema.optional(),
   error: z.object({
     code: z.string(),
     message: z.string(),
@@ -274,6 +332,160 @@ export async function getConnectCurrentUser(input: {
   return parsedResponse.data.data;
 }
 
+export async function listConnectProductsMine(input: {
+  sessionId: string;
+  page?: number;
+  perPage?: number;
+} & ConnectAuthApiOptions): Promise<ProductPage<Product>> {
+  const body = await requestConnectApiJson({
+    path: buildPagePath(cartProductsMinePath, input.page, input.perPage),
+    method: 'GET',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  });
+  const parsedResponse = productListResponseSchema.safeParse(body);
+  if (!parsedResponse.success) {
+    throw new Error('Invalid Connect Product list response.');
+  }
+
+  return parsedResponse.data;
+}
+
+export async function getConnectProductMine(input: {
+  sessionId: string;
+  productId: string;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return await parseProductResponse(await requestConnectApiJson({
+    path: `${cartProductsMinePath}/${encodeURIComponent(input.productId)}`,
+    method: 'GET',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+export async function createConnectProduct(input: {
+  sessionId: string;
+  product: ProductWriteParams;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return await parseProductResponse(await requestConnectApiJson({
+    path: cartProductsPath,
+    method: 'POST',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: input.product,
+  }));
+}
+
+export async function updateConnectProduct(input: {
+  sessionId: string;
+  productId: string;
+  product: ProductUpdateParams;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return await parseProductResponse(await requestConnectApiJson({
+    path: `${cartProductsPath}/${encodeURIComponent(input.productId)}`,
+    method: 'PATCH',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: input.product,
+  }));
+}
+
+export async function publishConnectProduct(input: {
+  sessionId: string;
+  productId: string;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return await postProductLifecycleAction(input, 'publish');
+}
+
+export async function archiveConnectProduct(input: {
+  sessionId: string;
+  productId: string;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return await postProductLifecycleAction(input, 'archive');
+}
+
+export async function restoreConnectProductToDraft(input: {
+  sessionId: string;
+  productId: string;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return await postProductLifecycleAction(input, 'restore-to-draft');
+}
+
+export async function listConnectProductCandidates(input: {
+  sessionId: string;
+  page?: number;
+  perPage?: number;
+  productId?: string;
+} & ConnectAuthApiOptions): Promise<ProductRecordPage> {
+  const body = await requestConnectApiJson({
+    path: buildCandidatesPath(input),
+    method: 'GET',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  });
+  return parseProductCandidateList(body);
+}
+
+export async function addConnectProductVariants(input: {
+  sessionId: string;
+  product: AddProductVariantsParams;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return parseProductResponse(await requestConnectApiJson({
+    path: `${cartProductsPath}/${encodeURIComponent(input.product.productId)}/variants`,
+    method: 'POST',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: { universalTokenIds: input.product.universalTokenIds },
+  }));
+}
+
+export async function removeConnectProductVariant(input: {
+  sessionId: string;
+  variant: RemoveProductVariantParams;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return parseProductResponse(await requestConnectApiJson({
+    path: `${cartProductsPath}/${encodeURIComponent(input.variant.productId)}/variants/${encodeURIComponent(input.variant.variantId)}`,
+    method: 'DELETE',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+export async function reorderConnectProductVariants(input: {
+  sessionId: string;
+  variants: ReorderProductVariantsParams;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return parseProductResponse(await requestConnectApiJson({
+    path: `${cartProductsPath}/${encodeURIComponent(input.variants.productId)}/variants/order`,
+    method: 'PATCH',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: { variantIds: input.variants.variantIds },
+  }));
+}
+
+export async function setConnectProductVariantVisibility(input: {
+  sessionId: string;
+  variant: SetProductVariantVisibilityParams;
+} & ConnectAuthApiOptions): Promise<Product> {
+  return parseProductResponse(await requestConnectApiJson({
+    path: `${cartProductsPath}/${encodeURIComponent(input.variant.productId)}/variants/${encodeURIComponent(input.variant.variantId)}`,
+    method: 'PATCH',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: { isHidden: input.variant.isHidden },
+  }));
+}
+
 export async function getConnectCheckoutStatus(input: {
   sessionId: string;
 } & ConnectAuthApiOptions): Promise<ConnectCheckoutStatus> {
@@ -291,11 +503,169 @@ export async function getConnectCheckoutStatus(input: {
   return parsedResponse.data.data;
 }
 
+export async function listConnectSavedCarts(input: {
+  sessionId: string;
+} & SavedCartListParams & ConnectAuthApiOptions): Promise<{
+  data: SavedCart[];
+  hasNextPage: boolean;
+}> {
+  const body = await requestConnectApiJson({
+    path: buildPagePath(savedCartsPath, input.page, input.perPage),
+    method: 'GET',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  });
+  return savedCartListResponseSchema.parse(body);
+}
+
+export async function getConnectSavedCart(input: {
+  sessionId: string;
+  cartId: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}`,
+    method: 'GET',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+export async function createConnectSavedCart(input: {
+  sessionId: string;
+  cart: SavedCartCreateParams;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: savedCartsPath,
+    method: 'POST',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: input.cart,
+  }));
+}
+
+export async function updateConnectSavedCart(input: {
+  sessionId: string;
+  cart: SavedCartUpdateParams;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cart.cartId)}`,
+    method: 'PATCH',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: { purchaseCurrency: input.cart.purchaseCurrency },
+  }));
+}
+
+export async function deleteConnectSavedCart(input: {
+  sessionId: string;
+  cartId: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}`,
+    method: 'DELETE',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+export async function putConnectSavedCartItem(input: {
+  sessionId: string;
+  cartId: string;
+  listingDigest: string;
+  quantity: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}/items/${encodeURIComponent(input.listingDigest)}`,
+    method: 'PUT',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+    body: { quantity: input.quantity },
+  }));
+}
+
+export async function removeConnectSavedCartItem(input: {
+  sessionId: string;
+  cartId: string;
+  listingDigest: string;
+} & ConnectAuthApiOptions): Promise<SavedCart> {
+  return await parseSavedCartResponse(await requestConnectApiJson({
+    path: `${savedCartsPath}/${encodeURIComponent(input.cartId)}/items/${encodeURIComponent(input.listingDigest)}`,
+    method: 'DELETE',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+async function parseSavedCartResponse(body: unknown): Promise<SavedCart> {
+  return savedCartResponseSchema.parse(body).data;
+}
+
+function parseProductResponse(body: unknown): Product {
+  const parsedResponse = productResponseSchema.safeParse(body);
+  if (!parsedResponse.success) {
+    throw new Error('Invalid Connect Product response.');
+  }
+
+  return parsedResponse.data.data;
+}
+
+function parseProductCandidateList(body: unknown): ProductRecordPage {
+  const parsedResponse = productCandidateListResponseSchema.safeParse(body);
+  if (!parsedResponse.success) {
+    throw new Error('Invalid Connect Product candidate list response.');
+  }
+
+  return parsedResponse.data;
+}
+
+async function postProductLifecycleAction(input: {
+  sessionId: string;
+  productId: string;
+} & ConnectAuthApiOptions, action: 'publish' | 'archive' | 'restore-to-draft'): Promise<Product> {
+  return parseProductResponse(await requestConnectApiJson({
+    path: `${cartProductsPath}/${encodeURIComponent(input.productId)}/${action === 'restore-to-draft' ? 'restore' : action}`,
+    method: 'POST',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    sessionId: input.sessionId,
+  }));
+}
+
+function buildPagePath(path: string, page = 1, perPage = 20): string {
+  const query = new URLSearchParams({
+    page: String(page),
+    perPage: String(perPage),
+  });
+  return `${path}?${query.toString()}`;
+}
+
+function buildCandidatesPath(input: {
+  page?: number;
+  perPage?: number;
+  productId?: string;
+}): string {
+  const query = new URLSearchParams({
+    page: String(input.page ?? 1),
+    perPage: String(input.perPage ?? 20),
+  });
+  if (input.productId !== undefined) {
+    query.set('productId', input.productId);
+  }
+  return `${cartProductsPath}/variant-candidates?${query.toString()}`;
+}
+
 async function requestConnectApiJson(input: {
   apiUrl?: string;
   fetch?: typeof fetch;
   path: string;
-  method: 'GET' | 'POST';
+  method: 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT';
   body?: unknown;
   sessionId?: string;
   signal?: AbortSignal;
@@ -314,7 +684,7 @@ async function requestConnectApiJson(input: {
 }
 
 function buildRequestInit(input: {
-  method: 'GET' | 'POST';
+  method: 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT';
   body?: unknown;
   sessionId?: string;
   signal?: AbortSignal;

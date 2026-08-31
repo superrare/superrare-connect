@@ -286,6 +286,34 @@ unsubscribe();
 
 `user.me()` requires a stored Connect session and throws `ConnectSessionRequiredError` when no local session exists.
 
+## Authenticated Cart
+
+Account-owned Cart resources live under `cart`. These methods attach the current Connect session and call Rare API directly; they do not load the hosted application.
+
+```ts
+const products = await superrare.cart.products.listMine();
+
+const cart = await superrare.cart.savedCarts.create({
+  chainId: '11155111',
+  cartAddress: '0x...',
+});
+
+await superrare.cart.savedCarts.items.put({
+  cartId: cart.id,
+  listingDigest: '0x...',
+  quantity: '1',
+});
+```
+
+Hosted Cart interfaces are optional launchers in the same domain:
+
+```ts
+await superrare.cart.hosted.openProductManager();
+await superrare.cart.hosted.openListingManager({ productId: '123' });
+```
+
+Permissionless Listing, signing, purchase execution, and receipt capabilities remain in `rare-sdk`; Connect does not wrap or duplicate them.
+
 ## Options
 
 ```ts
