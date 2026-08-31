@@ -8,6 +8,7 @@ import {
   type ConnectExpectedPriceTerms,
   type ConnectIntent,
   type ConnectSession,
+  type Product,
   type SuperRareConnectClient,
 } from '@rareprotocol/connect';
 import { createPublicClient, formatUnits, http } from 'viem';
@@ -58,6 +59,12 @@ type ArtworkLoadState =
   | { status: 'loaded'; artworks: SaleableErc721Artwork[] }
   | { status: 'failed'; message: string };
 
+type ProductLoadState =
+  | { status: 'signed_out' }
+  | { status: 'loading' }
+  | { status: 'loaded'; products: Product[] }
+  | { status: 'failed'; message: string };
+
 export function App(): JSX.Element {
   const client = useMemo(() => superrare, []);
   const session = useConnectSession(client);
@@ -66,8 +73,13 @@ export function App(): JSX.Element {
   const [selectedArtworkId, setSelectedArtworkId] = useState('');
   const [intentId, setIntentId] = useState('');
   const [hostedUrl, setHostedUrl] = useState('');
+  const [commerceHostedUrl, setCommerceHostedUrl] = useState('');
   const [intent, setIntent] = useState<ConnectIntent | undefined>();
   const [message, setMessage] = useState('');
+  const [productLoadState, setProductLoadState] = useState<ProductLoadState>({ status: 'signed_out' });
+  const [selectedProductId, setSelectedProductId] = useState('');
+  const [productTitle, setProductTitle] = useState('');
+  const [productDescription, setProductDescription] = useState('');
 
   useEffect(() => {
     if (!connectDebugEnabled) return;
@@ -115,6 +127,35 @@ export function App(): JSX.Element {
   }, []);
 
   useEffect(() => {
+    if (session === undefined) {
+      setProductLoadState({ status: 'signed_out' });
+      setSelectedProductId('');
+      return;
+    }
+
+    let cancelled = false;
+    setProductLoadState({ status: 'loading' });
+    client.cart.products.listMine()
+      .then((page) => {
+        if (cancelled) return;
+
+        setProductLoadState({ status: 'loaded', products: page.data });
+        setSelectedProductId((currentId) => (
+          currentId.length > 0 ? currentId : page.data[0]?.id ?? ''
+        ));
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+
+        setProductLoadState({ status: 'failed', message: formatError(error) });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client, session]);
+
+  useEffect(() => {
     if (intentId.trim().length === 0) return;
 
     const intervalId = window.setInterval(() => {
@@ -134,6 +175,8 @@ export function App(): JSX.Element {
   const intentOutcome = intent === undefined ? undefined : resolveConnectIntentOutcome(intent);
   const saleableArtworks = artworkLoadState.status === 'loaded' ? artworkLoadState.artworks : [];
   const selectedArtwork = getSelectedArtwork(saleableArtworks, selectedArtworkId);
+  const products = productLoadState.status === 'loaded' ? productLoadState.products : [];
+  const selectedProduct = products.find((product) => product.id === selectedProductId);
 
   return (
     <main>
@@ -254,6 +297,35 @@ export function App(): JSX.Element {
       </section>
 
       <section>
+        <h2>Product management through @rareprotocol/connect</h2>
+        <p>
+          This is the integrator-facing path: Product reads and mutations call Rare API with
+          the authenticated Connect session. Hosted seller managers are launched from the same
+          client, without importing Connect into connect-com.
+        </p>
+        {renderProductWorkspace({
+          client,
+          productLoadState,
+          products,
+          selectedProduct,
+          selectedProductId,
+          productTitle,
+          productDescription,
+          onSelectedProductIdChange: setSelectedProductId,
+          onProductTitleChange: setProductTitle,
+          onProductDescriptionChange: setProductDescription,
+          onProductLoadStateChange: setProductLoadState,
+          onMessageChange: setMessage,
+          onHostedUrlChange: setCommerceHostedUrl,
+        })}
+        {commerceHostedUrl.length > 0 ? (
+          <p>
+            <a href={commerceHostedUrl}>Open hosted seller flow</a>
+          </p>
+        ) : null}
+      </section>
+
+      <section>
         <h2>Messages</h2>
         <pre>{message}</pre>
       </section>
@@ -294,6 +366,157 @@ function renderArtworkSelector(input: {
         </select>
       </label>
       {renderArtworkPreview(getSelectedArtwork(input.artworkLoadState.artworks, input.selectedArtworkId))}
+    </>
+  );
+}
+
+function renderProductWorkspace(input: {
+  client: SuperRareConnectClient;
+  productLoadState: ProductLoadState;
+  products: Product[];
+  selectedProduct: Product | undefined;
+  selectedProductId: string;
+  productTitle: string;
+  productDescription: string;
+  onSelectedProductIdChange: (productId: string) => void;
+  onProductTitleChange: (title: string) => void;
+  onProductDescriptionChange: (description: string) => void;
+  onProductLoadStateChange: (state: ProductLoadState) => void;
+  onMessageChange: (message: string) => void;
+  onHostedUrlChange: (url: string) => void;
+}): JSX.Element {
+  if (input.productLoadState.status === 'signed_out') {
+    return <p>Log in above to load your Products from Rare API.</p>;
+  }
+
+  if (input.productLoadState.status === 'loading') {
+    return <p>Loading Products from Rare API...</p>;
+  }
+
+  if (input.productLoadState.status === 'failed') {
+    return <pre>{input.productLoadState.message}</pre>;
+  }
+
+  const createProduct = (): void => {
+    const title = input.productTitle.trim();
+    if (title.length === 0) {
+      input.onMessageChange('Enter a Product title before creating it.');
+      return;
+    }
+
+    input.onMessageChange('Creating Product through Rare API...');
+    void input.client.cart.products.create({
+      metadata: {
+        title,
+        description: input.productDescription.trim() || undefined,
+      },
+    }).then((product) => {
+      input.onProductLoadStateChange({
+        status: 'loaded',
+        products: [...input.products, product],
+      });
+      input.onSelectedProductIdChange(product.id);
+      input.onProductTitleChange('');
+      input.onProductDescriptionChange('');
+      input.onMessageChange(`Created Product ${product.id} as ${product.status}.`);
+    }).catch((error: unknown) => input.onMessageChange(formatError(error)));
+  };
+
+  const publishProduct = (): void => {
+    if (input.selectedProduct === undefined) return;
+
+    const productId = input.selectedProduct.id;
+    input.onMessageChange(`Publishing Product ${productId} through Rare API...`);
+    void input.client.cart.products.publish({ productId }).then((publishedProduct) => {
+      input.onProductLoadStateChange({
+        status: 'loaded',
+        products: input.products.map((product) => (
+          product.id === publishedProduct.id ? publishedProduct : product
+        )),
+      });
+      input.onMessageChange(`Published Product ${publishedProduct.id}.`);
+    }).catch((error: unknown) => input.onMessageChange(formatError(error)));
+  };
+
+  const openProductManager = (): void => {
+    input.onMessageChange('Creating the hosted seller Product manager intent...');
+    void input.client.cart.hosted.openProductManager({ returnPath: '/account' })
+      .then((createdIntent) => {
+        input.onHostedUrlChange(createdIntent.url);
+        input.onMessageChange('Open the hosted Product manager.');
+      })
+      .catch((error: unknown) => input.onMessageChange(formatError(error)));
+  };
+
+  const openListingManager = (): void => {
+    if (input.selectedProduct === undefined) return;
+
+    input.onMessageChange('Creating the hosted seller Listing manager intent...');
+    void input.client.cart.hosted.openListingManager({
+      productId: input.selectedProduct.id,
+      returnPath: `/products/${input.selectedProduct.id}`,
+    }).then((createdIntent) => {
+      input.onHostedUrlChange(createdIntent.url);
+      input.onMessageChange('Open the hosted Listing manager to configure and sign a Listing Root.');
+    }).catch((error: unknown) => input.onMessageChange(formatError(error)));
+  };
+
+  return (
+    <>
+      <div>
+        <label>
+          Title
+          <input
+            value={input.productTitle}
+            onChange={(event) => input.onProductTitleChange(event.currentTarget.value)}
+            placeholder="New Product"
+          />
+        </label>
+        <label>
+          Description
+          <textarea
+            value={input.productDescription}
+            onChange={(event) => input.onProductDescriptionChange(event.currentTarget.value)}
+            placeholder="Optional Product description"
+          />
+        </label>
+        <button type="button" onClick={createProduct}>Create Product</button>
+        <button type="button" onClick={openProductManager}>Open hosted Product manager</button>
+      </div>
+      {input.products.length === 0 ? <p>No Products found for this account.</p> : (
+        <>
+          <label>
+            Product
+            <select
+              value={input.selectedProductId}
+              onChange={(event) => input.onSelectedProductIdChange(event.currentTarget.value)}
+            >
+              {input.products.map((product) => (
+                <option key={product.id} value={product.id}>
+                  {product.metadata.title ?? product.slug ?? product.id} ({product.status})
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            disabled={input.selectedProduct === undefined || input.selectedProduct.status !== 'DRAFT'}
+            onClick={publishProduct}
+          >
+            Publish selected Product
+          </button>
+          <button
+            type="button"
+            disabled={input.selectedProduct === undefined}
+            onClick={openListingManager}
+          >
+            Open hosted Listing manager
+          </button>
+          {input.selectedProduct === undefined ? null : (
+            <pre>{JSON.stringify(input.selectedProduct, null, 2)}</pre>
+          )}
+        </>
+      )}
     </>
   );
 }

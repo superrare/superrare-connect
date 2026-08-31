@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@rareprotocol/rare-cli": "^1.4.0",
-    "@rareprotocol/connect": "workspace:*",
+    "@rareprotocol/connect": "github:superrare/superrare-connect#e4cf1d7",
     "buffer": "^6.0.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

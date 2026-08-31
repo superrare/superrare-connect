@@ -28,8 +28,8 @@ importers:
   examples/react:
     dependencies:
       '@rareprotocol/connect':
-        specifier: workspace:*
-        version: link:../..
+        specifier: github:superrare/superrare-connect#e4cf1d7
+        version: https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7
       '@rareprotocol/rare-cli':
         specifier: ^1.4.0
         version: 1.4.0(typescript@5.9.3)
@@ -367,6 +367,10 @@ packages:
 
   '@oxc-project/types@0.133.0':
     resolution: {integrity: sha512-KzkdCd6Uxqnf6l3HOw1xfatAlUURA0g14cvBYFyJ5SaNOQbOUvBr9PKArcPcrNIeRsBdgcUzOGrhKveVpvOIGA==}
+
+  '@rareprotocol/connect@https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7':
+    resolution: {tarball: https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7}
+    version: 0.3.0
 
   '@rareprotocol/rare-cli@1.4.0':
     resolution: {integrity: sha512-53JA8OFW1lqNadINdA25wA+F9snD3WsAJxv+lw9yOWEV84COTpAH3/214ZPtvnYAvSOzT0LARL7jL5HTGYPL7A==}
@@ -817,6 +821,7 @@ packages:
 
   crypto-js@4.2.0:
     resolution: {integrity: sha512-KALDyEYgpY+Rlob/iriUtjV6d5Eq+Y191A5g4UqLAi8CyGP9N1+FdVbkc1SxKc2r4YAYqG8JzO2KGL+AizD70Q==}
+    deprecated: Active development of CryptoJS has been discontinued. This library is no longer maintained.
 
   csstype@3.2.3:
     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
@@ -1912,6 +1917,10 @@ snapshots:
   '@noble/hashes@1.8.0': {}
 
   '@oxc-project/types@0.133.0': {}
+
+  '@rareprotocol/connect@https://codeload.github.com/superrare/superrare-connect/tar.gz/e4cf1d7':
+    dependencies:
+      zod: 4.4.3
 
   '@rareprotocol/rare-cli@1.4.0(typescript@5.9.3)':
     dependencies:
