@@ -274,21 +274,21 @@ Under the hood the hosted page reports the auth callback to the opener with a `p
 Product management requires an authenticated Connect session. The SDK sends the opaque session as a Bearer token to Rare API; it does not persist or own Product data. Public Product search and detail remain anonymous protocol operations.
 
 ```ts
-const products = await superrare.products.listMine();
+const products = await superrare.cart.products.listMine();
 
-const product = await superrare.products.create({
+const product = await superrare.cart.products.create({
   metadata: {
     title: 'A New Work',
     description: 'Optional presentation copy',
   },
 });
 
-await superrare.products.variants.addMany({
+await superrare.cart.products.variants.addMany({
   productId: product.id,
   universalTokenIds: ['11155111-0x1234567890123456789012345678901234567890-42'],
 });
 
-await superrare.products.publish({ productId: product.id });
+await superrare.cart.products.publish({ productId: product.id });
 ```
 
 The account-scoped namespace also provides `getMine`, `update`, `archive`,
@@ -302,11 +302,11 @@ pre-existing session; the hosted application authenticates before reading or
 mutating account-owned data.
 
 ```ts
-await superrare.seller.openProductManager({
+await superrare.cart.hosted.openProductManager({
   returnPath: '/inventory',
 });
 
-await superrare.seller.openListingManager({
+await superrare.cart.hosted.openListingManager({
   productId: product.id,
   returnPath: `/products/${product.id}`,
 });
