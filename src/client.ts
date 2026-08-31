@@ -29,17 +29,11 @@ import {
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
-  parseStoredPendingConnectAuth,
-  serializePendingConnectAuth,
   verifyConnectAuthCallbackAgainstPending,
   type ConnectAuthPendingVerificationError,
   type PendingConnectAuth,
 } from './auth-flow-core.js';
-import {
-  parseConnectAuthCallbackSearchParams,
-  type ConnectAuthCallbackParams,
-  type ConnectAuthCallbackParseResult,
-} from './callback-core.js';
+import type { ConnectAuthCallbackParams } from './callback-core.js';
 import {
   buildConnectCheckoutIntentRequest,
   type CheckoutStartParams,
@@ -73,38 +67,31 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   connectUrl?: string;
   initiatingOrigin?: string;
   createState?: () => string;
-  navigation?: ConnectNavigation | false;
   /**
-   * How hosted action/checkout intents open. `redirect` (default) navigates
-   * the current page; `popup` opens a small centered window — the integrator's
-   * page stays put and `onIntentSettled` fires when the flow finishes.
-   * `auth.login` always redirects (the auth callback returns to the page);
-   * `auth.loginWithPopup` is the popup counterpart for login.
+   * Every hosted flow — login, checkout, actions, offers — opens in a small
+   * centered window; the integrator's page always stays put. These options
+   * shape that window: its size, the opener (defaults to the browser's
+   * `window.open`), and the `message`-event source the login listens on.
    */
-  display?: 'redirect' | 'popup';
   popup?: ConnectPopupSize & {
     open?: ConnectPopupOpener;
-    /** Message-event source for popup login; defaults to the window. */
+    /** Message-event source for the login callback; defaults to the window. */
     messageEvents?: ConnectPopupMessageEvents;
   };
   /**
-   * Popup mode only. Called with the terminal status when the flow finishes
-   * (the SDK closes the window); with `status: 'expired'` when the server
-   * reports the intent expired (the window is left open — the hosted page may
-   * be mid-payment, and only it knows whether closing is safe); or with the
-   * latest known state when the user closes the popup early or the SDK's
-   * fallback deadline lapses — those two can carry a non-terminal status, so
-   * check `intent.status` before treating the flow as finished. Not called
-   * when the intent cannot be read at all and nothing was ever known.
+   * Called with the terminal status when a hosted action/checkout flow
+   * finishes (the SDK closes the window); with `status: 'expired'` when the
+   * server reports the intent expired (the window is left open — the hosted
+   * page may be mid-payment, and only it knows whether closing is safe); or
+   * with the latest known state when the user closes the window early or the
+   * SDK's fallback deadline lapses — those two can carry a non-terminal
+   * status, so check `intent.status` before treating the flow as finished.
+   * Not called when the intent cannot be read at all and nothing was ever
+   * known.
    */
   onIntentSettled?: (intent: ConnectIntent) => void;
   sessionStorage?: ConnectSessionStorage | false;
-  pendingAuthStorageKey?: string;
   sessionStorageKey?: string;
-};
-
-export type ConnectNavigation = {
-  assign: (url: string) => void;
 };
 
 export type ConnectPopupMessageEvent = {
@@ -123,11 +110,9 @@ export type ConnectAuthLoginParams = {
 };
 
 export type SuperRareConnectAuthNamespace = {
-  login: (params?: ConnectAuthLoginParams) => Promise<ConnectIntentCreation>;
+  login: (params?: ConnectAuthLoginParams) => Promise<ConnectPopupLoginResult>;
+  /** @deprecated `login` opens the window itself now; this is the same call. */
   loginWithPopup: (params?: ConnectAuthLoginParams) => Promise<ConnectPopupLoginResult>;
-  parseCallback: (searchParams: URLSearchParams) => ConnectAuthCallbackParseResult;
-  exchangeCallback: (searchParams: URLSearchParams) => Promise<ConnectSession>;
-  exchangeCode: (params: ConnectAuthCallbackParams) => Promise<ConnectSession>;
   getSession: () => ConnectSession | undefined;
   getRemoteSession: () => Promise<ConnectSessionState>;
   me: () => Promise<ConnectCurrentUser>;
@@ -175,16 +160,6 @@ export type SuperRareConnectClient = {
   intents: SuperRareConnectIntentsNamespace;
 };
 
-export class ConnectAuthCallbackError extends Error {
-  readonly code: Exclude<ConnectAuthCallbackParseResult, { ok: true }>['error'];
-
-  constructor(code: Exclude<ConnectAuthCallbackParseResult, { ok: true }>['error']) {
-    super(`Invalid Connect auth callback: ${code}`);
-    this.name = 'ConnectAuthCallbackError';
-    this.code = code;
-  }
-}
-
 export class ConnectAuthPendingError extends Error {
   readonly code: ConnectAuthPendingVerificationError;
 
@@ -212,30 +187,30 @@ export class ConnectSessionRequiredError extends Error {
 }
 
 /**
- * Thrown by `exchangeCallback`/`exchangeCode` when the session changed while
- * the exchange was in flight (a logout or a newer login on this client). The
- * exchanged session is deliberately NOT stored — committing it would resurrect
- * a session the caller already moved on from.
+ * Thrown when the hosted window could not be opened — the opener refused
+ * (popup blocked) or the host has no `window.open` at all. Every hosted flow
+ * needs its own window, so there is nothing to fall back to: call the SDK
+ * synchronously from a user gesture (a click handler) and the browser will
+ * allow the window.
  */
-export class ConnectSessionSupersededError extends Error {
-  readonly code = 'session_superseded';
+export class ConnectPopupBlockedError extends Error {
+  readonly code = 'popup_blocked';
 
   constructor() {
-    super('The Connect session changed while the login was completing.');
-    this.name = 'ConnectSessionSupersededError';
+    super(
+      'The Connect window could not be opened. Call the SDK directly from a user gesture (a click handler), and check that popups are allowed for this site.',
+    );
+    this.name = 'ConnectPopupBlockedError';
   }
 }
 
 const DEFAULT_CONNECT_SESSION_STORAGE_KEY = 'superrare.connect.session';
-const DEFAULT_CONNECT_PENDING_AUTH_STORAGE_KEY = 'superrare.connect.pendingAuth';
 
 export function createSuperRareClient(
   options: SuperRareConnectClientOptions = {},
 ): SuperRareConnectClient {
   const storage = resolveConnectSessionStorage(options.sessionStorage);
   const storageKey = options.sessionStorageKey ?? DEFAULT_CONNECT_SESSION_STORAGE_KEY;
-  const pendingAuthStorageKey = options.pendingAuthStorageKey ?? DEFAULT_CONNECT_PENDING_AUTH_STORAGE_KEY;
-  const navigation = resolveConnectNavigation(options.navigation);
   const sessionListeners = new Set<ConnectSessionChangeCallback>();
   // Per client: bumped by every session commit or clear on THIS client, so an
   // exchange that resolves after this client's session changed underneath it
@@ -256,38 +231,11 @@ export function createSuperRareClient(
   });
   const createState = options.createState ?? createConnectState;
   // The single place a session is written: bumps the generation, persists,
-  // notifies. `clearPendingAuth` is false for the popup path, which never
-  // owned the shared pending record.
-  const commitSession = (
-    session: ConnectSession,
-    { clearPendingAuth }: { clearPendingAuth: boolean },
-  ): void => {
+  // notifies.
+  const commitSession = (session: ConnectSession): void => {
     sessionCommitGeneration += 1;
     writeConnectSessionToStorage(storage, storageKey, session);
-    if (clearPendingAuth) {
-      removePendingAuthFromStorage(storage, pendingAuthStorageKey);
-    }
     notifySessionListeners(sessionListeners, session);
-  };
-  const exchangeCode = async (params: ConnectAuthCallbackParams): Promise<ConnectSession> => {
-    const generation = sessionCommitGeneration;
-    const session = await exchangeConnectAuthCode(params, apiOptions);
-    if (generation !== sessionCommitGeneration) {
-      // A logout or newer login landed on this client during the exchange, so
-      // the stale session must not be written. Drop the now-consumed pending
-      // record too — but only if it is still THIS callback's, since a
-      // concurrent redirect login may have replaced it — so replaying this
-      // callback fails locally instead of sending the spent code to the backend.
-      const storedPendingAuth = readPendingAuthFromStorage(storage, pendingAuthStorageKey);
-      if (storedPendingAuth?.intentId === params.intentId) {
-        removePendingAuthFromStorage(storage, pendingAuthStorageKey);
-      }
-
-      throw new ConnectSessionSupersededError();
-    }
-
-    commitSession(session, { clearPendingAuth: true });
-    return session;
   };
   const openPopupWindow = (
     target = 'superrare-connect',
@@ -446,49 +394,42 @@ export function createSuperRareClient(
     }
 
     // The popup must open before the first await to stay inside the user
-    // gesture; otherwise browsers block it. It navigates once the intent exists.
-    // Each action gets its own window name: a shared one lets a second action
-    // reuse the first's window, so one watcher could close the window a buyer
-    // is paying in.
-    const popup = options.display === 'popup'
-      ? openPopupWindow(`superrare-connect-intent-${createConnectPopupName()}`)
-      : null;
+    // gesture; otherwise browsers block it. It navigates once the intent
+    // exists. A blocked window fails the whole call before any intent is
+    // created — there is no same-page fallback. Each action gets its own
+    // window name: a shared one lets a second action reuse the first's
+    // window, so one watcher could close the window a buyer is paying in.
+    const popup = openPopupWindow(`superrare-connect-intent-${createConnectPopupName()}`);
+    if (popup === null) {
+      throw new ConnectPopupBlockedError();
+    }
+
     let intent: ConnectIntentCreation;
     try {
       intent = resolveHostedIntent(await createConnectIntent({
         ...apiOptions,
         request: requestResult.request,
       }));
-    } catch (error) {
-      popup?.close();
-      throw error;
-    }
-
-    try {
       requireNavigableHostedUrl(intent.url);
     } catch (error) {
-      popup?.close();
+      popup.close();
       throw error;
     }
 
-    if (popup !== null) {
-      popup.location.replace(appendConnectPopupDisplay(intent.url));
-      void watchPopupIntent({
-        popup,
-        intentId: intent.intentId,
-        deadline: getConnectPopupDeadline({
-          expiresAt: intent.expiresAt,
-          now: Date.now(),
-          fallbackMilliseconds: POPUP_FALLBACK_TIMEOUT_MS,
-        }) + POPUP_INTENT_DEADLINE_GRACE_MS,
-      }).catch(() => {
-        // The watcher owns its own cleanup; a throwing collaborator (a custom
-        // window, or the integrator's onIntentSettled) must not surface as an
-        // unhandled rejection.
-      });
-    } else {
-      navigation?.assign(intent.url);
-    }
+    popup.location.replace(appendConnectPopupDisplay(intent.url));
+    void watchPopupIntent({
+      popup,
+      intentId: intent.intentId,
+      deadline: getConnectPopupDeadline({
+        expiresAt: intent.expiresAt,
+        now: Date.now(),
+        fallbackMilliseconds: POPUP_FALLBACK_TIMEOUT_MS,
+      }) + POPUP_INTENT_DEADLINE_GRACE_MS,
+    }).catch(() => {
+      // The watcher owns its own cleanup; a throwing collaborator (a custom
+      // window, or the integrator's onIntentSettled) must not surface as an
+      // unhandled rejection.
+    });
 
     return intent;
   };
@@ -534,13 +475,6 @@ export function createSuperRareClient(
       },
     };
   };
-  // Only a REDIRECT login needs its pending record to survive the navigation.
-  // A popup login verifies its callback against the record it holds in memory,
-  // so it never writes here — the single storage key stays owned by whichever
-  // redirect login is actually in flight.
-  const persistPendingAuth = (pendingAuth: PendingConnectAuth): void => {
-    writePendingAuthToStorage(storage, pendingAuthStorageKey, pendingAuth);
-  };
   const completePopupLogin = async (input: {
     params: ConnectAuthCallbackParams;
     operationGeneration: number;
@@ -564,7 +498,7 @@ export function createSuperRareClient(
     // The session is established: the login has succeeded. The profile lookup
     // is best-effort — neither a failure nor a slow response may turn a
     // committed login into an error, so the watcher stops timing it here.
-    commitSession(session, { clearPendingAuth: false });
+    commitSession(session);
     input.onCommitted();
     const user = await getConnectCurrentUser({
       ...apiOptions,
@@ -724,21 +658,23 @@ export function createSuperRareClient(
     // the whole operation, so its exchange can never resurrect a replaced
     // session.
     const operationGeneration = sessionCommitGeneration;
-    // The popup must open before the first await to stay inside the user
-    // gesture; it navigates once the intent exists. Without a message source
-    // the callback could never be received, so don't open one — the flow
-    // falls back to the redirect login instead.
-    const popup = messageEvents === undefined
-      ? null
-      : openPopupWindow(`superrare-connect-login-${createConnectPopupName()}`);
-    if (popup === null && storage === undefined) {
-      // The redirect fallback verifies its callback against the STORED pending
-      // record, so without storage it could never complete.
+    if (messageEvents === undefined) {
+      // Without a message source the hosted page's callback could never be
+      // received, so the login could never complete — refuse before opening
+      // anything. Browsers always have one; a non-browser host supplies
+      // `popup.messageEvents`.
       throw new Error(
-        messageEvents === undefined
-          ? 'Popup login is unavailable (no message-event source), and the redirect fallback requires session storage.'
-          : 'The Connect popup could not be opened, and the redirect login fallback requires session storage.',
+        'Connect login is unavailable: no message-event source. Provide popup.messageEvents on hosts without window message events.',
       );
+    }
+
+    // The popup must open before the first await to stay inside the user
+    // gesture; it navigates once the intent exists. A blocked window fails
+    // the login before any intent is created — there is no same-page
+    // fallback.
+    const popup = openPopupWindow(`superrare-connect-login-${createConnectPopupName()}`);
+    if (popup === null) {
+      throw new ConnectPopupBlockedError();
     }
 
     let creationSettled = false;
@@ -750,31 +686,29 @@ export function createSuperRareClient(
 
     let started: StartedLoginIntent;
     try {
-      const raced = popup === null
-        ? { created: await creation }
-        : await Promise.race([
-          creation.then((created) => ({ created })),
-          watchPopupDismissal(popup, () => creationSettled).then(
-            (dismissal) => ({ dismissal }),
-          ),
-        ]);
+      const raced = await Promise.race([
+        creation.then((created) => ({ created })),
+        watchPopupDismissal(popup, () => creationSettled).then(
+          (dismissal) => ({ dismissal }),
+        ),
+      ]);
 
       if ('dismissal' in raced && raced.dismissal === 'dismissed') {
-        popup?.close();
+        popup.close();
         return { status: 'cancelled' };
       }
 
       started = 'created' in raced ? raced.created : await creation;
     } catch (error) {
-      popup?.close();
+      popup.close();
       throw error;
     }
 
     const { intent, pendingAuth } = started;
     // Creating the intent is a round trip; a logout during it invalidates this
-    // login before anything is stored or navigated.
+    // login before anything is navigated.
     if (operationGeneration !== sessionCommitGeneration) {
-      popup?.close();
+      popup.close();
       return { status: 'cancelled' };
     }
 
@@ -782,18 +716,8 @@ export function createSuperRareClient(
     try {
       connectOrigin = requireNavigableHostedUrl(intent.url);
     } catch (error) {
-      popup?.close();
+      popup.close();
       throw error;
-    }
-
-    if (popup === null || messageEvents === undefined) {
-      // Popup blocked: fall back to the redirect login. Only now is the
-      // pending record stored — it has to survive the navigation. Like
-      // `auth.login`, the redirect flow keeps a single pending record, so a
-      // concurrent redirect login on the same client replaces it (last wins).
-      persistPendingAuth(pendingAuth);
-      navigation?.assign(intent.url);
-      return { status: 'redirected', intent };
     }
 
     const popupUrl = appendConnectPopupDisplay(intent.url);
@@ -821,48 +745,24 @@ export function createSuperRareClient(
     }
   };
 
+  const login = async (
+    params: ConnectAuthLoginParams = {},
+  ): Promise<ConnectPopupLoginResult> => {
+    // One login at a time: the SDK holds a single session, so a second
+    // concurrent login could only race the first for the same slot. A
+    // caller that asks again — a double click — joins the login already
+    // running instead of opening a second window.
+    inFlightPopupLogin ??= runPopupLogin(params).finally(() => {
+      inFlightPopupLogin = undefined;
+    });
+
+    return await inFlightPopupLogin;
+  };
+
   return {
     auth: {
-      async login(params = {}): Promise<ConnectIntentCreation> {
-        const { intent, pendingAuth } = await createLoginIntent(params, {
-          signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
-        });
-        // Guard before anything is stored, so a rejected URL leaves no
-        // pending record behind.
-        requireNavigableHostedUrl(intent.url);
-        persistPendingAuth(pendingAuth);
-        navigation?.assign(intent.url);
-        return intent;
-      },
-      async loginWithPopup(params = {}): Promise<ConnectPopupLoginResult> {
-        // One login at a time: the SDK holds a single session, so a second
-        // concurrent login could only race the first for the same slot. A
-        // caller that asks again — a double click — joins the login already
-        // running instead of opening a second window.
-        inFlightPopupLogin ??= runPopupLogin(params).finally(() => {
-          inFlightPopupLogin = undefined;
-        });
-
-        return await inFlightPopupLogin;
-      },
-      parseCallback: parseConnectAuthCallbackSearchParams,
-      async exchangeCallback(searchParams): Promise<ConnectSession> {
-        const parseResult = parseConnectAuthCallbackSearchParams(searchParams);
-        if (!parseResult.ok) {
-          throw new ConnectAuthCallbackError(parseResult.error);
-        }
-
-        const pendingVerificationResult = verifyConnectAuthCallbackAgainstPending({
-          pendingAuth: readPendingAuthFromStorage(storage, pendingAuthStorageKey),
-          callbackParams: parseResult.params,
-        });
-        if (!pendingVerificationResult.ok) {
-          throw new ConnectAuthPendingError(pendingVerificationResult.error);
-        }
-
-        return exchangeCode(parseResult.params);
-      },
-      exchangeCode,
+      login,
+      loginWithPopup: login,
       getSession(): ConnectSession | undefined {
         return readConnectSessionFromStorage(storage, storageKey);
       },
@@ -879,7 +779,6 @@ export function createSuperRareClient(
       clearSession(): void {
         sessionCommitGeneration += 1;
         removeConnectSessionFromStorage(storage, storageKey);
-        removePendingAuthFromStorage(storage, pendingAuthStorageKey);
         notifySessionListeners(sessionListeners, undefined);
       },
       logout(): void {
@@ -1005,18 +904,6 @@ function resolveConnectSessionStorage(
 function readBrowserLocalStorage(): ConnectSessionStorage | undefined {
   const storage = Reflect.get(globalThis, 'localStorage');
   return isConnectSessionStorage(storage) ? storage : undefined;
-}
-
-function resolveConnectNavigation(
-  navigation: ConnectNavigation | false | undefined,
-): ConnectNavigation | undefined {
-  if (navigation === false) return undefined;
-  return navigation ?? readBrowserNavigation();
-}
-
-function readBrowserNavigation(): ConnectNavigation | undefined {
-  const location = Reflect.get(globalThis, 'location');
-  return isConnectNavigation(location) ? location : undefined;
 }
 
 const POPUP_POLL_INTERVAL_MS = 2000;
@@ -1161,15 +1048,6 @@ function readBrowserScreenSize(): { width: number; height: number } | undefined 
   return undefined;
 }
 
-function isConnectNavigation(value: unknown): value is ConnectNavigation {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'assign' in value &&
-    typeof value.assign === 'function'
-  );
-}
-
 function isConnectSessionStorage(value: unknown): value is ConnectSessionStorage {
   return (
     typeof value === 'object' &&
@@ -1240,27 +1118,3 @@ function resolveHostedConnectUrl(input: {
   return hostedUrl.toString();
 }
 
-function readPendingAuthFromStorage(
-  storage: ConnectSessionStorage | undefined,
-  storageKey: string,
-): PendingConnectAuth | undefined {
-  const serializedPendingAuth = storage?.getItem(storageKey);
-  return serializedPendingAuth === null || serializedPendingAuth === undefined
-    ? undefined
-    : parseStoredPendingConnectAuth(serializedPendingAuth);
-}
-
-function writePendingAuthToStorage(
-  storage: ConnectSessionStorage | undefined,
-  storageKey: string,
-  pendingAuth: PendingConnectAuth,
-): void {
-  storage?.setItem(storageKey, serializePendingConnectAuth(pendingAuth));
-}
-
-function removePendingAuthFromStorage(
-  storage: ConnectSessionStorage | undefined,
-  storageKey: string,
-): void {
-  storage?.removeItem(storageKey);
-}

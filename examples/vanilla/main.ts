@@ -14,8 +14,14 @@ const render = (value: unknown): void => {
   }
 };
 
+// Every hosted flow opens in its own window, so the SDK must be called
+// directly from the click handler — that keeps the window inside the user
+// gesture and the browser allows it.
 login?.addEventListener('click', () => {
-  void superrare.auth.login({ returnPath: '/callback.html' });
+  superrare.auth.login()
+    .then(async (result) => (result.status === 'authenticated' ? await superrare.user.me() : result))
+    .then(render)
+    .catch(render);
 });
 
 buy?.addEventListener('click', () => {
@@ -27,13 +33,5 @@ buy?.addEventListener('click', () => {
       tokenId: '1',
     },
     expected: { currency: 'ETH', price: '1000000000000' },
-    returnPath: '/buy-complete.html',
   }).then(render).catch(render);
 });
-
-if (window.location.search.length > 0) {
-  superrare.auth.exchangeCallback(new URLSearchParams(window.location.search))
-    .then(async () => await superrare.user.me())
-    .then(render)
-    .catch(render);
-}
