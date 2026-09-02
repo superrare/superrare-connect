@@ -297,11 +297,15 @@ const superrare = createSuperRareClient({
 });
 ```
 
-Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
+Use `connectUrl` to point every hosted window at a matching Connect deployment in staging or local environments (production is the default); the deployment must serve the hosted `/launch` page, which this SDK version opens for every flow. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
 
 ## Hosted Windows
 
-Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
+Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays.
+
+The window opens directly on the SuperRare Connect `/launch` page with the intent request in the URL fragment, and **that page creates the intent itself** before continuing into the hosted flow. Nothing between the click and the hosted flow depends on your page staying awake — which matters on iOS Safari, where the opener tab is suspended the moment the new window takes focus. The launch page reports `{intentId, url, expiresAt}` back to the SDK with a `postMessage`, and the SDK's promise resolves with it.
+
+`popup` shapes the window and `onIntentSettled` reports how the flow ended:
 
 ```ts
 const superrare = createSuperRareClient({
@@ -317,7 +321,11 @@ const superrare = createSuperRareClient({
 });
 ```
 
-Call `actions.buy()` (or any other action) directly from the click handler: the window opens synchronously inside the user gesture, so browsers allow it. When the window cannot be opened, the call rejects with `ConnectPopupBlockedError` before any intent is created — there is no same-page fallback.
+Call `actions.buy()` (or any other action) directly from the click handler: the window opens synchronously inside the user gesture, so browsers allow it. Failure modes are typed and nothing is created for any of them until the hosted page succeeds:
+
+- `ConnectPopupBlockedError` — the window could not be opened (popup blocked, or the call ran outside a user gesture).
+- `ConnectPopupClosedError` — the person closed the window before the hosted flow was created.
+- `ConnectLaunchFailedError` — the hosted page could not create the flow (Rare API rejected the request or was unreachable); the window stays open showing the same explanation.
 
 ## Return Path Safety
 
@@ -344,6 +352,8 @@ The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
+- `ConnectPopupClosedError` when the window was closed before the hosted flow was created.
+- `ConnectLaunchFailedError` when the hosted launch page could not create the flow; the message carries its explanation.
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.
 - `SuperRareConnectApiError` for Rare API non-2xx responses, with `status` and `path`.

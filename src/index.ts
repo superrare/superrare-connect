@@ -1,6 +1,8 @@
 export {
   ConnectAuthPendingError,
+  ConnectLaunchFailedError,
   ConnectPopupBlockedError,
+  ConnectPopupClosedError,
   ConnectReturnPathError,
   ConnectSessionRequiredError,
   createSuperRareClient,

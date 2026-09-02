@@ -1,7 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  createConnectIntent,
-  createConnectLoginIntent,
   getConnectCheckoutStatus,
   getConnectCurrentUser,
   getConnectIntent,
@@ -25,84 +23,6 @@ const checkoutTarget: ConnectErc1155CheckoutTarget = {
 };
 
 describe('Connect API client', () => {
-  it('creates login intents', async () => {
-    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const request = input instanceof Request ? input : new Request(input, init);
-
-      expect(request.method).toBe('POST');
-      expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
-      expect(await request.json()).toEqual({
-        action: { type: 'login' },
-        returnPath: '/account',
-        state: 'state_123',
-        initiatingOrigin: 'https://artist.example',
-      });
-
-      return jsonResponse({
-        data: {
-          intentId: 'connect_intent_123',
-          url: 'https://connect.superrare.test/login?intentId=connect_intent_123',
-          expiresAt: '2026-06-22T00:00:00.000Z',
-        },
-      });
-    });
-
-    await expect(createConnectLoginIntent({
-      apiUrl: 'https://rare-api.test',
-      fetch: fetchImplementation,
-      request: {
-        action: { type: 'login' },
-        returnPath: '/account',
-        state: 'state_123',
-        initiatingOrigin: 'https://artist.example',
-      },
-    })).resolves.toEqual({
-      intentId: 'connect_intent_123',
-      url: 'https://connect.superrare.test/login?intentId=connect_intent_123',
-      expiresAt: '2026-06-22T00:00:00.000Z',
-    });
-  });
-
-  it('creates checkout intents through the generic intent client', async () => {
-    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const request = input instanceof Request ? input : new Request(input, init);
-
-      expect(request.method).toBe('POST');
-      expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
-      expect(await request.json()).toEqual({
-        action: {
-          type: 'checkout',
-          target: checkoutTarget,
-        },
-        returnPath: '/thanks',
-        state: 'state_123',
-      });
-
-      return jsonResponse({
-        data: {
-          intentId: 'connect_intent_checkout',
-          url: 'https://connect.superrare.test/checkout/connect_checkout_session_123?intentId=connect_intent_checkout',
-          expiresAt: '2026-06-22T00:00:00.000Z',
-        },
-      });
-    });
-
-    await expect(createConnectIntent({
-      apiUrl: 'https://rare-api.test',
-      fetch: fetchImplementation,
-      request: {
-        action: {
-          type: 'checkout',
-          target: checkoutTarget,
-        },
-        returnPath: '/thanks',
-        state: 'state_123',
-      },
-    })).resolves.toMatchObject({
-      intentId: 'connect_intent_checkout',
-    });
-  });
-
   it('gets intent status', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);
