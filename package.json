@@ -1,6 +1,6 @@
 {
   "name": "@rareprotocol/connect",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Public SDK for using SuperRare Connect",
   "type": "module",
   "main": "./dist/index.cjs",
