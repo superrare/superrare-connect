@@ -10,6 +10,7 @@ export {
   type ConnectAuthLoginParams,
   type ConnectPopupMessageEvent,
   type ConnectPopupMessageEvents,
+  type ConnectPopupVisibilityEvents,
   type ConnectSessionChangeCallback,
   type SuperRareConnectAuthNamespace,
   type SuperRareConnectCheckoutNamespace,
@@ -74,6 +75,7 @@ export {
   SuperRareConnectApiError,
 } from './errors.js';
 export {
+  type ConnectAuthClaimResult,
   type ConnectCurrentUser,
   type ConnectIntentCreation,
   type ConnectSessionState,

@@ -248,10 +248,49 @@ function completedIntentStatusResponse(request: Request): Response {
 
 // The standard login-capable client: launch handoff through the recorder and
 // emitter, exchange/profile through the fetch mock, watcher polls terminal.
+// What Rare API answers a claim with until the hosted login completes.
+const claimNotCompletedResponse = (): Response =>
+  jsonResponse({ error: 'Hosted login has not completed yet' }, { status: 409 });
+
+const claimIssuedResponse = (): Response => jsonResponse({
+  data: {
+    code: 'connect_auth_code_claimed',
+    intentId: 'connect_intent_login',
+    state: 'state_login',
+    expiresAt: futureExpiry(),
+  },
+});
+
+function createVisibilityEmitter(): {
+  visibilityEvents: { subscribe: (listener: (visible: boolean) => void) => () => void };
+  emit: (visible: boolean) => void;
+  listenerCount: () => number;
+} {
+  const listeners = new Set<(visible: boolean) => void>();
+
+  return {
+    visibilityEvents: {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+    emit(visible) {
+      listeners.forEach((listener) => {
+        listener(visible);
+      });
+    },
+    listenerCount: () => listeners.size,
+  };
+}
+
 function createLoginTestClient(overrides: {
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   sessionStorage?: ConnectSessionStorage | false;
   connectUrl?: string;
+  visibilityEvents?: ReturnType<typeof createVisibilityEmitter>['visibilityEvents'];
 } = {}): {
   client: ReturnType<typeof createSuperRareClient>;
   emitter: ReturnType<typeof createMessageEmitter>;
@@ -263,10 +302,15 @@ function createLoginTestClient(overrides: {
     apiUrl: 'https://rare-api.test',
     connectUrl: overrides.connectUrl ?? connectOrigin,
     createState: () => 'state_login',
-    popup: { open: recorder.open, messageEvents: emitter.messageEvents },
+    popup: {
+      open: recorder.open,
+      messageEvents: emitter.messageEvents,
+      ...(overrides.visibilityEvents === undefined ? {} : { visibilityEvents: overrides.visibilityEvents }),
+    },
     fetch: overrides.fetch ?? (async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+      if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
       if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
       return completedIntentStatusResponse(request);
     }),
@@ -1487,6 +1531,188 @@ describe('auth.login', () => {
 
       await expect(resultPromise).resolves.toEqual({ status: 'expired' });
       expect(openedWindow.popup.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('claims the code from Rare API when the window closes without a callback', async () => {
+    // The hosted page posts its callback and closes itself; a suspended
+    // opener (iOS) never gets the message. Finding the window closed, the
+    // SDK asks Rare API instead of reporting a cancel.
+    vi.useFakeTimers();
+    try {
+      const requestedPaths: string[] = [];
+      const { client, emitter, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/auth/claim')) {
+            expect(await request.json()).toEqual({
+              intentId: 'connect_intent_login',
+              state: 'state_login',
+            });
+            return claimIssuedResponse();
+          }
+          if (request.url.endsWith('/v1/connect/auth/exchange')) {
+            expect(await request.json()).toEqual({
+              intentId: 'connect_intent_login',
+              state: 'state_login',
+              code: 'connect_auth_code_claimed',
+            });
+            return sessionResponse();
+          }
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+      emitter.emit(launchCreatedMessage(openedWindow.url));
+      await vi.advanceTimersByTimeAsync(0);
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const result = await resultPromise;
+      expect(result.status).toBe('authenticated');
+      expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+      expect(requestedPaths).toEqual([
+        '/v1/connect/auth/claim',
+        '/v1/connect/auth/exchange',
+        '/v1/connect/users/me',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('claims the code when the page becomes visible again', async () => {
+    // Back from the wallet app: the page resumes, the hosted window may
+    // still be open or already gone; either way the result is asked for.
+    const visibility = createVisibilityEmitter();
+    const requestedPaths: string[] = [];
+    const { client, emitter, opened } = createLoginTestClient({
+      visibilityEvents: visibility.visibilityEvents,
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestedPaths.push(new URL(request.url).pathname);
+        if (request.url.endsWith('/v1/connect/auth/claim')) return claimIssuedResponse();
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        return jsonResponse({ error: 'nope' }, { status: 500 });
+      },
+    });
+
+    const resultPromise = client.auth.login();
+    const openedWindow = opened[0];
+    if (openedWindow === undefined) throw new Error('expected a window');
+    await completeLaunch(emitter, openedWindow.url);
+    expect(visibility.listenerCount()).toBe(1);
+
+    visibility.emit(false);
+    visibility.emit(true);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(openedWindow.popup.closed).toBe(true);
+    expect(visibility.listenerCount()).toBe(0);
+    expect(requestedPaths.filter((path) => path === '/v1/connect/auth/claim')).toHaveLength(1);
+  });
+
+  it('exchanges once when the posted callback lands while a claim is out', async () => {
+    let resolveClaim: (response: Response) => void = () => {};
+    const exchangedCodes: string[] = [];
+    const visibility = createVisibilityEmitter();
+    const { client, emitter, opened } = createLoginTestClient({
+      visibilityEvents: visibility.visibilityEvents,
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/claim')) {
+          return await new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          });
+        }
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          const body: unknown = await request.json();
+          if (typeof body === 'object' && body !== null && 'code' in body && typeof body.code === 'string') {
+            exchangedCodes.push(body.code);
+          }
+          return sessionResponse();
+        }
+        return jsonResponse({ error: 'nope' }, { status: 500 });
+      },
+    });
+
+    const resultPromise = client.auth.login();
+    const openedWindow = opened[0];
+    if (openedWindow === undefined) throw new Error('expected a window');
+    await completeLaunch(emitter, openedWindow.url);
+
+    // A claim goes out, and the callback arrives before it answers.
+    visibility.emit(true);
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    resolveClaim(claimIssuedResponse());
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(exchangedCodes).toEqual(['connect_auth_code_login']);
+  });
+
+  it('resolves cancelled when the window closes and nothing completed', async () => {
+    // Rare API answers 409 until the hosted login completes: a closed window
+    // with nothing to claim is the person changing their mind.
+    vi.useFakeTimers();
+    try {
+      const requestedPaths: string[] = [];
+      const { client, emitter, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+      emitter.emit(launchCreatedMessage(openedWindow.url));
+      await vi.advanceTimersByTimeAsync(0);
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+      expect(requestedPaths).toEqual(['/v1/connect/auth/claim']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolves expired when the claim reports the intent expired', async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, emitter, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/claim')) {
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+          }
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+      emitter.emit(launchCreatedMessage(openedWindow.url));
+      await vi.advanceTimersByTimeAsync(0);
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'expired' });
     } finally {
       vi.useRealTimers();
     }

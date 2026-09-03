@@ -1,4 +1,5 @@
 import {
+  claimConnectAuthCode,
   exchangeConnectAuthCode,
   getConnectCheckoutStatus,
   getConnectCurrentUser,
@@ -85,6 +86,13 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
     open?: ConnectPopupOpener;
     /** Message-event source for the login callback; defaults to the window. */
     messageEvents?: ConnectPopupMessageEvents;
+    /**
+     * Page-visibility source for the login; defaults to the document. A
+     * login claims its result from Rare API whenever this page becomes
+     * visible again: iOS Safari suspends the page while the hosted window
+     * is in front, and the callback posted meanwhile never arrives.
+     */
+    visibilityEvents?: ConnectPopupVisibilityEvents;
   };
   /**
    * Called with the terminal status when a hosted action/checkout flow
@@ -110,6 +118,14 @@ export type ConnectPopupMessageEvent = {
 export type ConnectPopupMessageEvents = {
   /** Subscribes to `message` events; returns the unsubscribe function. */
   subscribe: (listener: (event: ConnectPopupMessageEvent) => void) => () => void;
+};
+
+export type ConnectPopupVisibilityEvents = {
+  /**
+   * Subscribes to page-visibility changes (`true` when the page becomes
+   * visible); returns the unsubscribe function.
+   */
+  subscribe: (listener: (visible: boolean) => void) => () => void;
 };
 
 export type ConnectAuthLoginParams = {
@@ -591,6 +607,7 @@ export function createSuperRareClient(
     });
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
+  const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
   let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
   const completePopupLogin = async (input: {
     params: ConnectAuthCallbackParams;
@@ -639,6 +656,7 @@ export function createSuperRareClient(
     popup: ConnectPopupWindow;
     pendingAuth: PendingConnectAuth;
     messageEvents: ConnectPopupMessageEvents;
+    visibilityEvents: ConnectPopupVisibilityEvents | undefined;
     connectOrigin: string;
     deadline: number;
     operationGeneration: number;
@@ -653,7 +671,11 @@ export function createSuperRareClient(
       let exchanging = false;
       let committed = false;
       let completionDeadline = 0;
+      // A claim in flight: the close-watcher waits for its answer rather than
+      // reporting a cancel for a login that may just have completed.
+      let claiming = false;
       let unsubscribe: () => void = () => {};
+      let unsubscribeVisibility: () => void = () => {};
       // Cleanup is best-effort: an integrator-supplied window or emitter may
       // throw on close/unsubscribe, but a login that reached a decision must
       // still settle, so the error is swallowed and `finish` always runs.
@@ -662,6 +684,7 @@ export function createSuperRareClient(
         settled = true;
         try {
           unsubscribe();
+          unsubscribeVisibility();
           if (!isPopupClosed(input.popup)) input.popup.close();
         } catch {
           // The window/emitter is already gone; nothing left to release.
@@ -669,22 +692,15 @@ export function createSuperRareClient(
         finish();
       };
 
-      unsubscribe = input.messageEvents.subscribe((event) => {
-        if (settled || exchanging) return;
-        const parsed = parseConnectAuthCallbackMessage({
-          data: event.data,
-          origin: event.origin,
-          expectedOrigin: input.connectOrigin,
-        });
-        // Unrelated or foreign-origin messages — keep waiting. A callback for
-        // another intent belongs to a different login, not this one.
-        if (!parsed.ok || parsed.params.intentId !== input.pendingAuth.intentId) return;
-
+      // One exchange per login, whichever delivery arrives first: the posted
+      // callback or a claim. A code the other path minted afterwards is
+      // simply never used (it expires with the intent).
+      const startExchange = (params: ConnectAuthCallbackParams): void => {
         // Verified against this login's own record, so storage-disabled
         // clients cannot be confused by an unrelated pending record.
         const verification = verifyConnectAuthCallbackAgainstPending({
           pendingAuth: input.pendingAuth,
-          callbackParams: parsed.params,
+          callbackParams: params,
         });
         if (!verification.ok) {
           settle(() => {
@@ -693,13 +709,13 @@ export function createSuperRareClient(
           return;
         }
 
-        // A callback in hand is exchanged regardless of the client clock: the
+        // A code in hand is exchanged regardless of the client clock: the
         // server is the authority on expiry and returns 410 for a spent
         // intent. The client deadline only closes an abandoned popup.
         exchanging = true;
         completionDeadline = Date.now() + POPUP_LOGIN_COMPLETION_TIMEOUT_MS;
         completePopupLogin({
-          params: parsed.params,
+          params,
           operationGeneration: input.operationGeneration,
           isAbandoned: () => settled,
           onCommitted: () => {
@@ -717,7 +733,65 @@ export function createSuperRareClient(
             });
           },
         );
+      };
+
+      unsubscribe = input.messageEvents.subscribe((event) => {
+        if (settled || exchanging) return;
+        const parsed = parseConnectAuthCallbackMessage({
+          data: event.data,
+          origin: event.origin,
+          expectedOrigin: input.connectOrigin,
+        });
+        // Unrelated or foreign-origin messages — keep waiting. A callback for
+        // another intent belongs to a different login, not this one.
+        if (!parsed.ok || parsed.params.intentId !== input.pendingAuth.intentId) return;
+
+        startExchange(parsed.params);
       });
+
+      // The pull side of the handoff. The hosted page posts its callback to
+      // this page, but iOS Safari suspends this page while the hosted window
+      // is in front and the message posted meanwhile never arrives. So on
+      // every occasion this page may have missed it — becoming visible again,
+      // finding the window closed — Rare API is asked for the result: a fresh
+      // code once the hosted login completed, 409 until then.
+      const claimCompletedLogin = async (): Promise<void> => {
+        if (settled || exchanging || claiming) return;
+        claiming = true;
+        try {
+          const claim = await claimConnectAuthCode(
+            { intentId: input.pendingAuth.intentId, state: input.pendingAuth.state },
+            { ...apiOptions, signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS) },
+          );
+          // The posted callback may have landed while the claim was out.
+          if (settled || exchanging || claim.status === 'not_completed') return;
+
+          startExchange(claim.params);
+        } catch (error) {
+          if (settled || exchanging) return;
+          if (error instanceof SuperRareConnectApiError && !isRetryableConnectApiStatus(error.status)) {
+            // 410 IS the expiry. Anything else non-retryable (the intent gone,
+            // its state refused) means this login can no longer complete.
+            if (error.status === 410) {
+              settle(() => {
+                resolve({ status: 'expired' });
+              });
+              return;
+            }
+
+            settle(() => {
+              reject(error);
+            });
+          }
+          // A retryable failure: the next occasion asks again.
+        } finally {
+          claiming = false;
+        }
+      };
+
+      unsubscribeVisibility = input.visibilityEvents?.subscribe((visible) => {
+        if (visible) void claimCompletedLogin();
+      }) ?? ((): void => {});
 
       const watchPopupLifetime = async (): Promise<void> => {
         while (!settled) {
@@ -738,6 +812,12 @@ export function createSuperRareClient(
           }
 
           if (isPopupClosed(input.popup)) {
+            // The hosted page closes itself once it has posted the callback:
+            // a closed window is where a missed callback is most likely, so
+            // it is a cancel only once Rare API confirms nothing completed.
+            if (!claiming) await claimCompletedLogin();
+            if (settled || exchanging || claiming) continue;
+
             settle(() => {
               resolve({ status: 'cancelled' });
             });
@@ -864,6 +944,7 @@ export function createSuperRareClient(
         popup,
         pendingAuth,
         messageEvents,
+        visibilityEvents,
         connectOrigin,
         deadline,
         operationGeneration,
@@ -1121,6 +1202,34 @@ function readBrowserMessageEvents(): ConnectPopupMessageEvents | undefined {
       addEventListener.call(globalThis, 'message', domListener);
       return () => {
         removeEventListener.call(globalThis, 'message', domListener);
+      };
+    },
+  };
+}
+
+function readBrowserVisibilityEvents(): ConnectPopupVisibilityEvents | undefined {
+  const document: unknown = Reflect.get(globalThis, 'document');
+  if (
+    typeof document !== 'object' ||
+    document === null ||
+    !('addEventListener' in document) ||
+    !('removeEventListener' in document) ||
+    typeof document.addEventListener !== 'function' ||
+    typeof document.removeEventListener !== 'function'
+  ) {
+    return undefined;
+  }
+  const addEventListener = document.addEventListener;
+  const removeEventListener = document.removeEventListener;
+
+  return {
+    subscribe(listener) {
+      const domListener = (): void => {
+        listener(Reflect.get(document, 'visibilityState') === 'visible');
+      };
+      addEventListener.call(document, 'visibilitychange', domListener);
+      return () => {
+        removeEventListener.call(document, 'visibilitychange', domListener);
       };
     },
   };
