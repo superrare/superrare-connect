@@ -244,7 +244,17 @@ When the window cannot be opened at all (a popup blocker, or a call outside a us
 
 Only one login runs at a time per client: the SDK holds a single session, so calling `login()` again while one is in flight joins the running login instead of opening a second window. If the backend stops responding after the callback arrives, the call rejects rather than hanging. `auth.loginWithPopup()` remains as a deprecated alias of `auth.login()`.
 
-For controlled environments (tests, non-browser hosts), `popup.open` and `popup.messageEvents` let you supply the window opener and the `message`-event source the login listens on:
+On iOS Safari the page is suspended the moment the hosted window takes focus, which has two consequences the SDK covers for you. First, the callback the hosted page posts when the login completes never arrives: the login therefore also claims its result from Rare API whenever the page becomes visible again or the hosted window is found closed, and a closed window is reported as `cancelled` only once Rare API confirms nothing completed. Second, `auth.login()` opens the window first and navigates it once the intent exists; if the page is suspended before that round trip finishes, the window stays blank. To rule that out, create the intent ahead of the tap with `auth.prepareLogin()` (on page load, or when the person is about to tap): the next `auth.login()` with the same params then opens the window already pointed at the hosted page, inside the gesture, with no round trip in between. A prepared login lasts as long as its intent (about fifteen minutes) and is dropped after a logout; `login` creates a fresh intent when none is usable.
+
+```ts
+await superrare.auth.prepareLogin();
+
+button.addEventListener('click', () => {
+  void superrare.auth.login();
+});
+```
+
+For controlled environments (tests, non-browser hosts), `popup.open`, `popup.messageEvents` and `popup.visibilityEvents` let you supply the window opener, the `message`-event source the login listens on, and the page-visibility source it claims on:
 
 ```ts
 createSuperRareClient({

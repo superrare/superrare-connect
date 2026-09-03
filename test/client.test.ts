@@ -141,6 +141,96 @@ const sessionResponse = (): Response => jsonResponse({
   },
 });
 
+// What Rare API answers a claim with until the hosted login completes.
+const claimNotCompletedResponse = (): Response =>
+  jsonResponse({ error: 'Hosted login has not completed yet' }, { status: 409 });
+
+const claimIssuedResponse = (): Response => jsonResponse({
+  data: {
+    code: 'connect_auth_code_claimed',
+    intentId: 'connect_intent_login',
+    state: 'state_login',
+    expiresAt: futureExpiry(),
+  },
+});
+
+function createVisibilityEmitter(): {
+  visibilityEvents: { subscribe: (listener: (visible: boolean) => void) => () => void };
+  emit: (visible: boolean) => void;
+  listenerCount: () => number;
+} {
+  const listeners = new Set<(visible: boolean) => void>();
+
+  return {
+    visibilityEvents: {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+    emit(visible) {
+      listeners.forEach((listener) => {
+        listener(visible);
+      });
+    },
+    listenerCount: () => listeners.size,
+  };
+}
+
+// Records every window the client opens, with the URL it opened at: a
+// prepared login opens straight at the hosted page, an unprepared one blank.
+function createPopupOpenRecorder(): {
+  open: (url: string, target: string, features: string) => ConnectPopupWindow;
+  opened: Array<{ url: string; popup: ReturnType<typeof createPopupStub> }>;
+} {
+  const opened: Array<{ url: string; popup: ReturnType<typeof createPopupStub> }> = [];
+
+  return {
+    open(url) {
+      const popup = createPopupStub();
+      opened.push({ url, popup });
+      return popup;
+    },
+    opened,
+  };
+}
+
+// The standard login-capable client for the claim and prepared-login tests:
+// intent creation, claim (409 unless overridden), exchange and profile
+// through the fetch mock.
+function createLoginTestClient(overrides: {
+  fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  visibilityEvents?: ReturnType<typeof createVisibilityEmitter>['visibilityEvents'];
+} = {}): {
+  client: ReturnType<typeof createSuperRareClient>;
+  emitter: ReturnType<typeof createMessageEmitter>;
+  opened: ReturnType<typeof createPopupOpenRecorder>['opened'];
+} {
+  const emitter = createMessageEmitter();
+  const recorder = createPopupOpenRecorder();
+  const client = createSuperRareClient({
+    apiUrl: 'https://rare-api.test',
+    createState: () => 'state_login',
+    popup: {
+      open: recorder.open,
+      messageEvents: emitter.messageEvents,
+      ...(overrides.visibilityEvents === undefined ? {} : { visibilityEvents: overrides.visibilityEvents }),
+    },
+    fetch: overrides.fetch ?? (async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+      if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
+      if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+      return loginIntentCreationResponse();
+    }),
+    sessionStorage: createMemoryStorage(),
+  });
+
+  return { client, emitter, opened: recorder.opened };
+}
+
 // A terminal poll answer for any intent watcher, so action tests running on
 // fake timers can settle their watcher with one 2s advance instead of
 // leaking a polling loop past the test.
@@ -1396,6 +1486,327 @@ describe('createSuperRareClient', () => {
       returnPath: '/buy/complete',
     })).rejects.toBeInstanceOf(ConnectPopupBlockedError);
     expect(fetchImplementation).not.toHaveBeenCalled();
+  });
+});
+
+describe('auth.login claims a result the posted callback never delivered', () => {
+  const connectOrigin = 'https://connect.superrare.test';
+
+  it('claims the code from Rare API when the window closes without a callback', async () => {
+    // The hosted page posts its callback and closes itself; a suspended
+    // opener (iOS) never gets the message. Finding the window closed, the
+    // SDK asks Rare API instead of reporting a cancel.
+    vi.useFakeTimers();
+    try {
+      const requestedPaths: string[] = [];
+      const { client, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/auth/claim')) {
+            expect(await request.json()).toEqual({
+              intentId: 'connect_intent_login',
+              state: 'state_login',
+            });
+            return claimIssuedResponse();
+          }
+          if (request.url.endsWith('/v1/connect/auth/exchange')) {
+            expect(await request.json()).toEqual({
+              intentId: 'connect_intent_login',
+              state: 'state_login',
+              code: 'connect_auth_code_claimed',
+            });
+            return sessionResponse();
+          }
+          if (request.url.endsWith('/v1/connect/users/me')) {
+            return jsonResponse({ error: 'nope' }, { status: 500 });
+          }
+          return loginIntentCreationResponse();
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      await vi.waitFor(() => {
+        expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+      });
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const result = await resultPromise;
+      expect(result.status).toBe('authenticated');
+      expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+      expect(requestedPaths).toEqual([
+        '/v1/connect/intents',
+        '/v1/connect/auth/claim',
+        '/v1/connect/auth/exchange',
+        '/v1/connect/users/me',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('claims the code when the page becomes visible again', async () => {
+    const visibility = createVisibilityEmitter();
+    const claims: number[] = [];
+    const { client, opened } = createLoginTestClient({
+      visibilityEvents: visibility.visibilityEvents,
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/claim')) {
+          claims.push(Date.now());
+          return claimIssuedResponse();
+        }
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
+        return loginIntentCreationResponse();
+      },
+    });
+
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(visibility.listenerCount()).toBe(1);
+
+    visibility.emit(false);
+    visibility.emit(true);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(opened[0]?.popup.closed).toBe(true);
+    expect(visibility.listenerCount()).toBe(0);
+    expect(claims).toHaveLength(1);
+  });
+
+  it('exchanges once when the posted callback lands while a claim is out', async () => {
+    let resolveClaim: (response: Response) => void = () => {};
+    const exchangedCodes: string[] = [];
+    const visibility = createVisibilityEmitter();
+    const { client, emitter, opened } = createLoginTestClient({
+      visibilityEvents: visibility.visibilityEvents,
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/claim')) {
+          return await new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          });
+        }
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          const body: unknown = await request.json();
+          if (typeof body === 'object' && body !== null && 'code' in body && typeof body.code === 'string') {
+            exchangedCodes.push(body.code);
+          }
+          return sessionResponse();
+        }
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
+        return loginIntentCreationResponse();
+      },
+    });
+
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+
+    // A claim goes out, and the callback arrives before it answers.
+    visibility.emit(true);
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    resolveClaim(claimIssuedResponse());
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(exchangedCodes).toEqual(['connect_auth_code_login']);
+  });
+
+  it('resolves cancelled when the window closes and nothing completed', async () => {
+    // Rare API answers 409 until the hosted login completes: a closed window
+    // with nothing to claim is the person changing their mind.
+    vi.useFakeTimers();
+    try {
+      const requestedPaths: string[] = [];
+      const { client, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
+          return loginIntentCreationResponse();
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      await vi.waitFor(() => {
+        expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+      });
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+      expect(requestedPaths).toEqual(['/v1/connect/intents', '/v1/connect/auth/claim']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolves expired when the claim reports the intent expired', async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/claim')) {
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+          }
+          return loginIntentCreationResponse();
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      await vi.waitFor(() => {
+        expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+      });
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'expired' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('auth.prepareLogin', () => {
+  const connectOrigin = 'https://connect.superrare.test';
+
+  it('opens the next login straight at the hosted page, with no round trip in the tap', async () => {
+    const requestedPaths: string[] = [];
+    const { client, emitter, opened } = createLoginTestClient({
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestedPaths.push(new URL(request.url).pathname);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
+        return loginIntentCreationResponse();
+      },
+    });
+
+    const prepared = await client.auth.prepareLogin({ returnPath: '/auth/callback' });
+    expect(prepared.intentId).toBe('connect_intent_login');
+    expect(requestedPaths).toEqual(['/v1/connect/intents']);
+    // Preparing again for the same params reuses the intent.
+    await client.auth.prepareLogin({ returnPath: '/auth/callback' });
+    expect(requestedPaths).toEqual(['/v1/connect/intents']);
+
+    const resultPromise = client.auth.login({ returnPath: '/auth/callback' });
+    // The window opened synchronously, already at the hosted page: no blank
+    // page, no navigation, no second intent.
+    expect(opened).toHaveLength(1);
+    expect(opened[0]?.url).toBe(
+      'https://connect.superrare.test/login?intentId=connect_intent_login&display=popup',
+    );
+    expect(opened[0]?.popup.replacedUrls).toEqual([]);
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(requestedPaths).toEqual([
+      '/v1/connect/intents',
+      '/v1/connect/auth/exchange',
+      '/v1/connect/users/me',
+    ]);
+  });
+
+  it('is used once: the login after it creates its own intent', async () => {
+    const { client, emitter, opened } = createLoginTestClient();
+
+    await client.auth.prepareLogin();
+    const first = client.auth.login();
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await first;
+
+    const second = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[1]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[1]?.url).toBe('about:blank');
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await second;
+  });
+
+  it('drops a prepared login whose params differ from the tap', async () => {
+    const { client, emitter, opened } = createLoginTestClient();
+
+    await client.auth.prepareLogin({ returnPath: '/one' });
+    const resultPromise = client.auth.login({ returnPath: '/two' });
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[0]?.url).toBe('about:blank');
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await resultPromise;
+  });
+
+  it('drops a prepared login whose intent is about to expire', async () => {
+    const { client, emitter, opened } = createLoginTestClient({
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
+        return jsonResponse({
+          data: {
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            // Thirty seconds out: not worth opening a window on.
+            expiresAt: new Date(Date.now() + 30_000).toISOString(),
+          },
+        });
+      },
+    });
+
+    await client.auth.prepareLogin();
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[0]?.url).toBe('about:blank');
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await resultPromise;
+  });
+
+  it('drops a prepared login after a logout', async () => {
+    const { client, emitter, opened } = createLoginTestClient();
+
+    await client.auth.prepareLogin();
+    client.auth.logout();
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[0]?.url).toBe('about:blank');
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await resultPromise;
   });
 });
 

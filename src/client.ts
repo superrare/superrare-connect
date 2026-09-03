@@ -1,4 +1,5 @@
 import {
+  claimConnectAuthCode,
   createConnectIntent,
   createConnectLoginIntent,
   exchangeConnectAuthCode,
@@ -77,6 +78,13 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
     open?: ConnectPopupOpener;
     /** Message-event source for the login callback; defaults to the window. */
     messageEvents?: ConnectPopupMessageEvents;
+    /**
+     * Page-visibility source for the login; defaults to the document. A
+     * login claims its result from Rare API whenever this page becomes
+     * visible again: iOS Safari suspends the page while the hosted window
+     * is in front, and the callback posted meanwhile never arrives.
+     */
+    visibilityEvents?: ConnectPopupVisibilityEvents;
   };
   /**
    * Called with the terminal status when a hosted action/checkout flow
@@ -104,15 +112,40 @@ export type ConnectPopupMessageEvents = {
   subscribe: (listener: (event: ConnectPopupMessageEvent) => void) => () => void;
 };
 
+export type ConnectPopupVisibilityEvents = {
+  /**
+   * Subscribes to page-visibility changes (`true` when the page becomes
+   * visible); returns the unsubscribe function.
+   */
+  subscribe: (listener: (visible: boolean) => void) => () => void;
+};
+
 export type ConnectAuthLoginParams = {
   returnPath?: string;
   initiatingOrigin?: string;
+};
+
+/** A login intent created ahead of the tap by `auth.prepareLogin`. */
+export type ConnectPreparedLogin = {
+  intentId: string;
+  expiresAt: string;
 };
 
 export type SuperRareConnectAuthNamespace = {
   login: (params?: ConnectAuthLoginParams) => Promise<ConnectPopupLoginResult>;
   /** @deprecated `login` opens the window itself now; this is the same call. */
   loginWithPopup: (params?: ConnectAuthLoginParams) => Promise<ConnectPopupLoginResult>;
+  /**
+   * Creates the login intent ahead of the tap, so the next `login` with the
+   * same params opens the hosted window already pointed at it — inside the
+   * gesture, with no round trip in between. That round trip is what a
+   * suspended opener (iOS Safari, the moment the window takes focus) never
+   * finishes, leaving the window blank. Call it when the page loads or when
+   * the person is about to tap. A prepared login lasts as long as its
+   * intent; `login` drops a stale or mismatched one and creates a fresh
+   * intent instead.
+   */
+  prepareLogin: (params?: ConnectAuthLoginParams) => Promise<ConnectPreparedLogin>;
   getSession: () => ConnectSession | undefined;
   getRemoteSession: () => Promise<ConnectSessionState>;
   me: () => Promise<ConnectCurrentUser>;
@@ -237,15 +270,19 @@ export function createSuperRareClient(
     writeConnectSessionToStorage(storage, storageKey, session);
     notifySessionListeners(sessionListeners, session);
   };
+  // `url` is the page the window opens at. A flow whose intent already
+  // exists opens straight at the hosted page; the others open blank and
+  // navigate once their intent is created.
   const openPopupWindow = (
     target = 'superrare-connect',
+    url = 'about:blank',
   ): ConnectPopupWindow | null => {
     const open = options.popup?.open ?? readBrowserPopupOpener();
     if (open === undefined) return null;
 
     const screen = readBrowserScreenSize();
     return open(
-      'about:blank',
+      url,
       target,
       getConnectPopupFeatures({
         size: options.popup,
@@ -445,6 +482,7 @@ export function createSuperRareClient(
     });
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
+  const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
   let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
   const createLoginIntent = async (
     params: ConnectAuthLoginParams,
@@ -474,6 +512,60 @@ export function createSuperRareClient(
         expiresAt: intent.expiresAt,
       },
     };
+  };
+  // The login prepared ahead of the tap, if any. Held in memory only: it is
+  // tied to this client's session generation (a logout invalidates it) and
+  // to the params it was prepared with.
+  let preparedLogin: PreparedLogin | undefined;
+  const resolveLoginParams = (params: ConnectAuthLoginParams): ResolvedLoginParams => ({
+    returnPath: params.returnPath,
+    initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+  });
+  const prepareLogin = async (
+    params: ConnectAuthLoginParams = {},
+  ): Promise<ConnectPreparedLogin> => {
+    const resolvedParams = resolveLoginParams(params);
+    const existing = preparedLogin;
+    if (
+      existing !== undefined &&
+      existing.operationGeneration === sessionCommitGeneration &&
+      isPreparedLoginUsable({ prepared: existing, params: resolvedParams, now: Date.now() })
+    ) {
+      return {
+        intentId: existing.started.intent.intentId,
+        expiresAt: existing.started.intent.expiresAt,
+      };
+    }
+
+    const operationGeneration = sessionCommitGeneration;
+    const started = await createLoginIntent(params, {
+      signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
+    });
+    const connectOrigin = requireNavigableHostedUrl(started.intent.url);
+    preparedLogin = {
+      started,
+      connectOrigin,
+      popupUrl: appendConnectPopupDisplay(started.intent.url),
+      params: resolvedParams,
+      operationGeneration,
+    };
+    return {
+      intentId: started.intent.intentId,
+      expiresAt: started.intent.expiresAt,
+    };
+  };
+  // Hands the prepared login over to a `login` call, once: a stale or
+  // mismatched one is dropped, and the call creates its own intent.
+  const takePreparedLogin = (params: ConnectAuthLoginParams): PreparedLogin | undefined => {
+    const prepared = preparedLogin;
+    preparedLogin = undefined;
+    if (prepared === undefined) return undefined;
+    if (prepared.operationGeneration !== sessionCommitGeneration) return undefined;
+    if (!isPreparedLoginUsable({ prepared, params: resolveLoginParams(params), now: Date.now() })) {
+      return undefined;
+    }
+
+    return prepared;
   };
   const completePopupLogin = async (input: {
     params: ConnectAuthCallbackParams;
@@ -536,6 +628,7 @@ export function createSuperRareClient(
     popup: ConnectPopupWindow;
     pendingAuth: PendingConnectAuth;
     messageEvents: ConnectPopupMessageEvents;
+    visibilityEvents: ConnectPopupVisibilityEvents | undefined;
     connectOrigin: string;
     deadline: number;
     operationGeneration: number;
@@ -550,7 +643,11 @@ export function createSuperRareClient(
       let exchanging = false;
       let committed = false;
       let completionDeadline = 0;
+      // A claim in flight: the close-watcher waits for its answer rather than
+      // reporting a cancel for a login that may just have completed.
+      let claiming = false;
       let unsubscribe: () => void = () => {};
+      let unsubscribeVisibility: () => void = () => {};
       // Cleanup is best-effort: an integrator-supplied window or emitter may
       // throw on close/unsubscribe, but a login that reached a decision must
       // still settle, so the error is swallowed and `finish` always runs.
@@ -559,6 +656,7 @@ export function createSuperRareClient(
         settled = true;
         try {
           unsubscribe();
+          unsubscribeVisibility();
           if (!isPopupClosed(input.popup)) input.popup.close();
         } catch {
           // The window/emitter is already gone; nothing left to release.
@@ -566,22 +664,15 @@ export function createSuperRareClient(
         finish();
       };
 
-      unsubscribe = input.messageEvents.subscribe((event) => {
-        if (settled || exchanging) return;
-        const parsed = parseConnectAuthCallbackMessage({
-          data: event.data,
-          origin: event.origin,
-          expectedOrigin: input.connectOrigin,
-        });
-        // Unrelated or foreign-origin messages — keep waiting. A callback for
-        // another intent belongs to a different login, not this one.
-        if (!parsed.ok || parsed.params.intentId !== input.pendingAuth.intentId) return;
-
+      // One exchange per login, whichever delivery arrives first: the posted
+      // callback or a claim. A code the other path minted afterwards is
+      // simply never used (it expires with the intent).
+      const startExchange = (params: ConnectAuthCallbackParams): void => {
         // Verified against this login's own record, so storage-disabled
         // clients cannot be confused by an unrelated pending record.
         const verification = verifyConnectAuthCallbackAgainstPending({
           pendingAuth: input.pendingAuth,
-          callbackParams: parsed.params,
+          callbackParams: params,
         });
         if (!verification.ok) {
           settle(() => {
@@ -590,13 +681,13 @@ export function createSuperRareClient(
           return;
         }
 
-        // A callback in hand is exchanged regardless of the client clock: the
+        // A code in hand is exchanged regardless of the client clock: the
         // server is the authority on expiry and returns 410 for a spent
         // intent. The client deadline only closes an abandoned popup.
         exchanging = true;
         completionDeadline = Date.now() + POPUP_LOGIN_COMPLETION_TIMEOUT_MS;
         completePopupLogin({
-          params: parsed.params,
+          params,
           operationGeneration: input.operationGeneration,
           isAbandoned: () => settled,
           onCommitted: () => {
@@ -614,7 +705,65 @@ export function createSuperRareClient(
             });
           },
         );
+      };
+
+      unsubscribe = input.messageEvents.subscribe((event) => {
+        if (settled || exchanging) return;
+        const parsed = parseConnectAuthCallbackMessage({
+          data: event.data,
+          origin: event.origin,
+          expectedOrigin: input.connectOrigin,
+        });
+        // Unrelated or foreign-origin messages — keep waiting. A callback for
+        // another intent belongs to a different login, not this one.
+        if (!parsed.ok || parsed.params.intentId !== input.pendingAuth.intentId) return;
+
+        startExchange(parsed.params);
       });
+
+      // The pull side of the handoff. The hosted page posts its callback to
+      // this page, but iOS Safari suspends this page while the hosted window
+      // is in front and the message posted meanwhile never arrives. So on
+      // every occasion this page may have missed it — becoming visible again,
+      // finding the window closed — Rare API is asked for the result: a fresh
+      // code once the hosted login completed, 409 until then.
+      const claimCompletedLogin = async (): Promise<void> => {
+        if (settled || exchanging || claiming) return;
+        claiming = true;
+        try {
+          const claim = await claimConnectAuthCode(
+            { intentId: input.pendingAuth.intentId, state: input.pendingAuth.state },
+            { ...apiOptions, signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS) },
+          );
+          // The posted callback may have landed while the claim was out.
+          if (settled || exchanging || claim.status === 'not_completed') return;
+
+          startExchange(claim.params);
+        } catch (error) {
+          if (settled || exchanging) return;
+          if (error instanceof SuperRareConnectApiError && !isRetryableConnectApiStatus(error.status)) {
+            // 410 IS the expiry. Anything else non-retryable (the intent gone,
+            // its state refused) means this login can no longer complete.
+            if (error.status === 410) {
+              settle(() => {
+                resolve({ status: 'expired' });
+              });
+              return;
+            }
+
+            settle(() => {
+              reject(error);
+            });
+          }
+          // A retryable failure: the next occasion asks again.
+        } finally {
+          claiming = false;
+        }
+      };
+
+      unsubscribeVisibility = input.visibilityEvents?.subscribe((visible) => {
+        if (visible) void claimCompletedLogin();
+      }) ?? ((): void => {});
 
       const watchPopupLifetime = async (): Promise<void> => {
         while (!settled) {
@@ -635,6 +784,12 @@ export function createSuperRareClient(
           }
 
           if (isPopupClosed(input.popup)) {
+            // The hosted page closes itself once it has posted the callback:
+            // a closed window is where a missed callback is most likely, so
+            // it is a cancel only once Rare API confirms nothing completed.
+            if (!claiming) await claimCompletedLogin();
+            if (settled || exchanging || claiming) continue;
+
             settle(() => {
               resolve({ status: 'cancelled' });
             });
@@ -671,10 +826,37 @@ export function createSuperRareClient(
     // The popup must open before the first await to stay inside the user
     // gesture; it navigates once the intent exists. A blocked window fails
     // the login before any intent is created — there is no same-page
-    // fallback.
-    const popup = openPopupWindow(`superrare-connect-login-${createConnectPopupName()}`);
+    // fallback. A login prepared ahead of the tap has its intent already:
+    // the window opens straight at the hosted page, with no round trip for a
+    // suspended opener to leave unfinished.
+    const prepared = takePreparedLogin(params);
+    const popup = openPopupWindow(
+      `superrare-connect-login-${createConnectPopupName()}`,
+      prepared?.popupUrl,
+    );
     if (popup === null) {
       throw new ConnectPopupBlockedError();
+    }
+
+    if (prepared !== undefined) {
+      try {
+        return await watchPopupLogin({
+          popup,
+          pendingAuth: prepared.started.pendingAuth,
+          messageEvents,
+          visibilityEvents,
+          connectOrigin: prepared.connectOrigin,
+          deadline: getConnectPopupDeadline({
+            expiresAt: prepared.started.intent.expiresAt,
+            now: Date.now(),
+            fallbackMilliseconds: POPUP_FALLBACK_TIMEOUT_MS,
+          }),
+          operationGeneration,
+        });
+      } catch (error) {
+        if (!popup.closed) popup.close();
+        throw error;
+      }
     }
 
     let creationSettled = false;
@@ -732,6 +914,7 @@ export function createSuperRareClient(
         popup,
         pendingAuth,
         messageEvents,
+        visibilityEvents,
         connectOrigin,
         deadline,
         operationGeneration,
@@ -763,6 +946,7 @@ export function createSuperRareClient(
     auth: {
       login,
       loginWithPopup: login,
+      prepareLogin,
       getSession(): ConnectSession | undefined {
         return readConnectSessionFromStorage(storage, storageKey);
       },
@@ -970,6 +1154,49 @@ type StartedLoginIntent = {
   pendingAuth: PendingConnectAuth;
 };
 
+type ResolvedLoginParams = {
+  returnPath: string | undefined;
+  initiatingOrigin: string | undefined;
+};
+
+type PreparedLogin = {
+  started: StartedLoginIntent;
+  connectOrigin: string;
+  popupUrl: string;
+  params: ResolvedLoginParams;
+  operationGeneration: number;
+};
+
+/**
+ * How much of the intent's life a prepared login must still have to be worth
+ * opening: a window opened on an intent about to expire would only show the
+ * hosted page's "expired" screen.
+ */
+const PREPARED_LOGIN_MIN_REMAINING_MS = 60_000;
+
+/**
+ * Whether a prepared login can serve a `login` call: same return path and
+ * initiating origin, and enough of its intent's life left. An expiry that
+ * cannot be parsed is treated as expired.
+ */
+function isPreparedLoginUsable(input: {
+  prepared: PreparedLogin;
+  params: ResolvedLoginParams;
+  now: number;
+}): boolean {
+  if (
+    input.prepared.params.returnPath !== input.params.returnPath ||
+    input.prepared.params.initiatingOrigin !== input.params.initiatingOrigin
+  ) {
+    return false;
+  }
+
+  const expiresAt = Date.parse(input.prepared.started.intent.expiresAt);
+  if (Number.isNaN(expiresAt)) return false;
+
+  return expiresAt - input.now > PREPARED_LOGIN_MIN_REMAINING_MS;
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -993,6 +1220,34 @@ function readBrowserMessageEvents(): ConnectPopupMessageEvents | undefined {
       addEventListener.call(globalThis, 'message', domListener);
       return () => {
         removeEventListener.call(globalThis, 'message', domListener);
+      };
+    },
+  };
+}
+
+function readBrowserVisibilityEvents(): ConnectPopupVisibilityEvents | undefined {
+  const document: unknown = Reflect.get(globalThis, 'document');
+  if (
+    typeof document !== 'object' ||
+    document === null ||
+    !('addEventListener' in document) ||
+    !('removeEventListener' in document) ||
+    typeof document.addEventListener !== 'function' ||
+    typeof document.removeEventListener !== 'function'
+  ) {
+    return undefined;
+  }
+  const addEventListener = document.addEventListener;
+  const removeEventListener = document.removeEventListener;
+
+  return {
+    subscribe(listener) {
+      const domListener = (): void => {
+        listener(Reflect.get(document, 'visibilityState') === 'visible');
+      };
+      addEventListener.call(document, 'visibilitychange', domListener);
+      return () => {
+        removeEventListener.call(document, 'visibilitychange', domListener);
       };
     },
   };
