@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_CONNECT_POPUP_HEIGHT,
   DEFAULT_CONNECT_POPUP_WIDTH,
+  appendConnectPopupDisplay,
   getConnectPopupDeadline,
   getConnectPopupFeatures,
   isConnectIntentSettled,
@@ -40,6 +41,18 @@ describe('getConnectPopupFeatures', () => {
 
     expect(features).toContain('left=0');
     expect(features).toContain('top=0');
+  });
+});
+
+describe('appendConnectPopupDisplay', () => {
+  it('marks the hosted URL as popup without dropping existing params', () => {
+    expect(
+      appendConnectPopupDisplay(
+        'https://connect.superrare.test/action/connect_intent_1?executionSessionId=session_1',
+      ),
+    ).toBe(
+      'https://connect.superrare.test/action/connect_intent_1?executionSessionId=session_1&display=popup',
+    );
   });
 });
 

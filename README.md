@@ -244,7 +244,17 @@ When the window cannot be opened at all (a popup blocker, or a call outside a us
 
 Only one login runs at a time per client: the SDK holds a single session, so calling `login()` again while one is in flight joins the running login instead of opening a second window. If the backend stops responding after the callback arrives, the call rejects rather than hanging. `auth.loginWithPopup()` remains as a deprecated alias of `auth.login()`.
 
-For controlled environments (tests, non-browser hosts), `popup.open` and `popup.messageEvents` let you supply the window opener and the `message`-event source the login listens on:
+On iOS Safari the page is suspended the moment the hosted window takes focus, which has two consequences the SDK covers for you. First, the callback the hosted page posts when the login completes never arrives: the login therefore also claims its result from Rare API whenever the page becomes visible again or the hosted window is found closed, and a closed window is reported as `cancelled` only once Rare API confirms nothing completed. Second, `auth.login()` opens the window first and navigates it once the intent exists; if the page is suspended before that round trip finishes, the window stays blank. To rule that out, create the intent ahead of the tap with `auth.prepareLogin()` (on page load, or when the person is about to tap): the next `auth.login()` with the same params then opens the window already pointed at the hosted page, inside the gesture, with no round trip in between. A prepared login lasts as long as its intent (about fifteen minutes) and is dropped after a logout; `login` creates a fresh intent when none is usable.
+
+```ts
+await superrare.auth.prepareLogin();
+
+button.addEventListener('click', () => {
+  void superrare.auth.login();
+});
+```
+
+For controlled environments (tests, non-browser hosts), `popup.open`, `popup.messageEvents` and `popup.visibilityEvents` let you supply the window opener, the `message`-event source the login listens on, and the page-visibility source it claims on:
 
 ```ts
 createSuperRareClient({
@@ -297,15 +307,11 @@ const superrare = createSuperRareClient({
 });
 ```
 
-Use `connectUrl` to point every hosted window at a matching Connect deployment in staging or local environments (production is the default); the deployment must serve the hosted `/launch` page, which this SDK version opens for every flow. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
+Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
 
 ## Hosted Windows
 
-Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays.
-
-The window opens directly on the SuperRare Connect `/launch` page with the intent request in the URL fragment, and **that page creates the intent itself** before continuing into the hosted flow. Nothing between the click and the hosted flow depends on your page staying awake — which matters on iOS Safari, where the opener tab is suspended the moment the new window takes focus. The launch page reports `{intentId, url, expiresAt}` back to the SDK with a `postMessage`, and the SDK's promise resolves with it.
-
-`popup` shapes the window and `onIntentSettled` reports how the flow ended:
+Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
 
 ```ts
 const superrare = createSuperRareClient({
@@ -321,11 +327,7 @@ const superrare = createSuperRareClient({
 });
 ```
 
-Call `actions.buy()` (or any other action) directly from the click handler: the window opens synchronously inside the user gesture, so browsers allow it. Failure modes are typed and nothing is created for any of them until the hosted page succeeds:
-
-- `ConnectPopupBlockedError` — the window could not be opened (popup blocked, or the call ran outside a user gesture).
-- `ConnectPopupClosedError` — the person closed the window before the hosted flow was created.
-- `ConnectLaunchFailedError` — the hosted page could not create the flow (Rare API rejected the request or was unreachable); the window stays open showing the same explanation.
+Call `actions.buy()` (or any other action) directly from the click handler: the window opens synchronously inside the user gesture, so browsers allow it. When the window cannot be opened, the call rejects with `ConnectPopupBlockedError` before any intent is created — there is no same-page fallback.
 
 ## Return Path Safety
 
@@ -352,8 +354,6 @@ The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
-- `ConnectPopupClosedError` when the window was closed before the hosted flow was created.
-- `ConnectLaunchFailedError` when the hosted launch page could not create the flow; the message carries its explanation.
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.
 - `SuperRareConnectApiError` for Rare API non-2xx responses, with `status` and `path`.

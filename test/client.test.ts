@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  ConnectLaunchFailedError,
   ConnectPopupBlockedError,
-  ConnectPopupClosedError,
   createSuperRareClient,
 } from '../src/client.js';
 import type {
@@ -71,8 +69,6 @@ const batchOfferTarget: ConnectErc721BatchOfferTarget = {
 // date (the deadline logic compares expiresAt against Date.now()).
 const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
 
-const connectOrigin = 'https://connect.superrare.test';
-
 type EmittedMessage = { origin: string; data: unknown };
 
 function createMessageEmitter(): {
@@ -117,100 +113,14 @@ function createPopupStub(): ConnectPopupWindow & { replacedUrls: string[] } {
   return popup;
 }
 
-type OpenedWindow = {
-  url: string;
-  target: string;
-  features: string;
-  popup: ReturnType<typeof createPopupStub>;
-};
-
-function createPopupOpenRecorder(): {
-  open: (url: string, target: string, features: string) => ConnectPopupWindow;
-  opened: OpenedWindow[];
-} {
-  const opened: OpenedWindow[] = [];
-
-  return {
-    open(url, target, features) {
-      const popup = createPopupStub();
-      opened.push({ url, target, features, popup });
-      return popup;
-    },
-    opened,
-  };
-}
-
-// The request and launch id travel to the hosted page in the URL fragment;
-// tests recover them from the opened URL both to assert the request shape
-// and to speak as the launch page would.
-function readLaunchFromUrl(url: string): {
-  launchId: string;
-  origin: string;
-  request: Record<string, unknown>;
-} {
-  const parsedUrl = new URL(url);
-  expect(parsedUrl.pathname).toBe('/launch');
-  const payload: unknown = JSON.parse(decodeURIComponent(parsedUrl.hash.slice(1)));
-  if (
-    typeof payload !== 'object' || payload === null ||
-    !('launchId' in payload) || typeof payload.launchId !== 'string' ||
-    !('request' in payload) || typeof payload.request !== 'object' || payload.request === null
-  ) {
-    throw new Error('unreachable: opened URL carries no launch payload');
-  }
-
-  return {
-    launchId: payload.launchId,
-    origin: parsedUrl.origin,
-    request: payload.request as Record<string, unknown>,
-  };
-}
-
-function launchCreatedMessage(
-  openedUrl: string,
-  intent: Partial<{ intentId: string; url: string; expiresAt: string }> = {},
-): EmittedMessage {
-  const launch = readLaunchFromUrl(openedUrl);
-
-  return {
-    origin: launch.origin,
+function loginIntentCreationResponse(): Response {
+  return jsonResponse({
     data: {
-      type: 'superrare-connect:launch-created',
-      launchId: launch.launchId,
-      intentId: intent.intentId ?? 'connect_intent_login',
-      url: intent.url ?? `${launch.origin}/login?intentId=${intent.intentId ?? 'connect_intent_login'}`,
-      expiresAt: intent.expiresAt ?? futureExpiry(),
+      intentId: 'connect_intent_login',
+      url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+      expiresAt: futureExpiry(),
     },
-  };
-}
-
-// Emits the launch report, then drains microtasks until the next watcher
-// (the login's auth-callback listener) has subscribed — otherwise a message
-// emitted right after this one is lost in the handover gap. Microtask
-// draining works under both real and fake timers.
-async function completeLaunch(
-  emitter: ReturnType<typeof createMessageEmitter>,
-  openedUrl: string,
-  intent: Partial<{ intentId: string; url: string; expiresAt: string }> = {},
-): Promise<void> {
-  emitter.emit(launchCreatedMessage(openedUrl, intent));
-  for (let drains = 0; drains < 50 && emitter.listenerCount() === 0; drains += 1) {
-    await Promise.resolve();
-  }
-  expect(emitter.listenerCount()).toBe(1);
-}
-
-function launchFailedMessage(openedUrl: string, message: string): EmittedMessage {
-  const launch = readLaunchFromUrl(openedUrl);
-
-  return {
-    origin: launch.origin,
-    data: {
-      type: 'superrare-connect:launch-failed',
-      launchId: launch.launchId,
-      message,
-    },
-  };
+  });
 }
 
 const authCallbackMessage = {
@@ -231,6 +141,96 @@ const sessionResponse = (): Response => jsonResponse({
   },
 });
 
+// What Rare API answers a claim with until the hosted login completes.
+const claimNotCompletedResponse = (): Response =>
+  jsonResponse({ error: 'Hosted login has not completed yet' }, { status: 409 });
+
+const claimIssuedResponse = (): Response => jsonResponse({
+  data: {
+    code: 'connect_auth_code_claimed',
+    intentId: 'connect_intent_login',
+    state: 'state_login',
+    expiresAt: futureExpiry(),
+  },
+});
+
+function createVisibilityEmitter(): {
+  visibilityEvents: { subscribe: (listener: (visible: boolean) => void) => () => void };
+  emit: (visible: boolean) => void;
+  listenerCount: () => number;
+} {
+  const listeners = new Set<(visible: boolean) => void>();
+
+  return {
+    visibilityEvents: {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+    emit(visible) {
+      listeners.forEach((listener) => {
+        listener(visible);
+      });
+    },
+    listenerCount: () => listeners.size,
+  };
+}
+
+// Records every window the client opens, with the URL it opened at: a
+// prepared login opens straight at the hosted page, an unprepared one blank.
+function createPopupOpenRecorder(): {
+  open: (url: string, target: string, features: string) => ConnectPopupWindow;
+  opened: Array<{ url: string; popup: ReturnType<typeof createPopupStub> }>;
+} {
+  const opened: Array<{ url: string; popup: ReturnType<typeof createPopupStub> }> = [];
+
+  return {
+    open(url) {
+      const popup = createPopupStub();
+      opened.push({ url, popup });
+      return popup;
+    },
+    opened,
+  };
+}
+
+// The standard login-capable client for the claim and prepared-login tests:
+// intent creation, claim (409 unless overridden), exchange and profile
+// through the fetch mock.
+function createLoginTestClient(overrides: {
+  fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  visibilityEvents?: ReturnType<typeof createVisibilityEmitter>['visibilityEvents'];
+} = {}): {
+  client: ReturnType<typeof createSuperRareClient>;
+  emitter: ReturnType<typeof createMessageEmitter>;
+  opened: ReturnType<typeof createPopupOpenRecorder>['opened'];
+} {
+  const emitter = createMessageEmitter();
+  const recorder = createPopupOpenRecorder();
+  const client = createSuperRareClient({
+    apiUrl: 'https://rare-api.test',
+    createState: () => 'state_login',
+    popup: {
+      open: recorder.open,
+      messageEvents: emitter.messageEvents,
+      ...(overrides.visibilityEvents === undefined ? {} : { visibilityEvents: overrides.visibilityEvents }),
+    },
+    fetch: overrides.fetch ?? (async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+      if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
+      if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+      return loginIntentCreationResponse();
+    }),
+    sessionStorage: createMemoryStorage(),
+  });
+
+  return { client, emitter, opened: recorder.opened };
+}
+
 // A terminal poll answer for any intent watcher, so action tests running on
 // fake timers can settle their watcher with one 2s advance instead of
 // leaking a polling loop past the test.
@@ -244,36 +244,6 @@ function completedIntentStatusResponse(request: Request): Response {
       expiresAt: futureExpiry(),
     },
   });
-}
-
-// The standard login-capable client: launch handoff through the recorder and
-// emitter, exchange/profile through the fetch mock, watcher polls terminal.
-function createLoginTestClient(overrides: {
-  fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-  sessionStorage?: ConnectSessionStorage | false;
-  connectUrl?: string;
-} = {}): {
-  client: ReturnType<typeof createSuperRareClient>;
-  emitter: ReturnType<typeof createMessageEmitter>;
-  opened: OpenedWindow[];
-} {
-  const emitter = createMessageEmitter();
-  const recorder = createPopupOpenRecorder();
-  const client = createSuperRareClient({
-    apiUrl: 'https://rare-api.test',
-    connectUrl: overrides.connectUrl ?? connectOrigin,
-    createState: () => 'state_login',
-    popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-    fetch: overrides.fetch ?? (async (input, init) => {
-      const request = input instanceof Request ? input : new Request(input, init);
-      if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
-      if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
-      return completedIntentStatusResponse(request);
-    }),
-    sessionStorage: overrides.sessionStorage ?? createMemoryStorage(),
-  });
-
-  return { client, emitter, opened: recorder.opened };
 }
 
 describe('createSuperRareClient', () => {
@@ -297,16 +267,36 @@ describe('createSuperRareClient', () => {
 
   it('notifies auth listeners when sessions change and unsubscribe stops future calls', async () => {
     const listener = vi.fn();
-    const { client, emitter, opened } = createLoginTestClient();
+    const emitter = createMessageEmitter();
+    const popups: Array<ReturnType<typeof createPopupStub>> = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: {
+        open: () => {
+          const popup = createPopupStub();
+          popups.push(popup);
+          return popup;
+        },
+        messageEvents: emitter.messageEvents,
+      },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        return loginIntentCreationResponse();
+      },
+      sessionStorage: createMemoryStorage(),
+    });
 
     const unsubscribe = client.auth.onChange(listener);
 
     const completeLogin = async (): Promise<void> => {
       const resultPromise = client.auth.login();
-      const openedWindow = opened[opened.length - 1];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      await completeLaunch(emitter, openedWindow.url);
-      emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+      await vi.waitFor(() => {
+        expect(popups[popups.length - 1]?.replacedUrls).toHaveLength(1);
+      });
+      emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
       await resultPromise;
     };
 
@@ -437,288 +427,539 @@ describe('createSuperRareClient', () => {
     });
   });
 
-  it('opens each hosted action at the launch page with the request in the fragment', async () => {
+  it('starts checkout intents through checkout.start and opens them in their window', async () => {
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
-      const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const request = input instanceof Request ? input : new Request(input, init);
-        expect(request.method).toBe('GET');
-        expect(request.headers.get('authorization')).toBeNull();
-        return completedIntentStatusResponse(request);
-      });
+      const popup = createPopupStub();
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
-        createState: () => 'state_action',
-        initiatingOrigin: 'https://artist.example',
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-        fetch: fetchImplementation,
-        sessionStorage: false,
-      });
-
-      const runAction = async (
-        start: () => Promise<{ intentId: string }>,
-        intentId: string,
-      ): Promise<Record<string, unknown>> => {
-        const intentPromise = start();
-        const openedWindow = recorder.opened[recorder.opened.length - 1];
-        if (openedWindow === undefined) throw new Error('expected a window');
-        expect(openedWindow.target).toMatch(/^superrare-connect-intent-.+/);
-        const launch = readLaunchFromUrl(openedWindow.url);
-        expect(launch.origin).toBe(connectOrigin);
-        emitter.emit(launchCreatedMessage(openedWindow.url, {
-          intentId,
-          url: `${connectOrigin}/intents/${intentId}`,
-        }));
-        await expect(intentPromise).resolves.toMatchObject({ intentId });
-        return launch.request;
-      };
-
-      // The request each hosted flow was opened with IS the create-intent
-      // request — the launch page forwards it verbatim.
-      expect(await runAction(
-        () => client.checkout.start({ target: checkoutTarget, returnPath: '/thanks' }),
-        'connect_intent_checkout',
-      )).toEqual({
-        action: { type: 'checkout', target: checkoutTarget },
-        returnPath: '/thanks',
-        state: 'state_action',
-        initiatingOrigin: 'https://artist.example',
-      });
-
-      expect(await runAction(
-        () => client.actions.buy({
-          target: directListingTarget,
-          expected: { currency: 'ETH', price: '1.2' },
-          payment: { method: 'wallet' },
-          returnPath: '/buy/complete',
-        }),
-        'connect_intent_buy',
-      )).toEqual({
-        action: {
-          type: 'buy',
-          target: directListingTarget,
-          expected: { currency: 'ETH', price: '1.2' },
-        },
-        payment: { method: 'wallet' },
-        returnPath: '/buy/complete',
-        state: 'state_action',
-        initiatingOrigin: 'https://artist.example',
-      });
-
-      expect(await runAction(
-        () => client.actions.bid({
-          target: reserveAuctionTarget,
-          bid: { currency: 'ETH', amount: '1.2' },
-          returnPath: '/bid/complete',
-        }),
-        'connect_intent_bid',
-      )).toMatchObject({
-        action: { type: 'bid', target: reserveAuctionTarget, bid: { currency: 'ETH', amount: '1.2' } },
-      });
-
-      expect(await runAction(
-        () => client.actions.mint({
-          target: releaseTarget,
-          purchase: { quantity: '2', currency: 'ETH', unitPrice: '0.5' },
-          returnPath: '/mint/complete',
-        }),
-        'connect_intent_mint',
-      )).toMatchObject({
-        action: { type: 'mint', target: releaseTarget, purchase: { quantity: '2', currency: 'ETH', unitPrice: '0.5' } },
-      });
-
-      expect(await runAction(
-        () => client.actions.settle({ target: reserveAuctionTarget, returnPath: '/settle/complete' }),
-        'connect_intent_settle',
-      )).toMatchObject({
-        action: { type: 'settle', target: reserveAuctionTarget },
-      });
-
-      expect(await runAction(
-        () => client.offers.make({
-          target: offerTarget,
-          offer: { currency: 'ETH', amount: '1.2' },
-          returnPath: '/offer/complete',
-        }),
-        'connect_intent_offer',
-      )).toMatchObject({
-        action: { type: 'offer', target: offerTarget, offer: { currency: 'ETH', amount: '1.2' } },
-      });
-
-      expect(await runAction(
-        () => client.offers.accept({
-          target: offerTarget,
-          expected: { currency: 'ETH', amount: '1.2' },
-          returnPath: '/offer/accept/complete',
-        }),
-        'connect_intent_offer_accept',
-      )).toMatchObject({
-        action: { type: 'offer-accept', target: offerTarget, expected: { currency: 'ETH', amount: '1.2' } },
-      });
-
-      expect(await runAction(
-        () => client.offers.cancel({ target: batchOfferTarget, returnPath: '/offer/cancel/complete' }),
-        'connect_intent_offer_cancel',
-      )).toMatchObject({
-        action: { type: 'offer-cancel', target: batchOfferTarget },
-      });
-
-      // Creation never touched the network from this page: every fetch the
-      // client made was a watcher status poll.
-      await vi.advanceTimersByTimeAsync(2000);
-      expect(fetchImplementation.mock.calls.length).toBeGreaterThan(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('rewrites the reported hosted URL onto the configured connect origin', async () => {
-    vi.useFakeTimers();
-    try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
-      const client = createSuperRareClient({
-        apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
-        createState: () => 'state_buy',
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
+        connectUrl: 'https://connect.staging.test',
+        createState: () => 'state_checkout',
+        popup: { open: () => popup },
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
-          return completedIntentStatusResponse(request);
-        },
-        sessionStorage: false,
-      });
+          if (request.method === 'GET') return completedIntentStatusResponse(request);
 
-      const intentPromise = client.actions.buy({
-        target: directListingTarget,
-        expected: { currency: 'ETH', price: '1.2' },
-        returnPath: '/buy/complete',
-      });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      // A dev Rare API reports its own idea of the hosted origin; the URL
-      // handed to the integrator gets the configured connect origin instead.
-      emitter.emit(launchCreatedMessage(openedWindow.url, {
-        intentId: 'connect_intent_buy',
-        url: 'https://0.0.0.0:3000/action/connect_intent_buy',
-      }));
+          expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
+          expect(await request.json()).toEqual({
+            action: {
+              type: 'checkout',
+              target: checkoutTarget,
+            },
+            returnPath: '/thanks',
+            state: 'state_checkout',
+          });
 
-      await expect(intentPromise).resolves.toMatchObject({
-        intentId: 'connect_intent_buy',
-        url: `${connectOrigin}/action/connect_intent_buy`,
-      });
-
-      await vi.advanceTimersByTimeAsync(2000);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('opens hosted intents in a sized window and closes it once the intent settles', async () => {
-    vi.useFakeTimers();
-    try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
-      const settledStatuses: string[] = [];
-      let statusRequests = 0;
-      const client = createSuperRareClient({
-        apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
-        createState: () => 'state_popup',
-        popup: {
-          width: 400,
-          height: 640,
-          open: recorder.open,
-          messageEvents: emitter.messageEvents,
-        },
-        onIntentSettled: (intent) => {
-          settledStatuses.push(intent.status);
-        },
-        fetch: async (input, init) => {
-          const request = input instanceof Request ? input : new Request(input, init);
-          statusRequests += 1;
           return jsonResponse({
             data: {
-              intentId: 'connect_intent_buy',
-              type: 'buy',
-              status: statusRequests < 2 ? 'requires_user' : 'completed',
-              returnPath: '/buy/complete',
-              expiresAt: futureExpiry(),
+              intentId: 'connect_intent_checkout',
+              url: 'https://connect.superrare.test/action/connect_intent_checkout/start?executionSessionId=execution_session_123',
+              expiresAt: '2026-06-22T00:00:00.000Z',
             },
           });
         },
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await expect(client.checkout.start({
+        target: checkoutTarget,
+        returnPath: '/thanks',
+      })).resolves.toMatchObject({
+        intentId: 'connect_intent_checkout',
+        url: 'https://connect.staging.test/action/connect_intent_checkout/start?executionSessionId=execution_session_123',
+      });
+      expect(popup.replacedUrls).toEqual([
+        'https://connect.staging.test/action/connect_intent_checkout/start?executionSessionId=execution_session_123&display=popup',
+      ]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('replaces backend local hosted URL origin and clears the backend port', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        connectUrl: 'https://connect-com-bc4d-784573620320.us-east1.run.app',
+        createState: () => 'state_buy',
+        popup: { open: () => createPopupStub() },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'GET') return completedIntentStatusResponse(request);
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_b6e82512-1318-4a61-89d0-9cda854eae15',
+              url: 'https://0.0.0.0:3000/action/connect_intent_b6e82512-1318-4a61-89d0-9cda854eae15',
+              expiresAt: '2026-06-22T00:00:00.000Z',
+            },
+          });
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1000000000000' },
+        returnPath: '/buy/complete',
+      })).resolves.toMatchObject({
+        intentId: 'connect_intent_b6e82512-1318-4a61-89d0-9cda854eae15',
+        url: 'https://connect-com-bc4d-784573620320.us-east1.run.app/action/connect_intent_b6e82512-1318-4a61-89d0-9cda854eae15',
+      });
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts bid intents through actions.bid', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_bid',
+        popup: { open: () => createPopupStub() },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'GET') return completedIntentStatusResponse(request);
+
+          expect(await request.json()).toEqual({
+            action: {
+              type: 'bid',
+              target: reserveAuctionTarget,
+              bid: { currency: 'ETH', amount: '1.2' },
+            },
+            returnPath: '/bid/complete',
+            state: 'state_bid',
+          });
+
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_bid',
+              url: 'https://connect.superrare.test/action/connect_intent_bid',
+              expiresAt: '2026-06-22T00:00:00.000Z',
+            },
+          });
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.bid({
+        target: reserveAuctionTarget,
+        bid: { currency: 'ETH', amount: '1.2' },
+        returnPath: '/bid/complete',
+      })).resolves.toMatchObject({
+        intentId: 'connect_intent_bid',
+      });
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts settle intents through actions.settle and opens the hosted URL in its window', async () => {
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_settle',
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'GET') return completedIntentStatusResponse(request);
+
+          expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
+          expect(await request.json()).toEqual({
+            action: {
+              type: 'settle',
+              target: reserveAuctionTarget,
+            },
+            returnPath: '/settle/complete',
+            state: 'state_settle',
+          });
+
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_settle',
+              url: 'https://connect.superrare.test/action/connect_intent_settle',
+              expiresAt: '2026-06-22T00:00:00.000Z',
+            },
+          });
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.settle({
+        target: reserveAuctionTarget,
+        returnPath: '/settle/complete',
+      })).resolves.toMatchObject({
+        intentId: 'connect_intent_settle',
+        url: 'https://connect.superrare.test/action/connect_intent_settle',
+      });
+      expect(popup.replacedUrls).toEqual([
+        'https://connect.superrare.test/action/connect_intent_settle?display=popup',
+      ]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts make, accept, and cancel offer intents through the offers namespace', async () => {
+    vi.useFakeTimers();
+    try {
+    const replacedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_offer',
+      popup: {
+        open: () => {
+          const popup = createPopupStub();
+          const recordingPopup = {
+            ...popup,
+            location: {
+              replace(url: string): void {
+                replacedUrls.push(url);
+              },
+            },
+          };
+          return recordingPopup;
+        },
+      },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.method === 'GET') return completedIntentStatusResponse(request);
+        const body: unknown = await request.json();
+
+        if (isConnectActionRequest(body, 'offer')) {
+          expect(body).toEqual({
+            action: {
+              type: 'offer',
+              target: offerTarget,
+              offer: { currency: 'ETH', amount: '1.2' },
+            },
+            returnPath: '/offer/complete',
+            state: 'state_offer',
+          });
+          return connectIntentCreationResponse('connect_intent_offer');
+        }
+
+        if (isConnectActionRequest(body, 'offer-accept')) {
+          expect(body).toEqual({
+            action: {
+              type: 'offer-accept',
+              target: offerTarget,
+              expected: { currency: 'ETH', amount: '1.2' },
+            },
+            returnPath: '/offer/accept/complete',
+            state: 'state_offer',
+          });
+          return connectIntentCreationResponse('connect_intent_offer_accept');
+        }
+
+        if (isConnectActionRequest(body, 'offer-cancel')) {
+          expect(body).toEqual({
+            action: {
+              type: 'offer-cancel',
+              target: batchOfferTarget,
+            },
+            returnPath: '/offer/cancel/complete',
+            state: 'state_offer',
+          });
+          return connectIntentCreationResponse('connect_intent_offer_cancel');
+        }
+
+        throw new Error('Unexpected offer Connect request.');
+      },
+      sessionStorage: false,
+    });
+
+    await expect(client.offers.make({
+      target: offerTarget,
+      offer: { currency: 'ETH', amount: '1.2' },
+      returnPath: '/offer/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_offer' });
+    await expect(client.offers.accept({
+      target: offerTarget,
+      expected: { currency: 'ETH', amount: '1.2' },
+      returnPath: '/offer/accept/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_offer_accept' });
+    await expect(client.offers.cancel({
+      target: batchOfferTarget,
+      returnPath: '/offer/cancel/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_offer_cancel' });
+
+    expect(replacedUrls).toEqual([
+      'https://connect.superrare.test/intents/connect_intent_offer?display=popup',
+      'https://connect.superrare.test/intents/connect_intent_offer_accept?display=popup',
+      'https://connect.superrare.test/intents/connect_intent_offer_cancel?display=popup',
+    ]);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('supports anonymous checkout, actions, and intent status without a Connect session', async () => {
+    vi.useFakeTimers();
+    try {
+    const requestedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_anonymous',
+      popup: { open: () => createPopupStub() },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestedUrls.push(request.url);
+        expect(request.headers.get('authorization')).toBeNull();
+
+        if (request.method === 'GET') {
+          // Watcher polls for the other intents arrive after the assertions;
+          // a terminal answer settles each watcher.
+          if (!request.url.endsWith('/connect_intent_bid')) {
+            return completedIntentStatusResponse(request);
+          }
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_bid',
+              type: 'bid',
+              status: 'pending',
+              returnPath: '/bid/complete',
+              expiresAt: '2026-06-22T00:00:00.000Z',
+            },
+          });
+        }
+
+        const body: unknown = await request.json();
+        if (isConnectActionRequest(body, 'checkout')) {
+          expect(body).toEqual({
+            action: {
+              type: 'checkout',
+              target: checkoutTarget,
+            },
+            returnPath: '/checkout/complete',
+            state: 'state_anonymous',
+          });
+          return connectIntentCreationResponse('connect_intent_checkout');
+        }
+
+        if (isConnectActionRequest(body, 'buy')) {
+          expect(body).toEqual({
+            action: {
+              type: 'buy',
+              target: directListingTarget,
+              expected: { currency: 'ETH', price: '1.2' },
+            },
+            returnPath: '/buy/complete',
+            state: 'state_anonymous',
+          });
+          return connectIntentCreationResponse('connect_intent_buy');
+        }
+
+        if (isConnectActionRequest(body, 'bid')) {
+          expect(body).toEqual({
+            action: {
+              type: 'bid',
+              target: reserveAuctionTarget,
+              bid: { currency: 'ETH', amount: '1.2' },
+            },
+            returnPath: '/bid/complete',
+            state: 'state_anonymous',
+          });
+          return connectIntentCreationResponse('connect_intent_bid');
+        }
+
+        if (isConnectActionRequest(body, 'mint')) {
+          expect(body).toEqual({
+            action: {
+              type: 'mint',
+              target: releaseTarget,
+              purchase: { quantity: '2', currency: 'ETH', unitPrice: '0.5' },
+            },
+            returnPath: '/mint/complete',
+            state: 'state_anonymous',
+          });
+          return connectIntentCreationResponse('connect_intent_mint');
+        }
+
+        throw new Error('Unexpected anonymous Connect request.');
+      },
+      sessionStorage: false,
+    });
+
+    await expect(client.checkout.start({
+      target: checkoutTarget,
+      returnPath: '/checkout/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_checkout' });
+    await expect(client.actions.buy({
+      target: directListingTarget,
+      expected: { currency: 'ETH', price: '1.2' },
+      returnPath: '/buy/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_buy' });
+    await expect(client.actions.bid({
+      target: reserveAuctionTarget,
+      bid: { currency: 'ETH', amount: '1.2' },
+      returnPath: '/bid/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_bid' });
+    await expect(client.actions.mint({
+      target: releaseTarget,
+      purchase: { quantity: '2', currency: 'ETH', unitPrice: '0.5' },
+      returnPath: '/mint/complete',
+    })).resolves.toMatchObject({ intentId: 'connect_intent_mint' });
+    await expect(client.actions.getStatus({
+      intentId: 'connect_intent_bid',
+    })).resolves.toMatchObject({ status: 'pending' });
+
+    expect(requestedUrls).toEqual([
+      'https://rare-api.test/v1/connect/intents',
+      'https://rare-api.test/v1/connect/intents',
+      'https://rare-api.test/v1/connect/intents',
+      'https://rare-api.test/v1/connect/intents',
+      'https://rare-api.test/v1/connect/intents/connect_intent_bid',
+    ]);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('opens hosted intents in a sized popup and closes it once the intent settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const opened: Array<{ url: string; target: string; features: string }> = [];
+      const replacedUrls: string[] = [];
+      const settledStatuses: string[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: {
+          replace(url) {
+            replacedUrls.push(url);
+          },
+        },
+      };
+      let statusRequests = 0;
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_popup',
+        popup: {
+          width: 400,
+          height: 640,
+          open: (url, target, features) => {
+            opened.push({ url, target, features });
+            return popup;
+          },
+        },
+        onIntentSettled: (intent) => {
+          settledStatuses.push(intent.status);
+        },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: statusRequests < 2 ? 'requires_user' : 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: '2026-06-22T00:00:00.000Z',
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
-      });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      expect(openedWindow.features).toContain('popup=yes');
-      expect(openedWindow.features).toContain('width=400');
-      expect(openedWindow.features).toContain('height=640');
-      emitter.emit(launchCreatedMessage(openedWindow.url, {
-        intentId: 'connect_intent_buy',
-        url: `${connectOrigin}/intents/connect_intent_buy`,
-      }));
-      await expect(intentPromise).resolves.toMatchObject({ intentId: 'connect_intent_buy' });
+      })).resolves.toMatchObject({ intentId: 'connect_intent_buy' });
+
+      expect(opened).toHaveLength(1);
+      expect(opened[0]?.url).toBe('about:blank');
+      // Each action popup gets its own window name so a second action cannot
+      // reuse (and its watcher close) the window of the first.
+      expect(opened[0]?.target).toMatch(/^superrare-connect-intent-.+/);
+      expect(opened[0]?.features).toContain('popup=yes');
+      expect(opened[0]?.features).toContain('width=400');
+      expect(opened[0]?.features).toContain('height=640');
+      // The popup navigates with the display marker.
+      expect(replacedUrls).toEqual([
+        'https://connect.superrare.test/intents/connect_intent_buy?display=popup',
+      ]);
 
       await vi.advanceTimersByTimeAsync(2000);
-      expect(openedWindow.popup.closed).toBe(false);
+      expect(popup.closed).toBe(false);
       expect(settledStatuses).toEqual([]);
 
       await vi.advanceTimersByTimeAsync(2000);
-      expect(openedWindow.popup.closed).toBe(true);
+      expect(popup.closed).toBe(true);
       expect(settledStatuses).toEqual(['completed']);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('reports the latest intent state when the user closes the window early', async () => {
+  it('reports the latest intent state when the user closes the popup early', async () => {
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
       const settledStatuses: string[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
+        popup: { open: () => popup },
         onIntentSettled: (intent) => {
           settledStatuses.push(intent.status);
         },
-        fetch: async () => jsonResponse({
-          data: {
-            intentId: 'connect_intent_buy',
-            type: 'buy',
-            status: 'requires_user',
-            returnPath: '/buy/complete',
-            expiresAt: futureExpiry(),
-          },
-        }),
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'requires_user',
+                returnPath: '/buy/complete',
+                expiresAt: '2026-06-22T00:00:00.000Z',
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
+        },
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_buy' }));
-      await intentPromise;
 
-      await vi.advanceTimersByTimeAsync(2000);
-      openedWindow.popup.closed = true;
+      popup.closed = true;
       await vi.advanceTimersByTimeAsync(2000);
       expect(settledStatuses).toEqual(['requires_user']);
     } finally {
@@ -726,68 +967,94 @@ describe('createSuperRareClient', () => {
     }
   });
 
-  it('rejects a reported intent URL that is not a web URL, and closes the window', async () => {
-    // The launch page only navigates itself by path, so this URL is the one
-    // handed back to the integrator — an executable URL must never be.
-    const emitter = createMessageEmitter();
-    const recorder = createPopupOpenRecorder();
-    const client = createSuperRareClient({
-      apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
-      createState: () => 'state_popup',
-      popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-      fetch: async () => jsonResponse({ error: 'unused' }, { status: 500 }),
-      sessionStorage: false,
+  it('refuses to navigate to a non-web intent URL', async () => {
+    // The hosted URL comes from Rare API, but it is the last thing standing
+    // between the SDK and a real navigation: an executable URL must never
+    // reach location.replace.
+    const executableIntentResponse = (): Response => jsonResponse({
+      data: {
+        intentId: 'connect_intent_buy',
+        url: 'javascript:alert(1)',
+        expiresAt: '2026-06-22T00:00:00.000Z',
+      },
     });
-
-    const intentPromise = client.actions.buy({
+    const buyParams = {
       target: directListingTarget,
       expected: { currency: 'ETH', price: '1.2' },
       returnPath: '/buy/complete',
-    });
-    const openedWindow = recorder.opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    emitter.emit(launchCreatedMessage(openedWindow.url, {
-      intentId: 'connect_intent_buy',
-      url: 'javascript:alert(1)',
-    }));
+    } as const;
 
-    await expect(intentPromise).rejects.toThrow('Invalid Connect intent URL');
-    expect(openedWindow.popup.closed).toBe(true);
+    const replacedUrls: string[] = [];
+    const popup: ConnectPopupWindow = {
+      closed: false,
+      close(): void {
+        popup.closed = true;
+      },
+      location: {
+        replace(url: string): void {
+          replacedUrls.push(url);
+        },
+      },
+    };
+    const popupClient = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_popup',
+      popup: { open: () => popup },
+      fetch: async () => executableIntentResponse(),
+      sessionStorage: false,
+    });
+
+    await expect(popupClient.actions.buy(buyParams)).rejects.toThrow('Invalid Connect intent URL');
+    expect(replacedUrls).toEqual([]);
+    expect(popup.closed).toBe(true);
   });
 
-  it('stops watching an action window once the intent can no longer change', async () => {
+  it('stops watching an action popup once the intent can no longer change', async () => {
     // Regression: the watcher used to poll forever. A buyer who walks away with
     // the window open kept the integrator's page hitting Rare API every 2s.
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
       let statusRequests = 0;
       let pollsWithoutDeadline = 0;
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
       const settled: ConnectIntent[] = [];
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
         onIntentSettled: (intent) => {
           settled.push(intent);
         },
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
+        popup: { open: () => popup },
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
-          statusRequests += 1;
-          // Each poll must carry its own request deadline; one hung fetch
-          // otherwise stalls the whole watcher.
-          if (!(init?.signal instanceof AbortSignal)) pollsWithoutDeadline += 1;
-          void request;
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            // Each poll must carry its own request deadline; one hung fetch
+            // otherwise stalls the whole watcher.
+            if (!(init?.signal instanceof AbortSignal)) pollsWithoutDeadline += 1;
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'requires_user',
+                returnPath: '/buy/complete',
+                // Already expired: the deadline plus its grace is in the past.
+                expiresAt: '2020-01-01T00:00:00.000Z',
+              },
+            });
+          }
+
           return jsonResponse({
             data: {
               intentId: 'connect_intent_buy',
-              type: 'buy',
-              status: 'requires_user',
-              returnPath: '/buy/complete',
-              // Already expired: the deadline plus its grace is in the past.
+              url: 'https://connect.superrare.test/intents/connect_intent_buy',
               expiresAt: '2020-01-01T00:00:00.000Z',
             },
           });
@@ -795,21 +1062,14 @@ describe('createSuperRareClient', () => {
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, {
-        intentId: 'connect_intent_buy',
-        expiresAt: '2020-01-01T00:00:00.000Z',
-      }));
-      await intentPromise;
 
-      // A past expiry falls back to a bounded window, so the watcher runs —
-      // but it does not run forever.
+      // An unparseable/past expiry falls back to a bounded window, so the
+      // watcher runs — but it does not run forever.
       await vi.advanceTimersByTimeAsync(20 * 60_000);
       const requestsAfterDeadline = statusRequests;
       await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -817,7 +1077,7 @@ describe('createSuperRareClient', () => {
       expect(statusRequests).toBe(requestsAfterDeadline);
       // Only a KNOWN terminal outcome closes the buyer's window; a fallback
       // stop leaves it to the hosted page, which may be mid-payment.
-      expect(openedWindow.popup.closed).toBe(false);
+      expect(popup.closed).toBe(false);
       // The documented deadline contract: the integrator hears about the stop,
       // and the payload can be non-terminal — their code must check status.
       expect(settled).toHaveLength(1);
@@ -831,31 +1091,37 @@ describe('createSuperRareClient', () => {
   it('stops watching when the intent can no longer be read', async () => {
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
       let statusRequests = 0;
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-        fetch: async () => {
-          statusRequests += 1;
-          // Gone for good: retrying cannot make it readable.
-          return jsonResponse({ error: 'Connect intent not found' }, { status: 404 });
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            // Gone for good: retrying cannot make it readable.
+            return jsonResponse({ error: 'Connect intent not found' }, { status: 404 });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
         },
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_buy' }));
-      await intentPromise;
 
       // One 4xx can be edge infrastructure having a moment; the watcher only
       // believes the second consecutive one.
@@ -864,7 +1130,7 @@ describe('createSuperRareClient', () => {
 
       await vi.advanceTimersByTimeAsync(10_000);
       expect(statusRequests).toBe(2);
-      expect(openedWindow.popup.closed).toBe(false);
+      expect(popup.closed).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -877,52 +1143,58 @@ describe('createSuperRareClient', () => {
     // only the hosted page knows whether closing mid-payment is safe.
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
       let statusRequests = 0;
       const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
         onIntentSettled: (intent) => {
           settled.push(intent);
         },
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-        fetch: async () => {
-          statusRequests += 1;
-          if (statusRequests === 1) {
-            return jsonResponse({
-              data: {
-                intentId: 'connect_intent_buy',
-                type: 'buy',
-                status: 'requires_user',
-                returnPath: '/buy/complete',
-                expiresAt: futureExpiry(),
-              },
-            });
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'requires_user',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
           }
-          return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+
+          return connectIntentCreationResponse('connect_intent_buy');
         },
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_buy' }));
-      await intentPromise;
 
       await vi.advanceTimersByTimeAsync(6000);
 
       // One 410 is definitive: rare-api only answers it for expiry, so the
       // watcher does not spend a confirmation tick on it.
       expect(statusRequests).toBe(2);
-      expect(openedWindow.popup.closed).toBe(false);
+      expect(popup.closed).toBe(false);
       expect(settled).toHaveLength(1);
       expect(settled[0]?.status).toBe('expired');
       expect(settled[0]?.intentId).toBe('connect_intent_buy');
@@ -937,48 +1209,54 @@ describe('createSuperRareClient', () => {
     // answer afterwards proves the watcher was right to keep going.
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
       let statusRequests = 0;
       const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
         onIntentSettled: (intent) => {
           settled.push(intent);
         },
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-        fetch: async () => {
-          statusRequests += 1;
-          if (statusRequests === 1 || statusRequests === 3) {
-            return jsonResponse({ error: 'not found' }, { status: 404 });
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1 || statusRequests === 3) {
+              return jsonResponse({ error: 'not found' }, { status: 404 });
+            }
+            if (statusRequests === 2) {
+              return jsonResponse({ error: 'unavailable' }, { status: 503 });
+            }
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: futureExpiry(),
+              },
+            });
           }
-          if (statusRequests === 2) {
-            return jsonResponse({ error: 'unavailable' }, { status: 503 });
-          }
-          return jsonResponse({
-            data: {
-              intentId: 'connect_intent_buy',
-              type: 'buy',
-              status: 'completed',
-              returnPath: '/buy/complete',
-              expiresAt: futureExpiry(),
-            },
-          });
+
+          return connectIntentCreationResponse('connect_intent_buy');
         },
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_buy' }));
-      await intentPromise;
 
       await vi.advanceTimersByTimeAsync(10_000);
 
@@ -997,47 +1275,52 @@ describe('createSuperRareClient', () => {
     // and is reported as such.
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
       let statusRequests = 0;
       const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
         onIntentSettled: (intent) => {
           settled.push(intent);
         },
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-        fetch: async () => {
-          statusRequests += 1;
-          if (statusRequests === 1) {
-            return jsonResponse({
-              data: {
-                intentId: 'connect_intent_buy',
-                type: 'buy',
-                status: 'processing',
-                returnPath: '/buy/complete',
-                expiresAt: futureExpiry(),
-              },
-            });
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'processing',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            popup.closed = true;
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
           }
-          const openedWindow = recorder.opened[0];
-          if (openedWindow !== undefined) openedWindow.popup.closed = true;
-          return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+
+          return connectIntentCreationResponse('connect_intent_buy');
         },
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_buy' }));
-      await intentPromise;
 
       await vi.advanceTimersByTimeAsync(6000);
 
@@ -1054,60 +1337,65 @@ describe('createSuperRareClient', () => {
     // be reported as `processing`. The close branch re-reads first.
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
       let statusRequests = 0;
       const settled: ConnectIntent[] = [];
+      const popup: ConnectPopupWindow = {
+        closed: false,
+        close: () => {
+          popup.closed = true;
+        },
+        location: { replace: () => undefined },
+      };
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
         onIntentSettled: (intent) => {
           settled.push(intent);
         },
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-        fetch: async () => {
-          statusRequests += 1;
-          if (statusRequests === 1) {
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+
+          if (request.method === 'GET') {
+            statusRequests += 1;
+            if (statusRequests === 1) {
+              return jsonResponse({
+                data: {
+                  intentId: 'connect_intent_buy',
+                  type: 'buy',
+                  status: 'processing',
+                  returnPath: '/buy/complete',
+                  expiresAt: futureExpiry(),
+                },
+              });
+            }
+            if (statusRequests === 2) {
+              // The buyer closes on the tick whose poll also fails: the known
+              // state is now one interval old.
+              popup.closed = true;
+              return jsonResponse({ error: 'flaky edge' }, { status: 503 });
+            }
             return jsonResponse({
               data: {
                 intentId: 'connect_intent_buy',
                 type: 'buy',
-                status: 'processing',
+                status: 'completed',
                 returnPath: '/buy/complete',
                 expiresAt: futureExpiry(),
               },
             });
           }
-          if (statusRequests === 2) {
-            // The buyer closes on the tick whose poll also fails: the known
-            // state is now one interval old.
-            const openedWindow = recorder.opened[0];
-            if (openedWindow !== undefined) openedWindow.popup.closed = true;
-            return jsonResponse({ error: 'flaky edge' }, { status: 503 });
-          }
-          return jsonResponse({
-            data: {
-              intentId: 'connect_intent_buy',
-              type: 'buy',
-              status: 'completed',
-              returnPath: '/buy/complete',
-              expiresAt: futureExpiry(),
-            },
-          });
+
+          return connectIntentCreationResponse('connect_intent_buy');
         },
         sessionStorage: false,
       });
 
-      const intentPromise = client.actions.buy({
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_buy' }));
-      await intentPromise;
 
       await vi.advanceTimersByTimeAsync(6000);
 
@@ -1119,47 +1407,60 @@ describe('createSuperRareClient', () => {
     }
   });
 
-  it('gives each concurrent action window its own name and launch id', async () => {
+  it('gives each concurrent action popup its own window', async () => {
+    // Fake timers + terminal poll responses: both watchers settle inside the
+    // test instead of polling in the background until their fallback deadline.
     vi.useFakeTimers();
     try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
+      const openedTargets: string[] = [];
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_popup',
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
+        popup: {
+          open: (_url, target) => {
+            openedTargets.push(target);
+            return {
+              closed: false,
+              close: () => undefined,
+              location: { replace: () => undefined },
+            };
+          },
+        },
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
-          return completedIntentStatusResponse(request);
+
+          if (request.method === 'GET') {
+            return jsonResponse({
+              data: {
+                intentId: 'connect_intent_buy',
+                type: 'buy',
+                status: 'completed',
+                returnPath: '/buy/complete',
+                expiresAt: futureExpiry(),
+              },
+            });
+          }
+
+          return connectIntentCreationResponse('connect_intent_buy');
         },
         sessionStorage: false,
       });
 
-      const buy = (): Promise<{ intentId: string }> => client.actions.buy({
+      await client.actions.buy({
+        target: directListingTarget,
+        expected: { currency: 'ETH', price: '1.2' },
+        returnPath: '/buy/complete',
+      });
+      await client.actions.buy({
         target: directListingTarget,
         expected: { currency: 'ETH', price: '1.2' },
         returnPath: '/buy/complete',
       });
 
-      const firstPromise = buy();
-      const secondPromise = buy();
-      expect(recorder.opened).toHaveLength(2);
-      const [firstWindow, secondWindow] = recorder.opened;
-      if (firstWindow === undefined || secondWindow === undefined) throw new Error('expected windows');
-
-      // Two buys must not share a browsing context or a launch id: the first
-      // watcher would otherwise close (or claim) the window the second is
-      // being paid in.
-      expect(firstWindow.target).not.toBe(secondWindow.target);
-      expect(readLaunchFromUrl(firstWindow.url).launchId)
-        .not.toBe(readLaunchFromUrl(secondWindow.url).launchId);
-
-      // Each report lands on its own flow.
-      emitter.emit(launchCreatedMessage(secondWindow.url, { intentId: 'connect_intent_second' }));
-      emitter.emit(launchCreatedMessage(firstWindow.url, { intentId: 'connect_intent_first' }));
-      await expect(firstPromise).resolves.toMatchObject({ intentId: 'connect_intent_first' });
-      await expect(secondPromise).resolves.toMatchObject({ intentId: 'connect_intent_second' });
+      expect(openedTargets).toHaveLength(2);
+      // Two buys must not share a browsing context: the first watcher would
+      // otherwise close the window the second is being paid in.
+      expect(new Set(openedTargets).size).toBe(2);
 
       await vi.advanceTimersByTimeAsync(2000);
     } finally {
@@ -1167,113 +1468,14 @@ describe('createSuperRareClient', () => {
     }
   });
 
-  it('ignores launch reports from a foreign origin', async () => {
-    const emitter = createMessageEmitter();
-    const recorder = createPopupOpenRecorder();
-    const client = createSuperRareClient({
-      apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
-      createState: () => 'state_popup',
-      popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-      fetch: async (input, init) => {
-        const request = input instanceof Request ? input : new Request(input, init);
-        return completedIntentStatusResponse(request);
-      },
-      sessionStorage: false,
-    });
-
-    vi.useFakeTimers();
-    try {
-      const intentPromise = client.actions.buy({
-        target: directListingTarget,
-        expected: { currency: 'ETH', price: '1.2' },
-        returnPath: '/buy/complete',
-      });
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-
-      // A hostile page cannot speak for the connect origin.
-      const forged = launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_evil' });
-      emitter.emit({ ...forged, origin: 'https://evil.test' });
-      await vi.advanceTimersByTimeAsync(0);
-
-      emitter.emit(launchCreatedMessage(openedWindow.url, { intentId: 'connect_intent_real' }));
-      await expect(intentPromise).resolves.toMatchObject({ intentId: 'connect_intent_real' });
-
-      await vi.advanceTimersByTimeAsync(2000);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('rejects with the hosted page\'s explanation when the launch fails', async () => {
-    const emitter = createMessageEmitter();
-    const recorder = createPopupOpenRecorder();
-    const client = createSuperRareClient({
-      apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
-      createState: () => 'state_popup',
-      popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-      fetch: async () => jsonResponse({ error: 'unused' }, { status: 500 }),
-      sessionStorage: false,
-    });
-
-    const intentPromise = client.actions.buy({
-      target: directListingTarget,
-      expected: { currency: 'ETH', price: '1.2' },
-      returnPath: '/buy/complete',
-    });
-    const openedWindow = recorder.opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    emitter.emit(launchFailedMessage(openedWindow.url, 'Unsupported chain for this action.'));
-
-    await expect(intentPromise).rejects.toBeInstanceOf(ConnectLaunchFailedError);
-    // The window is showing the same explanation; the SDK leaves it open.
-    expect(openedWindow.popup.closed).toBe(false);
-  });
-
-  it('rejects when the window is closed before the launch reports', async () => {
-    vi.useFakeTimers();
-    try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
-      const client = createSuperRareClient({
-        apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
-        createState: () => 'state_popup',
-        popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-        fetch: async () => jsonResponse({ error: 'unused' }, { status: 500 }),
-        sessionStorage: false,
-      });
-
-      const intentPromise = client.actions.buy({
-        target: directListingTarget,
-        expected: { currency: 'ETH', price: '1.2' },
-        returnPath: '/buy/complete',
-      });
-      const outcome = intentPromise.catch((error: unknown) => error);
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      openedWindow.popup.closed = true;
-      await vi.advanceTimersByTimeAsync(2000);
-
-      await expect(outcome).resolves.toBeInstanceOf(ConnectPopupClosedError);
-      expect(emitter.listenerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('throws when the window cannot be opened, before anything is created', async () => {
+  it('throws when the window cannot be opened, before creating an intent', async () => {
     // There is no same-page fallback: a blocked window fails the whole action
-    // with a typed error, and nothing has been created for it anywhere.
-    const emitter = createMessageEmitter();
-    const fetchImplementation = vi.fn(async () => jsonResponse({ error: 'unused' }, { status: 500 }));
+    // with a typed error, and no intent has been created for it.
+    const fetchImplementation = vi.fn(async () => connectIntentCreationResponse('connect_intent_buy'));
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
       createState: () => 'state_popup',
-      popup: { open: () => null, messageEvents: emitter.messageEvents },
+      popup: { open: () => null },
       fetch: fetchImplementation,
       sessionStorage: false,
     });
@@ -1284,69 +1486,341 @@ describe('createSuperRareClient', () => {
       returnPath: '/buy/complete',
     })).rejects.toBeInstanceOf(ConnectPopupBlockedError);
     expect(fetchImplementation).not.toHaveBeenCalled();
-    expect(emitter.listenerCount()).toBe(0);
+  });
+});
+
+describe('auth.login claims a result the posted callback never delivered', () => {
+  const connectOrigin = 'https://connect.superrare.test';
+
+  it('claims the code from Rare API when the window closes without a callback', async () => {
+    // The hosted page posts its callback and closes itself; a suspended
+    // opener (iOS) never gets the message. Finding the window closed, the
+    // SDK asks Rare API instead of reporting a cancel.
+    vi.useFakeTimers();
+    try {
+      const requestedPaths: string[] = [];
+      const { client, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/auth/claim')) {
+            expect(await request.json()).toEqual({
+              intentId: 'connect_intent_login',
+              state: 'state_login',
+            });
+            return claimIssuedResponse();
+          }
+          if (request.url.endsWith('/v1/connect/auth/exchange')) {
+            expect(await request.json()).toEqual({
+              intentId: 'connect_intent_login',
+              state: 'state_login',
+              code: 'connect_auth_code_claimed',
+            });
+            return sessionResponse();
+          }
+          if (request.url.endsWith('/v1/connect/users/me')) {
+            return jsonResponse({ error: 'nope' }, { status: 500 });
+          }
+          return loginIntentCreationResponse();
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      await vi.waitFor(() => {
+        expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+      });
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const result = await resultPromise;
+      expect(result.status).toBe('authenticated');
+      expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+      expect(requestedPaths).toEqual([
+        '/v1/connect/intents',
+        '/v1/connect/auth/claim',
+        '/v1/connect/auth/exchange',
+        '/v1/connect/users/me',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it('refuses to start an action without a message-event source', async () => {
-    // Without one the launch page's report could never be received. Node has
-    // no window message events and this client supplies none.
-    const recorder = createPopupOpenRecorder();
-    const fetchImplementation = vi.fn(async () => jsonResponse({ error: 'unused' }, { status: 500 }));
-    const client = createSuperRareClient({
-      apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
-      createState: () => 'state_popup',
-      popup: { open: recorder.open },
-      fetch: fetchImplementation,
-      sessionStorage: false,
-    });
-
-    await expect(client.actions.buy({
-      target: directListingTarget,
-      expected: { currency: 'ETH', price: '1.2' },
-      returnPath: '/buy/complete',
-    })).rejects.toThrow('no message-event source');
-    expect(fetchImplementation).not.toHaveBeenCalled();
-    expect(recorder.opened).toHaveLength(0);
-  });
-
-  it('supports anonymous intent reads without a Connect session', async () => {
-    const client = createSuperRareClient({
-      apiUrl: 'https://rare-api.test',
+  it('claims the code when the page becomes visible again', async () => {
+    const visibility = createVisibilityEmitter();
+    const claims: number[] = [];
+    const { client, opened } = createLoginTestClient({
+      visibilityEvents: visibility.visibilityEvents,
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
-        expect(request.method).toBe('GET');
-        expect(request.headers.get('authorization')).toBeNull();
-        expect(request.url).toBe('https://rare-api.test/v1/connect/intents/connect_intent_bid');
+        if (request.url.endsWith('/v1/connect/auth/claim')) {
+          claims.push(Date.now());
+          return claimIssuedResponse();
+        }
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
+        return loginIntentCreationResponse();
+      },
+    });
+
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(visibility.listenerCount()).toBe(1);
+
+    visibility.emit(false);
+    visibility.emit(true);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(opened[0]?.popup.closed).toBe(true);
+    expect(visibility.listenerCount()).toBe(0);
+    expect(claims).toHaveLength(1);
+  });
+
+  it('exchanges once when the posted callback lands while a claim is out', async () => {
+    let resolveClaim: (response: Response) => void = () => {};
+    const exchangedCodes: string[] = [];
+    const visibility = createVisibilityEmitter();
+    const { client, emitter, opened } = createLoginTestClient({
+      visibilityEvents: visibility.visibilityEvents,
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/claim')) {
+          return await new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          });
+        }
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          const body: unknown = await request.json();
+          if (typeof body === 'object' && body !== null && 'code' in body && typeof body.code === 'string') {
+            exchangedCodes.push(body.code);
+          }
+          return sessionResponse();
+        }
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
+        return loginIntentCreationResponse();
+      },
+    });
+
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+
+    // A claim goes out, and the callback arrives before it answers.
+    visibility.emit(true);
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    resolveClaim(claimIssuedResponse());
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(exchangedCodes).toEqual(['connect_auth_code_login']);
+  });
+
+  it('resolves cancelled when the window closes and nothing completed', async () => {
+    // Rare API answers 409 until the hosted login completes: a closed window
+    // with nothing to claim is the person changing their mind.
+    vi.useFakeTimers();
+    try {
+      const requestedPaths: string[] = [];
+      const { client, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
+          return loginIntentCreationResponse();
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      await vi.waitFor(() => {
+        expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+      });
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+      expect(requestedPaths).toEqual(['/v1/connect/intents', '/v1/connect/auth/claim']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolves expired when the claim reports the intent expired', async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, opened } = createLoginTestClient({
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.url.endsWith('/v1/connect/auth/claim')) {
+            return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+          }
+          return loginIntentCreationResponse();
+        },
+      });
+
+      const resultPromise = client.auth.login();
+      await vi.waitFor(() => {
+        expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+      });
+      const openedWindow = opened[0];
+      if (openedWindow === undefined) throw new Error('expected a window');
+
+      openedWindow.popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'expired' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('auth.prepareLogin', () => {
+  const connectOrigin = 'https://connect.superrare.test';
+
+  it('opens the next login straight at the hosted page, with no round trip in the tap', async () => {
+    const requestedPaths: string[] = [];
+    const { client, emitter, opened } = createLoginTestClient({
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestedPaths.push(new URL(request.url).pathname);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
+        return loginIntentCreationResponse();
+      },
+    });
+
+    const prepared = await client.auth.prepareLogin({ returnPath: '/auth/callback' });
+    expect(prepared.intentId).toBe('connect_intent_login');
+    expect(requestedPaths).toEqual(['/v1/connect/intents']);
+    // Preparing again for the same params reuses the intent.
+    await client.auth.prepareLogin({ returnPath: '/auth/callback' });
+    expect(requestedPaths).toEqual(['/v1/connect/intents']);
+
+    const resultPromise = client.auth.login({ returnPath: '/auth/callback' });
+    // The window opened synchronously, already at the hosted page: no blank
+    // page, no navigation, no second intent.
+    expect(opened).toHaveLength(1);
+    expect(opened[0]?.url).toBe(
+      'https://connect.superrare.test/login?intentId=connect_intent_login&display=popup',
+    );
+    expect(opened[0]?.popup.replacedUrls).toEqual([]);
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+
+    const result = await resultPromise;
+    expect(result.status).toBe('authenticated');
+    expect(requestedPaths).toEqual([
+      '/v1/connect/intents',
+      '/v1/connect/auth/exchange',
+      '/v1/connect/users/me',
+    ]);
+  });
+
+  it('is used once: the login after it creates its own intent', async () => {
+    const { client, emitter, opened } = createLoginTestClient();
+
+    await client.auth.prepareLogin();
+    const first = client.auth.login();
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await first;
+
+    const second = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[1]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[1]?.url).toBe('about:blank');
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await second;
+  });
+
+  it('drops a prepared login whose params differ from the tap', async () => {
+    const { client, emitter, opened } = createLoginTestClient();
+
+    await client.auth.prepareLogin({ returnPath: '/one' });
+    const resultPromise = client.auth.login({ returnPath: '/two' });
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[0]?.url).toBe('about:blank');
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await resultPromise;
+  });
+
+  it('drops a prepared login whose intent is about to expire', async () => {
+    const { client, emitter, opened } = createLoginTestClient({
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'nope' }, { status: 500 });
+        }
         return jsonResponse({
           data: {
-            intentId: 'connect_intent_bid',
-            type: 'bid',
-            status: 'pending',
-            returnPath: '/bid/complete',
-            expiresAt: futureExpiry(),
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            // Thirty seconds out: not worth opening a window on.
+            expiresAt: new Date(Date.now() + 30_000).toISOString(),
           },
         });
       },
-      sessionStorage: false,
     });
 
-    await expect(client.actions.getStatus({
-      intentId: 'connect_intent_bid',
-    })).resolves.toMatchObject({ status: 'pending' });
-    await expect(client.intents.get({
-      intentId: 'connect_intent_bid',
-    })).resolves.toMatchObject({ intentId: 'connect_intent_bid' });
+    await client.auth.prepareLogin();
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[0]?.url).toBe('about:blank');
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await resultPromise;
+  });
+
+  it('drops a prepared login after a logout', async () => {
+    const { client, emitter, opened } = createLoginTestClient();
+
+    await client.auth.prepareLogin();
+    client.auth.logout();
+    const resultPromise = client.auth.login();
+    await vi.waitFor(() => {
+      expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
+    });
+    expect(opened[0]?.url).toBe('about:blank');
+
+    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await resultPromise;
   });
 });
 
 describe('auth.login', () => {
   it('exchanges the posted callback, stores the session, and resolves with the user', async () => {
     const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
     const requestedPaths: string[] = [];
     const sessionChanges: Array<string | undefined> = [];
-    const { client, emitter, opened } = createLoginTestClient({
-      sessionStorage: storage,
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         requestedPaths.push(new URL(request.url).pathname);
@@ -1357,7 +1831,16 @@ describe('auth.login', () => {
             state: 'state_login',
             code: 'connect_auth_code_login',
           });
-          return sessionResponse();
+          return jsonResponse({
+            data: {
+              session: {
+                sessionId: 'connect_session_login',
+                userId: 'user_login',
+                address: '0x0000000000000000000000000000000000000009',
+                expiresAt: '2027-01-01T00:00:00.000Z',
+              },
+            },
+          });
         }
 
         if (request.url.endsWith('/v1/connect/users/me')) {
@@ -1372,32 +1855,43 @@ describe('auth.login', () => {
           });
         }
 
-        return completedIntentStatusResponse(request);
+        return loginIntentCreationResponse();
       },
+      sessionStorage: storage,
     });
     client.auth.onChange((session) => {
       sessionChanges.push(session?.sessionId);
     });
 
     const resultPromise = client.auth.login({ returnPath: '/auth/callback' });
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    // The login request rode to the hosted page in the fragment.
-    expect(readLaunchFromUrl(openedWindow.url).request).toMatchObject({
-      action: { type: 'login' },
-      returnPath: '/auth/callback',
-      state: 'state_login',
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
     });
-    await completeLaunch(emitter, openedWindow.url);
+    expect(popup.replacedUrls).toEqual([
+      'https://connect.superrare.test/login?intentId=connect_intent_login&display=popup',
+    ]);
 
     // Foreign-origin and unrelated messages are ignored.
     emitter.emit({
       origin: 'https://evil.test',
-      data: { ...authCallbackMessage, code: 'stolen' },
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_login',
+        code: 'stolen',
+      },
     });
-    emitter.emit({ origin: connectOrigin, data: { type: 'other' } });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: { type: 'other' } });
 
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    emitter.emit({
+      origin: 'https://connect.superrare.test',
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_login',
+        code: 'connect_auth_code_login',
+      },
+    });
 
     const result = await resultPromise;
     expect(result.status).toBe('authenticated');
@@ -1405,42 +1899,86 @@ describe('auth.login', () => {
     expect(result.session.sessionId).toBe('connect_session_login');
     expect(result.session.address).toBe('0x0000000000000000000000000000000000000009');
     expect(result.user?.username).toBe('collector');
-    expect(openedWindow.popup.closed).toBe(true);
+    expect(popup.closed).toBe(true);
     expect(emitter.listenerCount()).toBe(0);
     expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
     expect(sessionChanges).toEqual(['connect_session_login']);
-    // Creation never touched the network from this page.
     expect(requestedPaths).toEqual([
+      '/v1/connect/intents',
       '/v1/connect/auth/exchange',
       '/v1/connect/users/me',
     ]);
   });
 
   it('still resolves authenticated when the profile lookup fails', async () => {
-    const { client, emitter, opened } = createLoginTestClient();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          return jsonResponse({
+            data: {
+              session: {
+                sessionId: 'connect_session_login',
+                userId: 'user_login',
+                address: '0x0000000000000000000000000000000000000009',
+                expiresAt: '2027-01-01T00:00:00.000Z',
+              },
+            },
+          });
+        }
+
+        if (request.url.endsWith('/v1/connect/users/me')) {
+          return jsonResponse({ error: 'boom' }, { status: 500 });
+        }
+
+        return loginIntentCreationResponse();
+      },
+      sessionStorage: createMemoryStorage(),
+    });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({
+      origin: 'https://connect.superrare.test',
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_login',
+        code: 'connect_auth_code_login',
+      },
+    });
 
     const result = await resultPromise;
     expect(result).toMatchObject({ status: 'authenticated', user: undefined });
   });
 
-  it('resolves cancelled when the window is closed before completing', async () => {
+  it('resolves cancelled when the popup is closed before completing', async () => {
     vi.useFakeTimers();
     try {
-      const { client, emitter, opened } = createLoginTestClient();
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async () => loginIntentCreationResponse(),
+        sessionStorage: storage,
+      });
 
       const resultPromise = client.auth.login();
-      const openedWindow = opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url));
-      await vi.advanceTimersByTimeAsync(0);
-
-      openedWindow.popup.closed = true;
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
+      popup.closed = true;
       await vi.advanceTimersByTimeAsync(2000);
 
       await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
@@ -1450,71 +1988,78 @@ describe('auth.login', () => {
     }
   });
 
-  it('resolves cancelled when the window is closed before the launch reports', async () => {
-    // Closed during creation — the launch page never got to report. For a
-    // login that is the person changing their mind, not an error.
-    vi.useFakeTimers();
-    try {
-      const { client, opened } = createLoginTestClient();
-
-      const resultPromise = client.auth.login();
-      const openedWindow = opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      openedWindow.popup.closed = true;
-      await vi.advanceTimersByTimeAsync(2000);
-
-      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it('resolves expired once the login intent deadline passes with no callback', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'));
     try {
-      const { client, emitter, opened } = createLoginTestClient();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async () => jsonResponse({
+          data: {
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            // Four seconds out, so the watcher's 2s poll passes it.
+            expiresAt: '2026-06-01T00:00:04.000Z',
+          },
+        }),
+        sessionStorage: createMemoryStorage(),
+      });
 
       const resultPromise = client.auth.login();
-      const openedWindow = opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, {
-        // Four seconds out, so the watcher's 2s poll passes it.
-        expiresAt: '2026-06-01T00:00:04.000Z',
-      }));
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
       // No callback ever arrives; the deadline passes and the watcher closes.
       await vi.advanceTimersByTimeAsync(6000);
 
       await expect(resultPromise).resolves.toEqual({ status: 'expired' });
-      expect(openedWindow.popup.closed).toBe(true);
+      expect(popup.closed).toBe(true);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('rejects and closes the window when the callback does not match the pending auth', async () => {
-    const { client, emitter, opened } = createLoginTestClient();
+  it('rejects and closes the popup when the callback does not match the pending auth', async () => {
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      sessionStorage: createMemoryStorage(),
+    });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url);
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
     emitter.emit({
-      origin: connectOrigin,
-      data: { ...authCallbackMessage, state: 'state_other' },
+      origin: 'https://connect.superrare.test',
+      data: {
+        type: 'superrare-connect:auth-callback',
+        intentId: 'connect_intent_login',
+        state: 'state_other',
+        code: 'connect_auth_code_login',
+      },
     });
 
     await expect(resultPromise).rejects.toMatchObject({ code: 'state_mismatch' });
-    expect(openedWindow.popup.closed).toBe(true);
+    expect(popup.closed).toBe(true);
     expect(emitter.listenerCount()).toBe(0);
   });
 
-  it('throws when the window cannot be opened, before anything is created', async () => {
+  it('throws when the window cannot be opened, before creating an intent', async () => {
+    // There is no same-page fallback: a blocked window fails the login with a
+    // typed error, and no intent has been created yet.
     const emitter = createMessageEmitter();
-    const fetchImplementation = vi.fn(async () => jsonResponse({ error: 'unused' }, { status: 500 }));
+    const fetchImplementation = vi.fn(async () => loginIntentCreationResponse());
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
       createState: () => 'state_login',
       popup: { open: () => null, messageEvents: emitter.messageEvents },
       fetch: fetchImplementation,
@@ -1527,10 +2072,12 @@ describe('auth.login', () => {
   });
 
   it('refuses to start without a message-event source', async () => {
-    const fetchImplementation = vi.fn(async () => jsonResponse({ error: 'unused' }, { status: 500 }));
+    // Without one the hosted page's callback could never be received, so the
+    // login could never complete. Node has no window message events and this
+    // client supplies none.
+    const fetchImplementation = vi.fn(async () => loginIntentCreationResponse());
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
       createState: () => 'state_login',
       popup: { open: () => createPopupStub() },
       fetch: fetchImplementation,
@@ -1541,36 +2088,28 @@ describe('auth.login', () => {
     expect(fetchImplementation).not.toHaveBeenCalled();
   });
 
-  it('rejects with the hosted page\'s explanation when the launch fails', async () => {
-    const { client, emitter, opened } = createLoginTestClient();
-
-    const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    emitter.emit(launchFailedMessage(openedWindow.url, 'Rare API rejected the login.'));
-
-    await expect(resultPromise).rejects.toMatchObject({
-      name: 'ConnectLaunchFailedError',
-      message: 'Rare API rejected the login.',
-    });
-  });
-
   it('surfaces an exchange failure as a rejection', async () => {
-    const { client, emitter, opened } = createLoginTestClient({
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) {
           return jsonResponse({ error: 'invalid connect auth exchange' }, { status: 401 });
         }
-        return completedIntentStatusResponse(request);
+        return loginIntentCreationResponse();
       },
+      sessionStorage: createMemoryStorage(),
     });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
 
     await expect(resultPromise).rejects.toMatchObject({
       name: 'SuperRareConnectApiError',
@@ -1581,13 +2120,26 @@ describe('auth.login', () => {
   });
 
   it('completes with browser storage disabled by verifying the callback against its own pending record', async () => {
-    const { client, emitter, opened } = createLoginTestClient({ sessionStorage: false });
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        return loginIntentCreationResponse();
+      },
+      sessionStorage: false,
+    });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
 
     await expect(resultPromise).resolves.toMatchObject({
       status: 'authenticated',
@@ -1598,19 +2150,42 @@ describe('auth.login', () => {
   it('joins the login already in flight instead of starting a second one', async () => {
     // The SDK holds a single session, so two concurrent logins could only
     // race for the same slot. A second call joins the first.
-    const { client, emitter, opened } = createLoginTestClient();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const openedTargets: string[] = [];
+    let intentRequests = 0;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: {
+        open: (_url, target) => {
+          openedTargets.push(target);
+          return popup;
+        },
+        messageEvents: emitter.messageEvents,
+      },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
+        intentRequests += 1;
+        return loginIntentCreationResponse();
+      },
+      sessionStorage: createMemoryStorage(),
+    });
 
     const firstPromise = client.auth.login();
     // The deprecated alias is the same call, so it joins rather than racing.
     const secondPromise = client.auth.loginWithPopup();
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
 
-    // One window, one launch — the second call opened nothing.
-    expect(opened).toHaveLength(1);
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
+    // One window, one intent — the second call opened nothing.
+    expect(openedTargets).toHaveLength(1);
+    expect(intentRequests).toBe(1);
 
-    await completeLaunch(emitter, openedWindow.url);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
     const [firstResult, secondResult] = await Promise.all([firstPromise, secondPromise]);
     expect(firstResult).toMatchObject({ status: 'authenticated' });
     expect(secondResult).toBe(firstResult);
@@ -1619,26 +2194,45 @@ describe('auth.login', () => {
   it('releases the in-flight login once it settles', async () => {
     vi.useFakeTimers();
     try {
-      const { client, opened } = createLoginTestClient();
+      const emitter = createMessageEmitter();
+      const popups: Array<ReturnType<typeof createPopupStub>> = [];
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: {
+          open: () => {
+            const openedPopup = createPopupStub();
+            popups.push(openedPopup);
+            return openedPopup;
+          },
+          messageEvents: emitter.messageEvents,
+        },
+        fetch: async () => loginIntentCreationResponse(),
+        sessionStorage: createMemoryStorage(),
+      });
 
-      const closeWindowAt = (index: number): void => {
-        const openedWindow = opened[index];
-        if (openedWindow === undefined) {
-          throw new Error(`expected a window at index ${index}`);
+      const closePopupAt = (index: number): void => {
+        const openedPopup = popups[index];
+        if (openedPopup === undefined) {
+          throw new Error(`expected a popup at index ${index}`);
         }
-        openedWindow.popup.closed = true;
+        openedPopup.closed = true;
       };
 
       const firstPromise = client.auth.login();
-      expect(opened).toHaveLength(1);
-      closeWindowAt(0);
+      await vi.waitFor(() => {
+        expect(popups).toHaveLength(1);
+      });
+      closePopupAt(0);
       await vi.advanceTimersByTimeAsync(2000);
       await expect(firstPromise).resolves.toEqual({ status: 'cancelled' });
 
       // The lock is gone: a later login starts its own window.
       const secondPromise = client.auth.login();
-      expect(opened).toHaveLength(2);
-      closeWindowAt(1);
+      await vi.waitFor(() => {
+        expect(popups).toHaveLength(2);
+      });
+      closePopupAt(1);
       await vi.advanceTimersByTimeAsync(2000);
       await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
     } finally {
@@ -1646,10 +2240,43 @@ describe('auth.login', () => {
     }
   });
 
+  it('cancels when the popup is closed while the intent is still being created', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        // The intent request never settles: nothing else can end this login.
+        fetch: async () => await new Promise<Response>(() => {}),
+        sessionStorage: storage,
+      });
+
+      const resultPromise = client.auth.login();
+      await vi.advanceTimersByTimeAsync(0);
+      // Closed before the login watcher exists — the gap this covers.
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+      expect(popup.replacedUrls).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('forwards an abort signal to every request the caller waits on', async () => {
     // The timeouts are only real if the signal actually reaches fetch.
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
     const signalsByPath = new Map<string, AbortSignal | null | undefined>();
-    const { client, emitter, opened } = createLoginTestClient({
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         signalsByPath.set(new URL(request.url).pathname, init?.signal);
@@ -1664,18 +2291,21 @@ describe('auth.login', () => {
             },
           });
         }
-        return completedIntentStatusResponse(request);
+
+        return loginIntentCreationResponse();
       },
+      sessionStorage: createMemoryStorage(),
     });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
     await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
 
     for (const path of [
+      '/v1/connect/intents',
       '/v1/connect/auth/exchange',
       '/v1/connect/users/me',
     ]) {
@@ -1686,9 +2316,15 @@ describe('auth.login', () => {
   it('times out a completion the backend never answers', async () => {
     vi.useFakeTimers();
     try {
+      const storage = createMemoryStorage();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
       const sessionChanges: Array<string | undefined> = [];
       let releaseExchange: (() => void) | undefined;
-      const { client, emitter, opened } = createLoginTestClient({
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           if (request.url.endsWith('/v1/connect/auth/exchange')) {
@@ -1697,8 +2333,10 @@ describe('auth.login', () => {
             });
             return sessionResponse();
           }
-          return completedIntentStatusResponse(request);
+
+          return loginIntentCreationResponse();
         },
+        sessionStorage: storage,
       });
       client.auth.onChange((session) => {
         sessionChanges.push(session?.sessionId);
@@ -1709,12 +2347,12 @@ describe('auth.login', () => {
       // advancing timers, and an unobserved rejection is reported as an
       // unhandled error. Real callers await the call immediately.
       const outcome = resultPromise.catch((error: unknown) => error);
-      const openedWindow = opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url));
+      // Advance rather than vi.waitFor: with fake timers, waitFor polls on a
+      // faked timer nobody is advancing and deadlocks.
       await vi.advanceTimersByTimeAsync(0);
+      expect(popup.replacedUrls).toHaveLength(1);
 
-      emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+      emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
       await vi.advanceTimersByTimeAsync(0);
       expect(releaseExchange).toBeDefined();
 
@@ -1736,9 +2374,15 @@ describe('auth.login', () => {
   });
 
   it('drops a stale exchange when the session changed while it was in flight', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
     let releaseExchange: (() => void) | undefined;
     const sessionChanges: Array<string | undefined> = [];
-    const { client, emitter, opened } = createLoginTestClient({
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) {
@@ -1747,18 +2391,19 @@ describe('auth.login', () => {
           });
           return sessionResponse();
         }
-        return completedIntentStatusResponse(request);
+        return loginIntentCreationResponse();
       },
+      sessionStorage: storage,
     });
     client.auth.onChange((session) => {
       sessionChanges.push(session?.sessionId);
     });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
     await vi.waitFor(() => {
       expect(releaseExchange).toBeDefined();
     });
@@ -1772,28 +2417,12 @@ describe('auth.login', () => {
     expect(sessionChanges).toEqual([undefined]);
   });
 
-  it('cancels the login when logout lands while the launch is in flight', async () => {
-    // The generation check runs between the launch report and the watch: a
-    // logout during creation must close the window, not proceed to a login
-    // the user already walked away from.
-    const { client, emitter, opened } = createLoginTestClient();
-
-    const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    client.auth.logout();
-    emitter.emit(launchCreatedMessage(openedWindow.url));
-
-    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
-    expect(openedWindow.popup.closed).toBe(true);
-  });
-
   it('does not let one client instance suppress another client\'s in-flight exchange', async () => {
     // Two clients with independent session storage are independent sessions; a
     // logout on one must not drop a login committing on the other.
     let releaseExchangeB: (() => void) | undefined;
     const emitterB = createMessageEmitter();
-    const recorderB = createPopupOpenRecorder();
+    const popupB = createPopupStub();
     const buildClient = (
       key: string,
       storage: ConnectSessionStorage,
@@ -1801,9 +2430,8 @@ describe('auth.login', () => {
     ): ReturnType<typeof createSuperRareClient> =>
       createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_login',
-        popup: { open: recorderB.open, messageEvents: emitterB.messageEvents },
+        popup: { open: () => popupB, messageEvents: emitterB.messageEvents },
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           if (request.url.endsWith('/v1/connect/auth/exchange')) {
@@ -1815,7 +2443,7 @@ describe('auth.login', () => {
             return sessionResponse();
           }
           if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
-          return completedIntentStatusResponse(request);
+          return loginIntentCreationResponse();
         },
         sessionStorageKey: key,
         sessionStorage: storage,
@@ -1826,10 +2454,10 @@ describe('auth.login', () => {
 
     // B's login has its callback and the exchange is in flight, hung.
     const bPromise = clientB.auth.login();
-    const openedWindow = recorderB.opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitterB, openedWindow.url);
-    emitterB.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(popupB.replacedUrls).toHaveLength(1);
+    });
+    emitterB.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
     await vi.waitFor(() => {
       expect(releaseExchangeB).toBeDefined();
     });
@@ -1847,9 +2475,8 @@ describe('auth.login', () => {
   });
 
   it('delivers and unsubscribes through the default browser message adapter', async () => {
-    // Every other test injects a fake messageEvents; this one exercises the
-    // real globalThis.addEventListener/removeEventListener adapter, across
-    // both subscriptions (launch report, then auth callback).
+    // Every other popup test injects a fake messageEvents; this one exercises
+    // the real globalThis.addEventListener/removeEventListener adapter.
     const listeners = new Map<string, (event: unknown) => void>();
     const addEventListener = vi.fn((type: string, handler: (event: unknown) => void) => {
       listeners.set(type, handler);
@@ -1860,36 +2487,29 @@ describe('auth.login', () => {
     vi.stubGlobal('addEventListener', addEventListener);
     vi.stubGlobal('removeEventListener', removeEventListener);
     try {
-      const recorder = createPopupOpenRecorder();
+      const popup = createPopupStub();
       const client = createSuperRareClient({
         apiUrl: 'https://rare-api.test',
-        connectUrl: connectOrigin,
         createState: () => 'state_login',
         // No messageEvents override → the default browser adapter is used.
-        popup: { open: recorder.open },
+        popup: { open: () => popup },
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
           if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
-          return completedIntentStatusResponse(request);
+          return loginIntentCreationResponse();
         },
         sessionStorage: createMemoryStorage(),
       });
 
       const resultPromise = client.auth.login();
-      const openedWindow = recorder.opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      expect(listeners.has('message')).toBe(true);
-
-      // Deliver the launch report the way the browser would.
-      listeners.get('message')?.(launchCreatedMessage(openedWindow.url));
-
-      // The launch listener unsubscribed; the login watcher subscribes next.
       await vi.waitFor(() => {
         expect(listeners.has('message')).toBe(true);
       });
+
+      // Deliver a message the way the browser would, through the adapter.
       listeners.get('message')?.({
-        origin: connectOrigin,
+        origin: 'https://connect.superrare.test',
         data: authCallbackMessage,
       });
 
@@ -1903,13 +2523,18 @@ describe('auth.login', () => {
   });
 
   it('does not time out a committed login when the profile lookup is slow', async () => {
-    // The central invariant: once the session is committed the completion
-    // deadline stops applying, so a slow (not failed) /users/me cannot turn
-    // a succeeded login into a timeout rejection.
+    // The central invariant of the redesign: once the session is committed the
+    // completion deadline stops applying, so a slow (not failed) /users/me
+    // cannot turn a succeeded login into a timeout rejection.
     vi.useFakeTimers();
     try {
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
       let releaseProfile: (() => void) | undefined;
-      const { client, emitter, opened } = createLoginTestClient({
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
@@ -1926,8 +2551,9 @@ describe('auth.login', () => {
               },
             });
           }
-          return completedIntentStatusResponse(request);
+          return loginIntentCreationResponse();
         },
+        sessionStorage: createMemoryStorage(),
       });
 
       const resultPromise = client.auth.login();
@@ -1936,14 +2562,12 @@ describe('auth.login', () => {
         settledStatus = result.status;
       });
 
-      const openedWindow = opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url));
       await vi.advanceTimersByTimeAsync(1);
-      emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+      emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
       // Let the exchange resolve and commit; the profile lookup then hangs.
-      await vi.advanceTimersByTimeAsync(0);
-      expect(releaseProfile).toBeDefined();
+      await vi.waitFor(() => {
+        expect(releaseProfile).toBeDefined();
+      });
       // The session is committed even though the promise has not resolved yet.
       expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
 
@@ -1962,12 +2586,11 @@ describe('auth.login', () => {
     }
   });
 
-  it('settles even if closing the window throws while finishing the login', async () => {
+  it('settles even if closing the popup throws while finishing the login', async () => {
     // An integrator-supplied window whose close() throws must not leave the
     // login promise pending forever (which would also wedge the serialization
     // lock).
     const emitter = createMessageEmitter();
-    const opened: string[] = [];
     const popup: ConnectPopupWindow = {
       closed: false,
       close(): void {
@@ -1979,40 +2602,38 @@ describe('auth.login', () => {
     };
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
-      connectUrl: connectOrigin,
       createState: () => 'state_login',
-      popup: {
-        open: (url) => {
-          opened.push(url);
-          return popup;
-        },
-        messageEvents: emitter.messageEvents,
-      },
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
         if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
-        return completedIntentStatusResponse(request);
+        return loginIntentCreationResponse();
       },
       sessionStorage: createMemoryStorage(),
     });
 
     const resultPromise = client.auth.login();
-    const openedUrl = opened[0];
-    if (openedUrl === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedUrl);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(emitter.listenerCount()).toBe(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
 
     await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
   });
 
   it('exchanges an in-hand callback even when the intent expiry is behind the client clock', async () => {
-    // Client clock ahead of the server: the reported expiresAt is already in
+    // Client clock ahead of the server: the intent's expiresAt is already in
     // the past locally, but a callback in hand must still be exchanged — the
     // server, not the client clock, decides expiry. (Regression: the handler
     // used to discard the callback as `expired`.)
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
     const exchangeRequests: string[] = [];
-    const { client, emitter, opened } = createLoginTestClient({
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) {
@@ -2020,17 +2641,22 @@ describe('auth.login', () => {
           return sessionResponse();
         }
         if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
-        return completedIntentStatusResponse(request);
+        return jsonResponse({
+          data: {
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            expiresAt: '2020-01-01T00:00:00.000Z',
+          },
+        });
       },
+      sessionStorage: createMemoryStorage(),
     });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url, {
-      expiresAt: '2020-01-01T00:00:00.000Z',
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
     });
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
 
     await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
     expect(exchangeRequests).toHaveLength(1);
@@ -2039,35 +2665,58 @@ describe('auth.login', () => {
   it('falls back to a bounded deadline when the intent expiry is unparseable', async () => {
     vi.useFakeTimers();
     try {
-      const { client, emitter, opened } = createLoginTestClient();
+      const popup = createPopupStub();
+      const emitter = createMessageEmitter();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: { open: () => popup, messageEvents: emitter.messageEvents },
+        fetch: async () => jsonResponse({
+          data: {
+            intentId: 'connect_intent_login',
+            url: 'https://connect.superrare.test/login?intentId=connect_intent_login',
+            expiresAt: 'not-a-date',
+          },
+        }),
+        sessionStorage: createMemoryStorage(),
+      });
 
       const resultPromise = client.auth.login();
-      const openedWindow = opened[0];
-      if (openedWindow === undefined) throw new Error('expected a window');
-      emitter.emit(launchCreatedMessage(openedWindow.url, { expiresAt: 'not-a-date' }));
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
       await vi.advanceTimersByTimeAsync(14 * 60_000);
-      expect(openedWindow.popup.closed).toBe(false);
+      expect(popup.closed).toBe(false);
       await vi.advanceTimersByTimeAsync(2 * 60_000);
 
       await expect(resultPromise).resolves.toEqual({ status: 'expired' });
-      expect(openedWindow.popup.closed).toBe(true);
+      expect(popup.closed).toBe(true);
     } finally {
       vi.useRealTimers();
     }
   });
 
   it('drops the login when logout happens before the callback arrives', async () => {
-    const { client, emitter, opened } = createLoginTestClient();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        return loginIntentCreationResponse();
+      },
+      sessionStorage: createMemoryStorage(),
+    });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    emitter.emit(launchCreatedMessage(openedWindow.url));
     await vi.waitFor(() => {
-      expect(emitter.listenerCount()).toBe(1);
+      expect(popup.replacedUrls).toHaveLength(1);
     });
     client.auth.logout();
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
 
     await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
     expect(client.auth.getSession()).toBeUndefined();
@@ -2077,8 +2726,13 @@ describe('auth.login', () => {
     // Once the session is committed the login has succeeded; a logout during
     // the best-effort profile lookup is a later event (login, then logout),
     // not a reason to report the login as failed.
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
     let releaseProfile: (() => void) | undefined;
-    const { client, emitter, opened } = createLoginTestClient({
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
@@ -2095,15 +2749,16 @@ describe('auth.login', () => {
             },
           });
         }
-        return completedIntentStatusResponse(request);
+        return loginIntentCreationResponse();
       },
+      sessionStorage: createMemoryStorage(),
     });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    await completeLaunch(emitter, openedWindow.url);
-    emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
+    await vi.waitFor(() => {
+      expect(popup.replacedUrls).toHaveLength(1);
+    });
+    emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
     await vi.waitFor(() => {
       expect(releaseProfile).toBeDefined();
     });
@@ -2118,52 +2773,140 @@ describe('auth.login', () => {
   });
 
   it('gives each client instance its own named browsing context', async () => {
-    vi.useFakeTimers();
-    try {
-      const emitter = createMessageEmitter();
-      const recorder = createPopupOpenRecorder();
-      const buildClient = (): ReturnType<typeof createSuperRareClient> =>
-        createSuperRareClient({
-          apiUrl: 'https://rare-api.test',
-          connectUrl: connectOrigin,
-          createState: () => 'state_login',
-          popup: { open: recorder.open, messageEvents: emitter.messageEvents },
-          fetch: async (input, init) => {
-            const request = input instanceof Request ? input : new Request(input, init);
-            return completedIntentStatusResponse(request);
+    const openedTargets: string[] = [];
+    const openedPopups: Array<ReturnType<typeof createPopupStub>> = [];
+    const emitter = createMessageEmitter();
+    const buildClient = (): ReturnType<typeof createSuperRareClient> =>
+      createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_login',
+        popup: {
+          open: (_url, target) => {
+            openedTargets.push(target);
+            const openedPopup = createPopupStub();
+            openedPopups.push(openedPopup);
+            return openedPopup;
           },
-          sessionStorage: createMemoryStorage(),
-        });
-
-      // Serialization is per client, so two clients on one page can still have
-      // a login each — they must not share a window name.
-      const firstPromise = buildClient().auth.login();
-      const secondPromise = buildClient().auth.login();
-      expect(recorder.opened).toHaveLength(2);
-      expect(new Set(recorder.opened.map(({ target }) => target)).size).toBe(2);
-
-      // Settle both so neither watcher outlives the test.
-      recorder.opened.forEach(({ popup }) => {
-        popup.closed = true;
+          messageEvents: emitter.messageEvents,
+        },
+        fetch: async () => loginIntentCreationResponse(),
+        sessionStorage: createMemoryStorage(),
       });
-      await vi.advanceTimersByTimeAsync(2000);
-      await expect(firstPromise).resolves.toEqual({ status: 'cancelled' });
-      await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
-    } finally {
-      vi.useRealTimers();
-    }
+
+    // Serialization is per client, so two clients on one page can still have
+    // a login each — they must not share a window name.
+    const firstPromise = buildClient().auth.login();
+    const secondPromise = buildClient().auth.login();
+    await vi.waitFor(() => {
+      expect(openedTargets).toHaveLength(2);
+    });
+
+    expect(new Set(openedTargets).size).toBe(2);
+
+    // Settle both so neither watcher outlives the test.
+    openedPopups.forEach((openedPopup) => {
+      openedPopup.closed = true;
+    });
+    await expect(firstPromise).resolves.toEqual({ status: 'cancelled' });
+    await expect(secondPromise).resolves.toEqual({ status: 'cancelled' });
   });
 
-  it('rejects a reported login URL that is not a web URL, and closes the window', async () => {
-    const { client, emitter, opened } = createLoginTestClient();
+  it('refuses to navigate a popup to a non-web intent URL', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => jsonResponse({
+        data: {
+          intentId: 'connect_intent_login',
+          url: 'javascript:alert(1)',
+          expiresAt: '2027-01-01T00:00:00.000Z',
+        },
+      }),
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.login()).rejects.toThrow('Invalid Connect intent URL');
+    expect(popup.replacedUrls).toEqual([]);
+    expect(popup.closed).toBe(true);
+  });
+
+  it('cancels the login when logout lands while the intent is being created', async () => {
+    // The generation check runs between the intent round trip and the watch:
+    // a logout during creation must close the window, not proceed to a login
+    // the user already walked away from.
+    const emitter = createMessageEmitter();
+    const popup = createPopupStub();
+    let releaseIntent: (() => void) | undefined;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => {
+        await new Promise<void>((resolve) => {
+          releaseIntent = resolve;
+        });
+        return loginIntentCreationResponse();
+      },
+      sessionStorage: createMemoryStorage(),
+    });
 
     const resultPromise = client.auth.login();
-    const openedWindow = opened[0];
-    if (openedWindow === undefined) throw new Error('expected a window');
-    emitter.emit(launchCreatedMessage(openedWindow.url, { url: 'not a url' }));
+    await vi.waitFor(() => {
+      expect(releaseIntent).toBeDefined();
+    });
+    client.auth.logout();
+    releaseIntent?.();
 
-    await expect(resultPromise).rejects.toThrow('Invalid Connect intent URL');
-    expect(openedWindow.popup.closed).toBe(true);
+    await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
+    expect(popup.replacedUrls).toEqual([]);
+    expect(popup.closed).toBe(true);
+  });
+
+  it('releases the popup when popup navigation throws', async () => {
+    const storage = createMemoryStorage();
+    const emitter = createMessageEmitter();
+    const popup = createPopupStub();
+    popup.location.replace = (): never => {
+      throw new Error('navigation blocked');
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => loginIntentCreationResponse(),
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.login()).rejects.toThrow('navigation blocked');
+    expect(popup.closed).toBe(true);
+    expect(emitter.listenerCount()).toBe(0);
+  });
+
+  it('releases the popup when the intent URL is malformed', async () => {
+    const storage = createMemoryStorage();
+    const popup = createPopupStub();
+    const emitter = createMessageEmitter();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_login',
+      popup: { open: () => popup, messageEvents: emitter.messageEvents },
+      fetch: async () => jsonResponse({
+        data: {
+          intentId: 'connect_intent_login',
+          url: 'not a url',
+          expiresAt: '2027-01-01T00:00:00.000Z',
+        },
+      }),
+      sessionStorage: storage,
+    });
+
+    await expect(client.auth.login()).rejects.toThrow('Invalid Connect intent URL');
+    expect(popup.closed).toBe(true);
+    expect(popup.replacedUrls).toEqual([]);
     expect(emitter.listenerCount()).toBe(0);
   });
 });
@@ -2173,6 +2916,31 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
     ...init,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+function connectIntentCreationResponse(intentId: string): Response {
+  return jsonResponse({
+    data: {
+      intentId,
+      url: `https://connect.superrare.test/intents/${intentId}`,
+      expiresAt: '2026-06-22T00:00:00.000Z',
+    },
+  });
+}
+
+function isConnectActionRequest(
+  value: unknown,
+  type: 'checkout' | 'buy' | 'bid' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel',
+): value is { action: { type: 'checkout' | 'buy' | 'bid' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel' } } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'action' in value &&
+    typeof value.action === 'object' &&
+    value.action !== null &&
+    'type' in value.action &&
+    value.action.type === type
+  );
 }
 
 function createMemoryStorage(): ConnectSessionStorage {

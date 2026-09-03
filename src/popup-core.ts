@@ -9,6 +9,10 @@ import type { ConnectIntentStatus } from './status-core.js';
 export const DEFAULT_CONNECT_POPUP_WIDTH = 480;
 export const DEFAULT_CONNECT_POPUP_HEIGHT = 720;
 
+/** Search param the hosted app reads to adapt its chrome to the popup. */
+const CONNECT_POPUP_DISPLAY_PARAM = 'display';
+const CONNECT_POPUP_DISPLAY_VALUE = 'popup';
+
 /** Structural view of the opened window; lets tests stub `window.open`. */
 export type ConnectPopupWindow = {
   closed: boolean;
@@ -46,6 +50,13 @@ export const getConnectPopupFeatures = (input: {
   }
 
   return features.join(',');
+};
+
+/** Appends `display=popup` so the hosted app renders popup-aware chrome. */
+export const appendConnectPopupDisplay = (url: string): string => {
+  const target = new URL(url);
+  target.searchParams.set(CONNECT_POPUP_DISPLAY_PARAM, CONNECT_POPUP_DISPLAY_VALUE);
+  return target.toString();
 };
 
 const settledStatuses: ReadonlySet<ConnectIntentStatus> = new Set([

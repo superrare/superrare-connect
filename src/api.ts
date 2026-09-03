@@ -13,6 +13,7 @@ export type ConnectAuthApiOptions = {
 const DEFAULT_RARE_API_URL = 'https://api.superrare.com';
 const connectIntentsPath = '/v1/connect/intents';
 const connectAuthExchangePath = '/v1/connect/auth/exchange';
+const connectAuthClaimPath = '/v1/connect/auth/claim';
 const connectSessionPath = '/v1/connect/session';
 const connectCurrentUserPath = '/v1/connect/users/me';
 
@@ -37,6 +38,34 @@ export type ConnectCurrentUser = {
 const exchangeConnectAuthResponseSchema = z.object({
   data: z.object({
     session: connectSessionSchema,
+  }),
+});
+
+const claimConnectAuthResponseSchema = z.object({
+  data: z.object({
+    code: z.string().min(1),
+    intentId: z.string().min(1),
+    state: z.string().min(1),
+    expiresAt: z.string().min(1),
+  }),
+});
+
+export type ConnectAuthClaimResult =
+  | {
+    /** The hosted login completed; a fresh one-time code was issued. */
+    status: 'issued';
+    params: ConnectAuthCallbackParams;
+  }
+  | {
+    /** The hosted login has not completed (yet). */
+    status: 'not_completed';
+  };
+
+const createConnectIntentResponseSchema = z.object({
+  data: z.object({
+    intentId: z.string().min(1),
+    url: z.string().min(1),
+    expiresAt: z.string().min(1),
   }),
 });
 
@@ -162,6 +191,33 @@ const getConnectCheckoutStatusResponseSchema = z.object({
   data: connectCheckoutStatusSchema,
 });
 
+export async function createConnectIntent(input: {
+  request: CreateConnectIntentRequest;
+  signal?: AbortSignal;
+} & ConnectAuthApiOptions): Promise<ConnectIntentCreation> {
+  const body = await requestConnectApiJson({
+    path: connectIntentsPath,
+    method: 'POST',
+    apiUrl: input.apiUrl,
+    fetch: input.fetch,
+    body: input.request,
+    signal: input.signal,
+  });
+  const parsedResponse = createConnectIntentResponseSchema.safeParse(body);
+  if (!parsedResponse.success) {
+    throw new Error('Invalid Connect intent response.');
+  }
+
+  return parsedResponse.data.data;
+}
+
+export async function createConnectLoginIntent(input: {
+  request: CreateConnectLoginIntentRequest;
+  signal?: AbortSignal;
+} & ConnectAuthApiOptions): Promise<ConnectIntentCreation> {
+  return await createConnectIntent(input);
+}
+
 export async function getConnectIntent(input: {
   intentId: string;
   signal?: AbortSignal;
@@ -199,6 +255,51 @@ export async function exchangeConnectAuthCode(
   }
 
   return parsedResponse.data.data.session;
+}
+
+/**
+ * Asks Rare API for a fresh auth code for a login intent whose hosted login
+ * already completed. The hosted page posts its callback to the opener, but a
+ * suspended opener (iOS Safari freezes the tab while the hosted window is in
+ * front) never receives it; this is the pull side of that handoff. Rare API
+ * answers 409 until the hosted login completes, and gates the claim on the
+ * request origin being the intent's initiating origin plus the intent's
+ * `state`.
+ */
+export async function claimConnectAuthCode(
+  input: { intentId: string; state: string },
+  options: ConnectAuthApiOptions & { signal?: AbortSignal } = {},
+): Promise<ConnectAuthClaimResult> {
+  let body: unknown;
+  try {
+    body = await requestConnectApiJson({
+      path: connectAuthClaimPath,
+      method: 'POST',
+      apiUrl: options.apiUrl,
+      fetch: options.fetch,
+      body: input,
+      signal: options.signal,
+    });
+  } catch (error) {
+    if (error instanceof SuperRareConnectApiError && error.status === 409) {
+      return { status: 'not_completed' };
+    }
+    throw error;
+  }
+
+  const parsedResponse = claimConnectAuthResponseSchema.safeParse(body);
+  if (!parsedResponse.success) {
+    throw new Error('Invalid Connect auth claim response.');
+  }
+
+  return {
+    status: 'issued',
+    params: {
+      intentId: parsedResponse.data.data.intentId,
+      state: parsedResponse.data.data.state,
+      code: parsedResponse.data.data.code,
+    },
+  };
 }
 
 export async function getConnectSession(input: {
