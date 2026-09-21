@@ -149,7 +149,9 @@ await superrare.actions.bid({
     contract: '0x345ea85bc5391a55a46c9508727b37da2227b41e',
     tokenId: '4',
   },
-  bid: { currency: 'ETH', amount: '1.2' },
+  // Bid amounts are the currency's raw base units (wei for ETH), like offer
+  // amounts: '1200000000000000000' is 1.2 ETH. Rare API rejects decimals.
+  bid: { currency: 'ETH', amount: '1200000000000000000' },
   returnPath: '/bid/complete',
 });
 
