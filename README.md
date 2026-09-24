@@ -311,6 +311,29 @@ const superrare = createSuperRareClient({
 
 Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
 
+## Testing on Sepolia
+
+Production (`connect.superrare.com`) is Ethereum mainnet only. To test an integration on the **Sepolia** testnet, point the client at the shared dev environment and pass the Sepolia chain id (`11155111`) on the action target:
+
+```ts
+const superrare = createSuperRareClient({
+  apiUrl: 'https://rare-api-dev-mainnet.superrare.co',
+  connectUrl: 'https://connect-dev-mainnet.superrare.co',
+});
+
+await superrare.actions.buy({
+  target: {
+    kind: 'erc721-direct-listing',
+    chainId: 11155111, // Sepolia — the hosted window is pinned to this chain
+    contract: '0x…',
+    tokenId: '…',
+  },
+  expected: { currency: 'ETH', price: '…' }, // raw base units (wei)
+});
+```
+
+The dev environment resolves and executes both mainnet (`1`) and Sepolia (`11155111`) listings; the hosted window runs on whichever chain the action names, with no in-window network switch. You need a testnet asset the buyer can actually purchase (a live Sepolia listing whose seller still owns the token) and a buyer wallet funded with Sepolia ETH. Switch back to the production `apiUrl`/`connectUrl` for mainnet.
+
 ## Hosted Windows
 
 Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
