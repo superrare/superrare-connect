@@ -420,8 +420,21 @@ async function buildConnectApiError(
 async function readConnectApiErrorMessage(response: Response): Promise<string | undefined> {
   try {
     const body: unknown = await response.clone().json();
-    const parsed = z.object({ error: z.string() }).safeParse(body);
-    return parsed.success ? parsed.data.error : undefined;
+    // The documented shape is { error: string }, but a validation failure can
+    // answer with an object-shaped `error` (a serialized ZodError). Accept both
+    // so the reason still reaches the caller instead of collapsing to the
+    // generic "Request failed" fallback.
+    const parsed = z
+      .object({
+        error: z.union([z.string(), z.object({ message: z.string() })]),
+      })
+      .safeParse(body);
+    if (!parsed.success) {
+      return undefined;
+    }
+    return typeof parsed.data.error === 'string'
+      ? parsed.data.error
+      : parsed.data.error.message;
   } catch {
     return undefined;
   }

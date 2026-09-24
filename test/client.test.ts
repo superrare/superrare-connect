@@ -2958,3 +2958,28 @@ function createMemoryStorage(): ConnectSessionStorage {
     },
   };
 }
+
+describe('createSuperRareClient session storage resolution', () => {
+  it('degrades to no persistence when reading localStorage throws (blocked storage)', () => {
+    // A sandboxed or third-party iframe (Safari "block all cookies") makes the
+    // globalThis.localStorage getter throw SecurityError. Default construction
+    // must not propagate that — with eager init it would blank the whole app.
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() {
+        throw new Error('The operation is insecure.');
+      },
+    });
+
+    try {
+      expect(() => createSuperRareClient()).not.toThrow();
+    } finally {
+      if (descriptor === undefined) {
+        Reflect.deleteProperty(globalThis, 'localStorage');
+      } else {
+        Object.defineProperty(globalThis, 'localStorage', descriptor);
+      }
+    }
+  });
+});
