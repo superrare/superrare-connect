@@ -1086,8 +1086,16 @@ function resolveConnectSessionStorage(
 }
 
 function readBrowserLocalStorage(): ConnectSessionStorage | undefined {
-  const storage = Reflect.get(globalThis, 'localStorage');
-  return isConnectSessionStorage(storage) ? storage : undefined;
+  // Reading globalThis.localStorage throws (SecurityError) when storage is
+  // blocked — a sandboxed or third-party iframe, or Safari "block all cookies".
+  // Degrade to no persistence instead of aborting client construction, which
+  // with eager init would blank the whole embedding app.
+  try {
+    const storage = Reflect.get(globalThis, 'localStorage');
+    return isConnectSessionStorage(storage) ? storage : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 const POPUP_POLL_INTERVAL_MS = 2000;

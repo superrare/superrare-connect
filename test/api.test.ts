@@ -321,6 +321,42 @@ describe('Connect API client', () => {
       avatarUri: null,
     });
   });
+
+  it('surfaces the message from an object-shaped error body instead of "Request failed"', async () => {
+    // rare-api can answer a 400 whose `error` is an object (a serialized
+    // ZodError), not a string. The reason must still reach the caller rather
+    // than collapsing to the generic "Request failed" fallback.
+    const fetchImplementation = vi.fn(async (): Promise<Response> =>
+      jsonResponse(
+        {
+          success: false,
+          error: {
+            name: 'ZodError',
+            message: '[{"code":"invalid_union","path":[],"message":"Invalid input"}]',
+          },
+        },
+        { status: 400 },
+      ),
+    );
+
+    await expect(getConnectIntent({
+      intentId: 'connect_intent_123',
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+    })).rejects.toThrow('invalid_union');
+  });
+
+  it('still surfaces a plain string error body', async () => {
+    const fetchImplementation = vi.fn(async (): Promise<Response> =>
+      jsonResponse({ error: 'Reserve auction is unavailable' }, { status: 409 }),
+    );
+
+    await expect(getConnectIntent({
+      intentId: 'connect_intent_123',
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+    })).rejects.toThrow('Reserve auction is unavailable');
+  });
 });
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
