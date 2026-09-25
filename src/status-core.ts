@@ -31,6 +31,7 @@ export type ConnectActionTargetKind =
   | 'erc1155-listing'
   | 'erc721-reserve-auction'
   | 'erc721-batch-reserve-auction'
+  | 'erc721-scheduled-auction'
   | 'erc721-release'
   | 'erc1155-release'
   | 'erc1155-checkout'

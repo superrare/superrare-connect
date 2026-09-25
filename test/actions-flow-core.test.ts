@@ -16,6 +16,7 @@ import type {
   ConnectErc721OfferTarget,
   ConnectErc721ReleaseTarget,
   ConnectErc721ReserveAuctionTarget,
+  ConnectErc721ScheduledAuctionTarget,
 } from '../src/auth-flow-core.js';
 
 const directListingTarget: ConnectErc721DirectListingTarget = {
@@ -27,6 +28,13 @@ const directListingTarget: ConnectErc721DirectListingTarget = {
 
 const reserveAuctionTarget: ConnectErc721ReserveAuctionTarget = {
   kind: 'erc721-reserve-auction',
+  chainId: 1,
+  contract: '0x1234567890123456789012345678901234567890',
+  tokenId: '123',
+};
+
+const scheduledAuctionTarget: ConnectErc721ScheduledAuctionTarget = {
+  kind: 'erc721-scheduled-auction',
   chainId: 1,
   contract: '0x1234567890123456789012345678901234567890',
   tokenId: '123',
@@ -118,6 +126,28 @@ describe('buildConnectBidIntentRequest', () => {
           type: 'bid',
           target: reserveAuctionTarget,
           bid: { currency: 'ETH', amount: '1.2' },
+        },
+        returnPath: '/bid/complete',
+        state: 'state_123',
+      },
+    });
+  });
+});
+
+describe('buildConnectBidIntentRequest with a scheduled auction', () => {
+  it('builds a bid intent request with a scheduled auction target', () => {
+    expect(buildConnectBidIntentRequest({
+      target: scheduledAuctionTarget,
+      bid: { currency: 'ETH', amount: '1200000000000000000' },
+      returnPath: '/bid/complete',
+      state: 'state_123',
+    })).toEqual({
+      ok: true,
+      request: {
+        action: {
+          type: 'bid',
+          target: scheduledAuctionTarget,
+          bid: { currency: 'ETH', amount: '1200000000000000000' },
         },
         returnPath: '/bid/complete',
         state: 'state_123',
