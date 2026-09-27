@@ -51,6 +51,7 @@ export {
   type ConnectErc721OfferTarget,
   type ConnectErc721ReleaseTarget,
   type ConnectErc721ReserveAuctionTarget,
+  type ConnectErc721ScheduledAuctionTarget,
   type ConnectEthereumAddress,
   type ConnectExpectedOfferTerms,
   type ConnectExpectedPriceTerms,

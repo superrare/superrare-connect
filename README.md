@@ -155,6 +155,23 @@ await superrare.actions.bid({
   returnPath: '/bid/complete',
 });
 
+// Scheduled (no-reserve) auctions take the same target shape. Rare API reads
+// the auction on-chain and refuses the intent before the auction starts
+// (`AUCTION_NOT_STARTED`) or after it ends (`AUCTION_ENDED`). Only the first
+// bid is checked against the auction's minimum; the increment over an
+// existing bid is enforced by the auction contract, so compute the next valid
+// bid with `@rareprotocol/rare-sdk` `auction.status()` before starting one.
+await superrare.actions.bid({
+  target: {
+    kind: 'erc721-scheduled-auction',
+    chainId: 11155111,
+    contract: '0x345ea85bc5391a55a46c9508727b37da2227b41e',
+    tokenId: '4',
+  },
+  bid: { currency: 'ETH', amount: '1200000000000000000' },
+  returnPath: '/bid/complete',
+});
+
 await superrare.actions.mint({
   target: {
     kind: 'erc721-release',

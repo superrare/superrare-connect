@@ -181,6 +181,45 @@ describe('Connect API client', () => {
     });
   });
 
+  it('parses intent status carrying a scheduled auction bid snapshot', async () => {
+    const fetchImplementation = vi.fn(async (): Promise<Response> => jsonResponse({
+      data: {
+        intentId: 'connect_intent_scheduled_bid',
+        type: 'bid',
+        status: 'completed',
+        returnPath: '/bid/complete',
+        expiresAt: '2026-06-22T00:00:00.000Z',
+        resolvedActionSnapshot: {
+          actionKey: '1-0x1234567890123456789012345678901234567890-123',
+          actionType: 'bid',
+          resolvedAt: '2026-06-21T00:00:00.000Z',
+          targetKind: 'erc721-scheduled-auction',
+          terms: {
+            available: true,
+            amount: '1200000000000000000',
+            currency: 'ETH',
+            marketplace: '0x6D7c44773C52D396F43c2D511B81aa168E9a7a42',
+            seller: '0x0000000000000000000000000000000000000001',
+          },
+        },
+        result: { transactionHash: '0xtransaction' },
+      },
+    }));
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_scheduled_bid',
+    })).resolves.toMatchObject({
+      intentId: 'connect_intent_scheduled_bid',
+      type: 'bid',
+      resolvedActionSnapshot: {
+        targetKind: 'erc721-scheduled-auction',
+        terms: { amount: '1200000000000000000' },
+      },
+    });
+  });
+
   it('gets checkout status', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);

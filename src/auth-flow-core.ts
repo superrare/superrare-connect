@@ -117,6 +117,13 @@ export type ConnectErc721BatchReserveAuctionTarget = {
   tokenId: string;
 };
 
+export type ConnectErc721ScheduledAuctionTarget = {
+  kind: 'erc721-scheduled-auction';
+  chainId: ConnectChainId;
+  contract: ConnectEthereumAddress;
+  tokenId: string;
+};
+
 export type ConnectErc721ReleaseTarget = {
   kind: 'erc721-release';
   chainId: ConnectChainId;
@@ -192,7 +199,8 @@ export type ConnectBuyTarget =
 
 export type ConnectBidTarget =
   | ConnectErc721ReserveAuctionTarget
-  | ConnectErc721BatchReserveAuctionTarget;
+  | ConnectErc721BatchReserveAuctionTarget
+  | ConnectErc721ScheduledAuctionTarget;
 
 export type ConnectMintTarget =
   | ConnectErc721ReleaseTarget
