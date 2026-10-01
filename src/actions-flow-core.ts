@@ -11,6 +11,7 @@ import type {
   ConnectErc721BatchOfferTarget,
   ConnectErc721ReserveAuctionTarget,
   ConnectErc721OfferTarget,
+  ConnectEthereumAddress,
   ConnectExpectedOfferTerms,
   ConnectExpectedPriceTerms,
   ConnectExpectedUnitPriceTerms,
@@ -22,6 +23,8 @@ import type {
   ConnectLiquidEditionSellTerms,
   ConnectLiquidEditionSpendTerms,
   ConnectLiquidEditionTarget,
+  ConnectTransferChainId,
+  ConnectTransferCurrency,
   CreateConnectIntentRequest,
 } from './auth-flow-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
@@ -108,6 +111,13 @@ type Erc721BatchCancelOfferActionParams = ActionParamsBase & {
 
 export type CancelOfferActionParams = Erc721CancelOfferActionParams | Erc721BatchCancelOfferActionParams;
 
+export type TransferActionParams = Omit<ActionParamsBase, 'payment'> & {
+  chainId: ConnectTransferChainId;
+  to: ConnectEthereumAddress;
+  currency: ConnectTransferCurrency;
+  amount: string;
+};
+
 export type BuildConnectBuyIntentRequestInput = BuyActionParams & {
   state: string;
 };
@@ -137,6 +147,10 @@ export type BuildConnectAcceptOfferIntentRequestInput = AcceptOfferActionParams 
 };
 
 export type BuildConnectCancelOfferIntentRequestInput = CancelOfferActionParams & {
+  state: string;
+};
+
+export type BuildConnectTransferIntentRequestInput = TransferActionParams & {
   state: string;
 };
 
@@ -467,6 +481,38 @@ function isErc721BatchCancelOfferIntentRequestInput(
   input: BuildConnectCancelOfferIntentRequestInput,
 ): input is Erc721BatchCancelOfferActionParams & { state: string } {
   return input.target.kind === 'erc721-batch-offer';
+}
+
+export function buildConnectTransferIntentRequest(
+  input: BuildConnectTransferIntentRequestInput,
+): BuildConnectActionIntentRequestResult {
+  const sharedResult = buildSharedActionFields(input);
+  if (!sharedResult.ok) return sharedResult;
+
+  if (!baseUnitAmountPattern.test(input.amount)) {
+    return { ok: false, error: 'invalid_amount' };
+  }
+
+  return {
+    ok: true,
+    request: {
+      action: {
+        type: 'transfer',
+        target: {
+          kind: 'wallet',
+          chainId: input.chainId,
+          address: input.to,
+        },
+        transfer: {
+          currency: input.currency,
+          amount: input.amount,
+        },
+      },
+      returnPath: sharedResult.returnPath,
+      state: input.state,
+      ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+    },
+  };
 }
 
 function buildSharedActionFields(input: {

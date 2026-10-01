@@ -23,6 +23,7 @@ import {
   buildConnectMintIntentRequest,
   buildConnectSellIntentRequest,
   buildConnectSettleIntentRequest,
+  buildConnectTransferIntentRequest,
   type AcceptOfferActionParams,
   type BidActionParams,
   type BuyActionParams,
@@ -32,6 +33,7 @@ import {
   type MintActionParams,
   type SellActionParams,
   type SettleActionParams,
+  type TransferActionParams,
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
@@ -215,6 +217,7 @@ export type SuperRareConnectActionsNamespace = {
   bid: (params: BidActionParams) => Promise<ConnectIntentCreation>;
   mint: (params: MintActionParams) => Promise<ConnectIntentCreation>;
   settle: (params: SettleActionParams) => Promise<ConnectIntentCreation>;
+  transfer: (params: TransferActionParams) => Promise<ConnectIntentCreation>;
   getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
@@ -522,7 +525,8 @@ export function createSuperRareClient(
       | ReturnType<typeof buildConnectMintIntentRequest>
       | ReturnType<typeof buildConnectMakeOfferIntentRequest>
       | ReturnType<typeof buildConnectAcceptOfferIntentRequest>
-      | ReturnType<typeof buildConnectCancelOfferIntentRequest>,
+      | ReturnType<typeof buildConnectCancelOfferIntentRequest>
+      | ReturnType<typeof buildConnectTransferIntentRequest>,
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
       throw requestResult.error === 'invalid_return_path'
@@ -1465,6 +1469,13 @@ export function createSuperRareClient(
       },
       async mint(params): Promise<ConnectIntentCreation> {
         return await startIntent(buildConnectMintIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async transfer(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectTransferIntentRequest({
           ...params,
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),

@@ -48,6 +48,7 @@ export {
   type MintActionParams,
   type SellActionParams,
   type SettleActionParams,
+  type TransferActionParams,
 } from './actions-flow-core.js';
 export {
   type ConnectAcceptOfferTarget,
@@ -87,6 +88,8 @@ export {
   type ConnectMintTarget,
   type ConnectOfferTerms,
   type ConnectPurchaseTerms,
+  type ConnectTransferChainId,
+  type ConnectTransferCurrency,
   type ConnectAuthPendingVerificationError,
   type ConnectAuthPendingVerificationResult,
   type PendingConnectAuth,
