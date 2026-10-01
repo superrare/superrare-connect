@@ -7,6 +7,7 @@ import {
   buildConnectMakeOfferIntentRequest,
   buildConnectMintIntentRequest,
   buildConnectSettleIntentRequest,
+  buildConnectTransferIntentRequest,
 } from '../src/actions-flow-core.js';
 import type {
   ConnectErc721BatchOfferAcceptTarget,
@@ -357,6 +358,85 @@ describe('buildConnectSettleIntentRequest', () => {
           target: reserveAuctionTarget,
         },
         returnPath: '/settle/complete',
+        state: 'state_123',
+      },
+    });
+  });
+});
+
+describe('buildConnectTransferIntentRequest', () => {
+  const recipient = '0x52908400098527886E0F7030069857D2E4169EE7';
+
+  it.each([
+    { chainId: 1, currency: 'ETH', amount: '50000000000000000' },
+    { chainId: 11155111, currency: 'USDC', amount: '25000000' },
+  ] as const)('builds a $currency transfer on chain $chainId', ({ chainId, currency, amount }) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId,
+      to: recipient,
+      currency,
+      amount,
+      returnPath: '/credits/complete',
+      initiatingOrigin: 'https://game.example',
+      state: 'state_123',
+    })).toEqual({
+      ok: true,
+      request: {
+        action: {
+          type: 'transfer',
+          target: { kind: 'wallet', chainId, address: recipient },
+          transfer: { currency, amount },
+        },
+        returnPath: '/credits/complete',
+        state: 'state_123',
+        initiatingOrigin: 'https://game.example',
+      },
+    });
+  });
+
+  it.each(['0', '00', '01', '0.05', '1.5', '-1', '1e18', ' 1', '1 ', ''])('rejects the amount %j', (amount) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      amount,
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_amount' });
+  });
+
+  it.each([
+    'https://evil.example/credits',
+    '//evil.example/credits',
+    '/credits%2f..%2fevil',
+  ])('rejects the unsafe return path %j before validating the amount', (returnPath) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      amount: '0',
+      returnPath,
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_return_path' });
+  });
+
+  it('does not type a payment and never forwards one', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      amount: '50000000000000000',
+      // @ts-expect-error Transfers are wallet-only.
+      payment: { method: 'card' },
+      state: 'state_123',
+    })).toEqual({
+      ok: true,
+      request: {
+        action: {
+          type: 'transfer',
+          target: { kind: 'wallet', chainId: 1, address: recipient },
+          transfer: { currency: 'ETH', amount: '50000000000000000' },
+        },
+        returnPath: '/',
         state: 'state_123',
       },
     });

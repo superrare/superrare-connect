@@ -87,14 +87,14 @@ const getConnectCurrentUserResponseSchema = z.object({
 
 const connectIntentSchema = z.object({
   intentId: z.string().min(1),
-  type: z.enum(['login', 'checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
+  type: z.enum(['login', 'checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle', 'transfer']),
   status: z.enum(['pending', 'requires_user', 'processing', 'completed', 'failed', 'cancelled', 'expired']),
   initiatingOrigin: z.string().optional(),
   returnPath: z.string(),
   expiresAt: z.string().min(1),
   resolvedActionSnapshot: z.object({
     actionKey: z.string(),
-    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
+    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle', 'transfer']),
     resolvedAt: z.string(),
     targetKind: z.enum([
       'erc721-direct-listing',
@@ -108,11 +108,13 @@ const connectIntentSchema = z.object({
       'erc1155-checkout',
       'erc721-offer',
       'erc721-batch-offer',
+      'wallet',
     ]),
     terms: z.object({
       amount: z.string().optional(),
       available: z.boolean(),
       buyer: z.string().optional(),
+      chainId: z.number().optional(),
       currency: z.string().optional(),
       expiry: z.string().optional(),
       marketplace: z.string().optional(),
@@ -121,6 +123,7 @@ const connectIntentSchema = z.object({
       price: z.string().optional(),
       quantity: z.string().optional(),
       quantityAvailable: z.string().optional(),
+      recipient: z.string().optional(),
       seller: z.string().optional(),
       unitPrice: z.string().optional(),
     }),
@@ -150,7 +153,7 @@ const connectCheckoutStatusSchema = z.object({
   expiresAt: z.string().optional(),
   resolvedActionSnapshot: z.object({
     actionKey: z.string(),
-    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle']),
+    actionType: z.enum(['checkout', 'bid', 'buy', 'mint', 'offer', 'offer-accept', 'offer-cancel', 'settle', 'transfer']),
     resolvedAt: z.string(),
     targetKind: z.enum([
       'erc721-direct-listing',
@@ -164,11 +167,13 @@ const connectCheckoutStatusSchema = z.object({
       'erc1155-checkout',
       'erc721-offer',
       'erc721-batch-offer',
+      'wallet',
     ]),
     terms: z.object({
       amount: z.string().optional(),
       available: z.boolean(),
       buyer: z.string().optional(),
+      chainId: z.number().optional(),
       currency: z.string().optional(),
       expiry: z.string().optional(),
       marketplace: z.string().optional(),
@@ -177,6 +182,7 @@ const connectCheckoutStatusSchema = z.object({
       price: z.string().optional(),
       quantity: z.string().optional(),
       quantityAvailable: z.string().optional(),
+      recipient: z.string().optional(),
       seller: z.string().optional(),
       unitPrice: z.string().optional(),
     }),

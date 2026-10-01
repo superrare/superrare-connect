@@ -220,6 +220,70 @@ describe('Connect API client', () => {
     });
   });
 
+  it('parses a completed transfer intent and keeps the recipient and chain id in both status reads', async () => {
+    const transferSnapshot = {
+      actionKey: '11155111-0x52908400098527886E0F7030069857D2E4169EE7-transfer-USDC',
+      actionType: 'transfer',
+      resolvedAt: '2026-10-01T00:00:00.000Z',
+      targetKind: 'wallet',
+      terms: {
+        available: true,
+        amount: '25000000',
+        chainId: 11155111,
+        currency: 'USDC',
+        recipient: '0x52908400098527886E0F7030069857D2E4169EE7',
+      },
+    };
+    const transactionHash = '0x9b1f0c4f0a5d4a3c2a1b0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b';
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.url.includes('/v1/connect/checkout/')) {
+        return jsonResponse({
+          data: {
+            sessionId: 'connect_checkout_session_transfer',
+            status: 'completed',
+            intentId: 'connect_intent_transfer',
+            resolvedActionSnapshot: transferSnapshot,
+            transactionHash,
+          },
+        });
+      }
+
+      return jsonResponse({
+        data: {
+          intentId: 'connect_intent_transfer',
+          type: 'transfer',
+          status: 'completed',
+          returnPath: '/credits/complete',
+          expiresAt: '2026-10-01T00:15:00.000Z',
+          resolvedActionSnapshot: transferSnapshot,
+          result: { transactionHash },
+        },
+      });
+    });
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_transfer',
+    })).resolves.toEqual({
+      intentId: 'connect_intent_transfer',
+      type: 'transfer',
+      status: 'completed',
+      returnPath: '/credits/complete',
+      expiresAt: '2026-10-01T00:15:00.000Z',
+      resolvedActionSnapshot: transferSnapshot,
+      result: { transactionHash },
+    });
+    await expect(getConnectCheckoutStatus({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      sessionId: 'connect_checkout_session_transfer',
+    })).resolves.toMatchObject({
+      resolvedActionSnapshot: transferSnapshot,
+    });
+  });
+
   it('gets checkout status', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);

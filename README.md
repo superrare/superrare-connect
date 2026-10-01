@@ -2,7 +2,7 @@
 
 Public browser SDK for starting SuperRare-hosted Connect flows from external websites.
 
-SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, open them in their own window, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, and status flows do not require an authenticated Connect session.
+SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, wallet-to-wallet transfers, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, open them in their own window, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, transfer, and status flows do not require an authenticated Connect session.
 
 ## Install
 
@@ -187,7 +187,7 @@ The SDK never accepts arbitrary calldata, contract instructions, private keys, A
 
 ## Payment Methods
 
-Every action accepts an optional `payment` hint. Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
+Every action except `transfer` accepts an optional `payment` hint (transfers are wallet-only; see [Transfers](#transfers)). Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
 
 **Wallet-only is required when the sale settles on a custom contract whose mint or transfer logic depends on the receiving wallet** — for example a mint that binds a pre-registered artwork to the collector's address. Card settlement executes through a SuperRare buy-proxy that receives the asset itself and re-transfers it to the buyer, so the on-chain receiver is the proxy, not the buyer; such sales revert only after the card was charged. If your contract keys anything on the `mintTo` / transfer receiver, always create its intents wallet-only:
 
@@ -224,6 +224,77 @@ await superrare.actions.settle({
 
 Intent creation fails when the auction has not ended, has no winning bid, or was already settled.
 
+## Transfers
+
+`actions.transfer` asks the user to send an exact amount of ETH or USDC from their wallet to a wallet you name, for example to pay for off-chain goods such as game credits. The user signs in and confirms in the hosted window, which shows the amount, the network, and the full destination address before anything is sent.
+
+```ts
+const intent = await superrare.actions.transfer({
+  chainId: 1,
+  to: '0x52908400098527886E0F7030069857D2E4169EE7',
+  currency: 'USDC',
+  amount: '25000000', // 25 USDC
+  returnPath: '/credits/complete',
+});
+
+// Tie the intent to the order before the user can finish paying.
+await fetch('/api/orders/order_123/transfer-intent', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ intentId: intent.intentId }),
+});
+```
+
+- Chains: Ethereum mainnet (`chainId: 1`) and Sepolia (`11155111`). Production accepts mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia), which accepts both.
+- Currencies: `ETH` and `USDC`.
+- `amount` is a raw base-unit string, like bid and offer amounts: wei for ETH (`'50000000000000000'` is 0.05 ETH) and 6 decimals for USDC (`'25000000'` is 25 USDC). The SDK rejects decimals, zero, and leading zeros with `ConnectActionValidationError` (`code: 'invalid_amount'`) before any window opens.
+- Wallet-only: there is no `payment` option and the hosted window never offers card. The user pays from the wallet they sign in with, and the hosted window keeps the confirm button disabled while that wallet cannot cover the amount.
+- Rare API rejects the call with `SuperRareConnectApiError` (`status` 400) for a chain its deployment does not accept (any chain but mainnet in production), an invalid or zero address as `to`, an unknown currency, or a card payment or `payment.recipient` sent to the API directly.
+
+### Verifying a transfer before crediting
+
+The user controls the page, so nothing it reports proves a payment: not the `actions.transfer` result, not `onIntentSettled`, and never an amount or chain sent from the page. Grant goods only from your backend, based on the intent it reads itself:
+
+1. The page calls `actions.transfer` and sends the returned `intentId` to your backend, as in the example above. The backend records it against the pending order: player, product, and the expected `recipient`, `amount`, `currency`, and `chainId`. Always create the intent from the page: SDK actions need a page, and the SDK cannot open an intent it did not create.
+2. Treat `onIntentSettled` only as a hint to check. The backend reads the intent itself with `GET /v1/connect/intents/:intentId`, or with `intents.get` server-side.
+3. Credit only when all of these hold:
+   - `status === 'completed'`. A `processing` intent can already carry an unverified `result.transactionHash`; never credit it.
+   - `resolvedActionSnapshot.actionType === 'transfer'`.
+   - The terms `chainId`, `recipient`, `amount`, and `currency` equal the order's. `recipient` comes back checksummed, so compare addresses case-insensitively. A Sepolia transfer must never credit a mainnet order.
+   - The `intentId` was not credited before, for example with a unique constraint on the column that stores credited intent ids. `isTransferPaid` below checks everything else.
+
+```ts
+import { createSuperRareClient } from '@rareprotocol/connect';
+
+const superrare = createSuperRareClient({ sessionStorage: false });
+
+type TransferOrder = {
+  intentId: string;
+  chainId: 1 | 11155111;
+  recipient: string;
+  currency: 'ETH' | 'USDC';
+  amount: string;
+};
+
+async function isTransferPaid(order: TransferOrder): Promise<boolean> {
+  const intent = await superrare.intents.get({ intentId: order.intentId });
+  const snapshot = intent.resolvedActionSnapshot;
+
+  return (
+    intent.status === 'completed' &&
+    snapshot?.actionType === 'transfer' &&
+    snapshot.terms.chainId === order.chainId &&
+    snapshot.terms.recipient?.toLowerCase() === order.recipient.toLowerCase() &&
+    snapshot.terms.amount === order.amount &&
+    snapshot.terms.currency === order.currency
+  );
+}
+```
+
+A `completed` transfer means SuperRare verified on-chain that the wallet signed in to the hosted window at confirmation paid exactly `amount` of `currency` to `recipient` on `chainId`, in a transaction mined after the intent was created. One transaction completes at most one intent.
+
+If the intent is still `processing` when your backend reads it and it already carries `result.transactionHash` (the player closed the window, or confirmation took longer than usual), keep reading it: each read lets SuperRare re-verify the payment on-chain and complete the intent. Such a transfer stays readable for 24 hours after the intent's `expiresAt`, and a `completed` transfer is kept for the same 24 hours, so read and record it within that window. A transfer whose hash was not recorded before the intent expired is not completed automatically: the wallet approved it after the intent expired, the player closed the window before approving, or the player sped it up in their wallet after the window stopped watching.
+
 ## Intent Status
 
 ```ts
@@ -240,7 +311,7 @@ const outcome = resolveConnectIntentOutcome(intent);
 
 ## Optional Auth Flow
 
-Auth is available for integrations that need a Connect session or `user.me()`. It is not required for checkout, buy, bid, mint, or intent status.
+Auth is available for integrations that need a Connect session or `user.me()`. It is not required for checkout, buy, bid, mint, transfer, or intent status.
 
 `auth.login()` runs the login in a small centered window: the user authenticates on SuperRare Connect, the window closes itself, and the promise resolves with the session — including the authenticated wallet address — plus the signed-in user's profile. Your page never navigates away.
 
@@ -353,7 +424,7 @@ The dev environment resolves and executes both mainnet (`1`) and Sepolia (`11155
 
 ## Hosted Windows
 
-Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
+Every hosted flow — checkout, buy, bid, mint, settle, transfer, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
 
 ```ts
 const superrare = createSuperRareClient({
@@ -395,6 +466,7 @@ const result = normalizeReturnPath('/account');
 The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
+- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount` (a transfer amount that is not a positive base-unit integer).
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.
