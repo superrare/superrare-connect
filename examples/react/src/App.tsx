@@ -248,7 +248,16 @@ export function App(): JSX.Element {
         >
           Log in with SuperRare
         </button>
-        <button type="button" onClick={() => client.auth.logout()}>
+        <button
+          type="button"
+          onClick={() => {
+            client.auth.logout().then(() => {
+              setMessage('Logged out');
+            }).catch((error: unknown) => {
+              setMessage(formatError(error));
+            });
+          }}
+        >
           Log out
         </button>
       </section>

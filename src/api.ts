@@ -2,8 +2,15 @@ import { z } from 'zod';
 import type { CreateConnectIntentRequest, CreateConnectLoginIntentRequest } from './auth-flow-core.js';
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import { SuperRareConnectApiError } from './errors.js';
-import { connectSessionSchema, type ConnectSession } from './session-storage-core.js';
+import {
+  connectAuthCredentialsSchema,
+  connectSessionSchema,
+  type ConnectAuthCredentials,
+  type ConnectSession,
+} from './session-storage-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
+
+export type { ConnectAuthCredentials } from './session-storage-core.js';
 
 export type ConnectAuthApiOptions = {
   apiUrl?: string;
@@ -13,6 +20,8 @@ export type ConnectAuthApiOptions = {
 const DEFAULT_RARE_API_URL = 'https://api.superrare.com';
 const connectIntentsPath = '/v1/connect/intents';
 const connectAuthExchangePath = '/v1/connect/auth/exchange';
+const connectAuthRefreshPath = '/v1/connect/auth/refresh';
+const connectAuthLogoutPath = '/v1/connect/auth/logout';
 const connectAuthClaimPath = '/v1/connect/auth/claim';
 const connectSessionPath = '/v1/connect/session';
 const connectCurrentUserPath = '/v1/connect/users/me';
@@ -36,8 +45,16 @@ export type ConnectCurrentUser = {
 };
 
 const exchangeConnectAuthResponseSchema = z.object({
+  data: connectAuthCredentialsSchema,
+});
+
+const refreshConnectAuthResponseSchema = z.object({
+  data: connectAuthCredentialsSchema,
+});
+
+const logoutConnectAuthResponseSchema = z.object({
   data: z.object({
-    session: connectSessionSchema,
+    revoked: z.literal(true),
   }),
 });
 
@@ -242,7 +259,7 @@ export async function getConnectIntent(input: {
 export async function exchangeConnectAuthCode(
   params: ConnectAuthCallbackParams,
   options: ConnectAuthApiOptions & { signal?: AbortSignal } = {},
-): Promise<ConnectSession> {
+): Promise<ConnectAuthCredentials> {
   const body = await requestConnectApiJson({
     path: connectAuthExchangePath,
     method: 'POST',
@@ -256,7 +273,45 @@ export async function exchangeConnectAuthCode(
     throw new Error('Invalid Connect auth exchange response.');
   }
 
-  return parsedResponse.data.data.session;
+  return parsedResponse.data.data;
+}
+
+export async function refreshConnectAuthSession(
+  refreshToken: string,
+  options: ConnectAuthApiOptions & { signal?: AbortSignal } = {},
+): Promise<ConnectAuthCredentials> {
+  const body = await requestConnectApiJson({
+    path: connectAuthRefreshPath,
+    method: 'POST',
+    apiUrl: options.apiUrl,
+    fetch: options.fetch,
+    body: { refreshToken },
+    signal: options.signal,
+  });
+  const parsedResponse = refreshConnectAuthResponseSchema.safeParse(body);
+  if (!parsedResponse.success) {
+    throw new Error('Invalid Connect auth refresh response.');
+  }
+
+  return parsedResponse.data.data;
+}
+
+export async function revokeConnectAuthSession(
+  refreshToken: string,
+  options: ConnectAuthApiOptions & { signal?: AbortSignal } = {},
+): Promise<void> {
+  const body = await requestConnectApiJson({
+    path: connectAuthLogoutPath,
+    method: 'POST',
+    apiUrl: options.apiUrl,
+    fetch: options.fetch,
+    body: { refreshToken },
+    signal: options.signal,
+  });
+  const parsedResponse = logoutConnectAuthResponseSchema.safeParse(body);
+  if (!parsedResponse.success) {
+    throw new Error('Invalid Connect auth logout response.');
+  }
 }
 
 /**

@@ -15,6 +15,7 @@ import type { SuperRareConnectApiError } from '../src/errors.js';
 import type { ConnectIntent } from '../src/status-core.js';
 import type { ConnectPopupWindow } from '../src/popup-core.js';
 import type { ConnectSessionStorage } from '../src/session-storage-core.js';
+import type { ConnectAuthCredentials } from '../src/api.js';
 
 const directListingTarget: ConnectErc721DirectListingTarget = {
   kind: 'erc721-direct-listing',
@@ -68,6 +69,17 @@ const batchOfferTarget: ConnectErc721BatchOfferTarget = {
 // Relative to the clock so tests never expire an intent on a fixed future
 // date (the deadline logic compares expiresAt against Date.now()).
 const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
+const credentialStorageKey = 'superrare.connect.session:https%3A%2F%2Frare-api.test';
+const storedCredentials = (): ConnectAuthCredentials => ({
+  session: {
+    sessionId: 'connect_session_123',
+    userId: 'user_123',
+    address: '0x0000000000000000000000000000000000000001',
+    expiresAt: futureExpiry(),
+  },
+  refreshToken: 'connect_refresh_stored',
+  refreshExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString(),
+});
 
 type EmittedMessage = { origin: string; data: unknown };
 
@@ -136,8 +148,10 @@ const sessionResponse = (): Response => jsonResponse({
       sessionId: 'connect_session_login',
       userId: 'user_login',
       address: '0x0000000000000000000000000000000000000009',
-      expiresAt: '2027-01-01T00:00:00.000Z',
+      expiresAt: futureExpiry(),
     },
+    refreshToken: 'connect_refresh_login',
+    refreshExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString(),
   },
 });
 
@@ -221,6 +235,7 @@ function createLoginTestClient(overrides: {
     fetch: overrides.fetch ?? (async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+      if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
       if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
       if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
       return loginIntentCreationResponse();
@@ -249,20 +264,16 @@ function completedIntentStatusResponse(request: Request): Response {
 describe('createSuperRareClient', () => {
   it('clears stored Connect sessions', async () => {
     const storage = createMemoryStorage();
-    storage.setItem('superrare.connect.session', JSON.stringify({
-      sessionId: 'connect_session_123',
-      userId: 'user_123',
-      address: '0x0000000000000000000000000000000000000001',
-      expiresAt: '2026-06-22T00:00:00.000Z',
-    }));
+    storage.setItem(credentialStorageKey, JSON.stringify(storedCredentials()));
     const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
       sessionStorage: storage,
     });
 
     client.auth.clearSession();
 
     expect(client.auth.getSession()).toBeUndefined();
-    expect(storage.getItem('superrare.connect.session')).toBeNull();
+    expect(storage.getItem(credentialStorageKey)).toBeNull();
   });
 
   it('notifies auth listeners when sessions change and unsubscribe stops future calls', async () => {
@@ -283,6 +294,7 @@ describe('createSuperRareClient', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
         return loginIntentCreationResponse();
       },
@@ -301,7 +313,7 @@ describe('createSuperRareClient', () => {
     };
 
     await completeLogin();
-    client.auth.logout();
+    await client.auth.logout();
     unsubscribe();
     await completeLogin();
 
@@ -312,31 +324,28 @@ describe('createSuperRareClient', () => {
     ]);
   });
 
-  it('aliases logout to local session clearing', async () => {
+  it('clears the local session and revokes the persisted refresh credential on logout', async () => {
     const storage = createMemoryStorage();
-    storage.setItem('superrare.connect.session', JSON.stringify({
-      sessionId: 'connect_session_123',
-      userId: 'user_123',
-      address: '0x0000000000000000000000000000000000000001',
-      expiresAt: '2026-06-22T00:00:00.000Z',
-    }));
+    storage.setItem(credentialStorageKey, JSON.stringify(storedCredentials()));
     const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        expect(request.url).toBe('https://rare-api.test/v1/connect/auth/logout');
+        expect(await request.json()).toEqual({ refreshToken: 'connect_refresh_stored' });
+        return jsonResponse({ data: { revoked: true } });
+      },
       sessionStorage: storage,
     });
 
-    client.auth.logout();
+    await client.auth.logout();
 
     expect(client.auth.getSession()).toBeUndefined();
   });
 
   it('gets remote session state with the stored local session', async () => {
     const storage = createMemoryStorage();
-    storage.setItem('superrare.connect.session', JSON.stringify({
-      sessionId: 'connect_session_123',
-      userId: 'user_123',
-      address: '0x0000000000000000000000000000000000000001',
-      expiresAt: '2026-06-22T00:00:00.000Z',
-    }));
+    storage.setItem(credentialStorageKey, JSON.stringify(storedCredentials()));
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
       fetch: async (input, init) => {
@@ -352,7 +361,7 @@ describe('createSuperRareClient', () => {
               sessionId: 'connect_session_123',
               userId: 'user_123',
               address: '0x0000000000000000000000000000000000000001',
-              expiresAt: '2026-06-22T00:00:00.000Z',
+              expiresAt: futureExpiry(),
             },
           },
         });
@@ -367,12 +376,7 @@ describe('createSuperRareClient', () => {
 
   it('gets current user with the stored local session', async () => {
     const storage = createMemoryStorage();
-    storage.setItem('superrare.connect.session', JSON.stringify({
-      sessionId: 'connect_session_123',
-      userId: 'user_123',
-      address: '0x0000000000000000000000000000000000000001',
-      expiresAt: '2026-06-22T00:00:00.000Z',
-    }));
+    storage.setItem(credentialStorageKey, JSON.stringify(storedCredentials()));
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
       fetch: async (input, init) => {
@@ -403,12 +407,7 @@ describe('createSuperRareClient', () => {
 
   it('exposes user.me as the public user namespace', async () => {
     const storage = createMemoryStorage();
-    storage.setItem('superrare.connect.session', JSON.stringify({
-      sessionId: 'connect_session_123',
-      userId: 'user_123',
-      address: '0x0000000000000000000000000000000000000001',
-      expiresAt: '2026-06-22T00:00:00.000Z',
-    }));
+    storage.setItem(credentialStorageKey, JSON.stringify(storedCredentials()));
     const client = createSuperRareClient({
       apiUrl: 'https://rare-api.test',
       fetch: async () => jsonResponse({
@@ -1561,6 +1560,7 @@ describe('auth.login claims a result the posted callback never delivered', () =>
           return claimIssuedResponse();
         }
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) {
           return jsonResponse({ error: 'nope' }, { status: 500 });
         }
@@ -1698,6 +1698,7 @@ describe('auth.prepareLogin', () => {
         const request = input instanceof Request ? input : new Request(input, init);
         requestedPaths.push(new URL(request.url).pathname);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/auth/claim')) return claimNotCompletedResponse();
         if (request.url.endsWith('/v1/connect/users/me')) {
           return jsonResponse({ error: 'nope' }, { status: 500 });
@@ -1769,6 +1770,7 @@ describe('auth.prepareLogin', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) {
           return jsonResponse({ error: 'nope' }, { status: 500 });
         }
@@ -1798,7 +1800,7 @@ describe('auth.prepareLogin', () => {
     const { client, emitter, opened } = createLoginTestClient();
 
     await client.auth.prepareLogin();
-    client.auth.logout();
+    await client.auth.logout();
     const resultPromise = client.auth.login();
     await vi.waitFor(() => {
       expect(opened[0]?.popup.replacedUrls).toHaveLength(1);
@@ -1831,16 +1833,7 @@ describe('auth.login', () => {
             state: 'state_login',
             code: 'connect_auth_code_login',
           });
-          return jsonResponse({
-            data: {
-              session: {
-                sessionId: 'connect_session_login',
-                userId: 'user_login',
-                address: '0x0000000000000000000000000000000000000009',
-                expiresAt: '2027-01-01T00:00:00.000Z',
-              },
-            },
-          });
+          return sessionResponse();
         }
 
         if (request.url.endsWith('/v1/connect/users/me')) {
@@ -1921,16 +1914,7 @@ describe('auth.login', () => {
         const request = input instanceof Request ? input : new Request(input, init);
 
         if (request.url.endsWith('/v1/connect/auth/exchange')) {
-          return jsonResponse({
-            data: {
-              session: {
-                sessionId: 'connect_session_login',
-                userId: 'user_login',
-                address: '0x0000000000000000000000000000000000000009',
-                expiresAt: '2027-01-01T00:00:00.000Z',
-              },
-            },
-          });
+          return sessionResponse();
         }
 
         if (request.url.endsWith('/v1/connect/users/me')) {
@@ -2129,6 +2113,7 @@ describe('auth.login', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
         return loginIntentCreationResponse();
       },
@@ -2145,6 +2130,7 @@ describe('auth.login', () => {
       status: 'authenticated',
       session: { sessionId: 'connect_session_login' },
     });
+    expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
   });
 
   it('joins the login already in flight instead of starting a second one', async () => {
@@ -2167,6 +2153,7 @@ describe('auth.login', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
         intentRequests += 1;
         return loginIntentCreationResponse();
@@ -2281,6 +2268,7 @@ describe('auth.login', () => {
         const request = input instanceof Request ? input : new Request(input, init);
         signalsByPath.set(new URL(request.url).pathname, init?.signal);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) {
           return jsonResponse({
             data: {
@@ -2409,7 +2397,7 @@ describe('auth.login', () => {
     });
 
     // The user logs out while the exchange is still pending.
-    client.auth.logout();
+    await client.auth.logout();
     releaseExchange?.();
 
     await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
@@ -2463,7 +2451,7 @@ describe('auth.login', () => {
     });
 
     // A clears its own session — moving A's generation, not B's.
-    clientA.auth.logout();
+    await clientA.auth.logout();
 
     // B's exchange finally resolves: it must still commit B's session.
     releaseExchangeB?.();
@@ -2496,6 +2484,7 @@ describe('auth.login', () => {
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+          if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
           if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
           return loginIntentCreationResponse();
         },
@@ -2538,6 +2527,7 @@ describe('auth.login', () => {
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+          if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
           if (request.url.endsWith('/v1/connect/users/me')) {
             await new Promise<void>((resolve) => {
               releaseProfile = resolve;
@@ -2607,6 +2597,7 @@ describe('auth.login', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'nope' }, { status: 500 });
         return loginIntentCreationResponse();
       },
@@ -2706,6 +2697,7 @@ describe('auth.login', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         return loginIntentCreationResponse();
       },
       sessionStorage: createMemoryStorage(),
@@ -2715,7 +2707,7 @@ describe('auth.login', () => {
     await vi.waitFor(() => {
       expect(popup.replacedUrls).toHaveLength(1);
     });
-    client.auth.logout();
+    await client.auth.logout();
     emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
 
     await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
@@ -2736,6 +2728,7 @@ describe('auth.login', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.url.endsWith('/v1/connect/auth/exchange')) return sessionResponse();
+        if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
         if (request.url.endsWith('/v1/connect/users/me')) {
           await new Promise<void>((resolve) => {
             releaseProfile = resolve;
@@ -2764,7 +2757,7 @@ describe('auth.login', () => {
     });
 
     // The session was committed before the profile lookup; logout now.
-    client.auth.logout();
+    await client.auth.logout();
     releaseProfile?.();
 
     await expect(resultPromise).resolves.toMatchObject({ status: 'authenticated' });
@@ -2858,7 +2851,7 @@ describe('auth.login', () => {
     await vi.waitFor(() => {
       expect(releaseIntent).toBeDefined();
     });
-    client.auth.logout();
+    await client.auth.logout();
     releaseIntent?.();
 
     await expect(resultPromise).resolves.toEqual({ status: 'cancelled' });
