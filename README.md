@@ -309,11 +309,74 @@ const unsubscribe = superrare.auth.onChange((nextSession) => {
   // Update app state.
 });
 
-superrare.auth.logout();
+await superrare.auth.logout();
 unsubscribe();
 ```
 
-`user.me()` requires a stored Connect session and throws `ConnectSessionRequiredError` when no local session exists.
+`getSession()` is a synchronous, cached local snapshot for UI state. It is not
+server verification and may contain an expired access token. Login results and
+session-change callbacks contain access-session identity only, never refresh
+credentials.
+
+### Authenticated Calls To Your Backend
+
+Ask the SDK for an access token immediately before an authenticated request:
+
+```ts
+const token = await superrare.auth.getAccessToken();
+const response = await fetch('/api/game/score', {
+  method: 'POST',
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ score }),
+});
+```
+
+Your backend verifies the token with Rare API's `GET /v1/connect/session` and
+uses the returned identity. A browser-supplied score still needs game-specific
+validation; authentication alone does not authorize transfers.
+
+`getAccessToken()`, `auth.getRemoteSession()`, `auth.me()`, and `user.me()`
+automatically renew access when it expires or has at most 60 seconds remaining.
+Renewal happens on demand, not through background timers. Access lasts up to
+one hour; the refresh session has a fixed 30-day maximum from login. Callers do
+not manually manage refresh credentials. `getAccessToken()` and `me()` throw
+`ConnectSessionRequiredError` when there is no usable local session.
+
+Deploy the refresh-capable Rare API before upgrading this SDK: login exchange
+must return both access and refresh credentials, and refresh/logout endpoints
+must be available. Access-only exchange responses are rejected.
+
+The SDK persists credentials in browser local storage by default, restoring
+them across page loads. `sessionStorage: false` or blocked storage uses memory
+only; a page reload then requires login again. Storage is scoped to the app
+origin and Rare API environment. The production API uses
+`superrare.connect.session`; other API origins append `:` plus the
+URL-encoded API origin. `sessionStorageKey` replaces the base key. Old
+access-only storage records cannot renew and require a new login.
+
+Clients sharing the same storage object and key coordinate one renewal.
+Browsers with Web Locks also coordinate across tabs and re-read credentials
+inside the lock. Without Web Locks, separate tabs can race a single-use refresh
+credential, so an affected tab may need to sign in again.
+
+A refresh HTTP 401 clears the matching local session. Network errors and HTTP
+503 propagate without treating an outage as logout. Refresh requests are not
+automatically replayed: a lost response may have consumed the credential.
+
+`await auth.logout()` revokes the current refresh session and all its access
+tokens on Rare API. Local identity disappears immediately; persisted deletion
+may wait for an in-flight renewal or browser lock so logout can revoke the
+replacement credential. Revocation failures are reported to the caller.
+`auth.clearSession()` only clears local state and does not revoke server
+credentials. Neither method signs out the separate hosted Connect login cookie.
+
+Refresh credentials are private SDK state and are sent only to Rare API, never
+to your game backend. Browser persistence remains accessible to JavaScript:
+protect the app against XSS and never log stored credentials or put them in URLs.
+Use HTTPS outside local development.
 
 ## Options
 

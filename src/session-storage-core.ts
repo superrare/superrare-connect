@@ -4,10 +4,18 @@ export const connectSessionSchema = z.object({
   sessionId: z.string().min(1),
   userId: z.string().min(1),
   address: z.string().min(1),
-  expiresAt: z.string().min(1),
+  expiresAt: z.string().datetime(),
 });
 
 export type ConnectSession = z.infer<typeof connectSessionSchema>;
+
+export const connectAuthCredentialsSchema = z.object({
+  session: connectSessionSchema,
+  refreshToken: z.string().min(1).max(512),
+  refreshExpiresAt: z.string().datetime(),
+});
+
+export type ConnectAuthCredentials = z.infer<typeof connectAuthCredentialsSchema>;
 
 export type ConnectSessionStorage = {
   getItem: (key: string) => string | null;
@@ -15,32 +23,34 @@ export type ConnectSessionStorage = {
   removeItem: (key: string) => void;
 };
 
-export function serializeConnectSession(session: ConnectSession): string {
-  return JSON.stringify(session);
+export function serializeConnectCredentials(credentials: ConnectAuthCredentials): string {
+  return JSON.stringify(credentials);
 }
 
-export function parseStoredConnectSession(serializedSession: string): ConnectSession | undefined {
-  const parsedSession = parseJson(serializedSession);
-  const result = connectSessionSchema.safeParse(parsedSession);
+export function parseStoredConnectCredentials(
+  serializedCredentials: string,
+): ConnectAuthCredentials | undefined {
+  const parsedCredentials = parseJson(serializedCredentials);
+  const result = connectAuthCredentialsSchema.safeParse(parsedCredentials);
   return result.success ? result.data : undefined;
 }
 
-export function readConnectSessionFromStorage(
+export function readConnectCredentialsFromStorage(
   storage: ConnectSessionStorage | undefined,
   storageKey: string,
-): ConnectSession | undefined {
-  const serializedSession = storage?.getItem(storageKey);
-  return serializedSession === null || serializedSession === undefined
+): ConnectAuthCredentials | undefined {
+  const serializedCredentials = storage?.getItem(storageKey);
+  return serializedCredentials === null || serializedCredentials === undefined
     ? undefined
-    : parseStoredConnectSession(serializedSession);
+    : parseStoredConnectCredentials(serializedCredentials);
 }
 
-export function writeConnectSessionToStorage(
+export function writeConnectCredentialsToStorage(
   storage: ConnectSessionStorage | undefined,
   storageKey: string,
-  session: ConnectSession,
+  credentials: ConnectAuthCredentials,
 ): void {
-  storage?.setItem(storageKey, serializeConnectSession(session));
+  storage?.setItem(storageKey, serializeConnectCredentials(credentials));
 }
 
 export function removeConnectSessionFromStorage(
