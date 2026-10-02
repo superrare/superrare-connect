@@ -6,18 +6,19 @@ import {
 } from './api.js';
 import { SuperRareConnectApiError } from './errors.js';
 import {
-  readConnectCredentialsFromStorage,
+  parseStoredConnectCredentialRecord,
   removeConnectSessionFromStorage,
-  parseStoredConnectCredentials,
   serializeConnectCredentials,
   type ConnectSession,
   type ConnectSessionStorage,
+  type ConnectStoredAuthCredentials,
 } from './session-storage-core.js';
 
 type SessionListener = (session: ConnectSession | undefined) => void;
 type CredentialSlot = {
   credentials: ConnectAuthCredentials | undefined;
   serializedCredentials: string | null | undefined;
+  lineageId: string | undefined;
   generation: number;
   replacementGeneration: number;
   logoutGeneration: number | undefined;
@@ -34,7 +35,7 @@ export type ConnectSessionLifecycle = {
   getReplacementGeneration: () => number;
   getSession: () => ConnectSession | undefined;
   getCurrentSession: () => Promise<ConnectSession | undefined>;
-  commit: (credentials: ConnectAuthCredentials) => void;
+  commit: (credentials: ConnectAuthCredentials, shouldCommit: () => boolean) => Promise<boolean>;
   clear: () => void;
   logout: () => Promise<void>;
   onChange: (listener: SessionListener) => () => void;
@@ -58,23 +59,27 @@ export function createConnectSessionLifecycle(input: {
   const read = (): ConnectAuthCredentials | undefined => {
     if (slot.logoutGeneration !== undefined) return undefined;
     if (!slot.persistenceEnabled || input.storage === undefined) return slot.credentials;
-    let stored: ConnectAuthCredentials | undefined;
+    let storedRecord: ConnectStoredAuthCredentials | undefined;
     try {
       const serialized = input.storage.getItem(input.storageKey);
       if (serialized === slot.serializedCredentials) return slot.credentials;
       slot.serializedCredentials = serialized;
-      stored = serialized === null ? undefined : parseStoredConnectCredentials(serialized);
+      storedRecord = serialized === null ? undefined : parseStoredConnectCredentialRecord(serialized);
     } catch {
       // Blocked storage is an in-memory mode, not a failed authentication.
       slot.persistenceEnabled = false;
       return slot.credentials;
     }
-    if (!sameCredentials(slot.credentials, stored)) {
+    const stored = storedRecord?.credentials;
+    const lineageId = storedRecord?.lineageId;
+    if (!sameCredentials(slot.credentials, stored) || slot.lineageId !== lineageId) {
       if (
+        slot.lineageId !== lineageId ||
         slot.credentials?.session.userId !== stored?.session.userId ||
         slot.credentials?.session.address !== stored?.session.address
       ) slot.replacementGeneration += 1;
       slot.credentials = stored;
+      slot.lineageId = lineageId;
       slot.generation += 1;
     }
     return slot.credentials;
@@ -86,7 +91,10 @@ export function createConnectSessionLifecycle(input: {
         removeConnectSessionFromStorage(input.storage, input.storageKey);
         slot.serializedCredentials = null;
       } else {
-        const serialized = serializeConnectCredentials(credentials);
+        const serialized = serializeConnectCredentials(
+          credentials,
+          slot.lineageId ?? credentials.session.sessionId,
+        );
         input.storage.setItem(input.storageKey, serialized);
         slot.serializedCredentials = serialized;
       }
@@ -94,19 +102,34 @@ export function createConnectSessionLifecycle(input: {
       slot.persistenceEnabled = false;
     }
   };
-  const commit = (credentials: ConnectAuthCredentials, replacement = true): void => {
+  const applyCredentials = (credentials: ConnectAuthCredentials, replacement: boolean): void => {
     slot.generation += 1;
-    if (replacement) slot.replacementGeneration += 1;
+    if (replacement) {
+      slot.replacementGeneration += 1;
+      slot.lineageId = credentials.session.sessionId;
+    } else {
+      slot.lineageId ??= credentials.session.sessionId;
+    }
     slot.logoutGeneration = undefined;
     slot.credentials = credentials;
     persist(credentials);
     notify();
   };
+  const commit = async (
+    credentials: ConnectAuthCredentials,
+    shouldCommit: () => boolean,
+  ): Promise<boolean> => await withCredentialLock(input.storageKey, async () => {
+    read();
+    if (!shouldCommit()) return false;
+    applyCredentials(credentials, true);
+    return true;
+  });
   const clear = (): void => {
     slot.generation += 1;
     slot.replacementGeneration += 1;
     slot.logoutGeneration = undefined;
     slot.credentials = undefined;
+    slot.lineageId = undefined;
     persist(undefined);
     notify();
   };
@@ -124,7 +147,9 @@ export function createConnectSessionLifecycle(input: {
       try {
         const renewed = await refreshConnectAuthSession(credentials.refreshToken, input.apiOptions);
         const current = read();
-        if (slot.generation === generation && sameCredentials(current, credentials)) commit(renewed, false);
+        if (slot.generation === generation && sameCredentials(current, credentials)) {
+          applyCredentials(renewed, false);
+        }
         // Return the winner even after a local clear: logout must revoke the
         // rotated token, not the consumed token that started this request.
         return renewed;
@@ -156,32 +181,49 @@ export function createConnectSessionLifecycle(input: {
   };
   const logout = async (): Promise<void> => {
     const credentials = read();
+    const lineageId = slot.lineageId;
     const pending = slot.refresh;
     slot.generation += 1;
     slot.replacementGeneration += 1;
     const logoutGeneration = slot.generation;
     slot.logoutGeneration = logoutGeneration;
     slot.credentials = undefined;
-    notify();
+    let notificationFailed = false;
+    let notificationError: unknown;
+    try {
+      notify();
+    } catch (error) {
+      notificationFailed = true;
+      notificationError = error;
+    }
     const winner = pending === undefined ? undefined : await pending.catch(() => undefined);
     await withCredentialLock(input.storageKey, async () => {
-      // Leave persistence intact while waiting for another tab's renewal
-      // lock, then read its winner before removing credentials. This realm's
-      // snapshot is already hidden, so no local consumer can restore it.
+      // Keep storage intact while waiting so the lock holder can rotate the
+      // captured lineage; a different lineage belongs to a newer login.
       const stillCleared = slot.logoutGeneration === logoutGeneration;
-      let stored: ConnectAuthCredentials | undefined;
+      let storedRecord: ConnectStoredAuthCredentials | undefined;
       if (stillCleared && slot.persistenceEnabled && input.storage !== undefined) {
         try {
-          stored = readConnectCredentialsFromStorage(input.storage, input.storageKey);
+          const serialized = input.storage.getItem(input.storageKey);
+          storedRecord = serialized === null ? undefined : parseStoredConnectCredentialRecord(serialized);
         } catch {
           slot.persistenceEnabled = false;
         }
       }
-      const rotated = stored !== undefined && stored.refreshToken !== credentials?.refreshToken
-        ? stored : winner;
-      const token = rotated?.refreshToken ?? credentials?.refreshToken;
+      const stored = storedRecord?.credentials;
+      const storedIsLogoutLineage = lineageId !== undefined && storedRecord?.lineageId === lineageId;
+      const storedTokenIsRotated = storedIsLogoutLineage &&
+        stored?.refreshToken !== credentials?.refreshToken;
+      const token = storedTokenIsRotated
+        ? stored?.refreshToken
+        : winner?.refreshToken ?? credentials?.refreshToken;
       if (stillCleared) {
-        persist(undefined);
+        if (storedRecord === undefined || storedIsLogoutLineage) {
+          persist(undefined);
+        } else {
+          slot.serializedCredentials = null;
+          slot.lineageId = undefined;
+        }
         slot.logoutGeneration = undefined;
       }
       if (token === undefined) return;
@@ -193,6 +235,7 @@ export function createConnectSessionLifecycle(input: {
         if (!(error instanceof SuperRareConnectApiError && error.status === 401)) throw error;
       }
     });
+    if (notificationFailed) throw notificationError;
   };
 
   read();
@@ -214,6 +257,7 @@ function getCredentialSlot(storage: ConnectSessionStorage | undefined, storageKe
   const createSlot = (): CredentialSlot => ({
     credentials: undefined,
     serializedCredentials: undefined,
+    lineageId: undefined,
     generation: 0,
     replacementGeneration: 0,
     logoutGeneration: undefined,

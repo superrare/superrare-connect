@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createSuperRareClient, ConnectPopupBlockedError, ConnectSessionRequiredError, type SuperRareConnectClient } from '../src/client.js';
 import type { ConnectAuthCredentials } from '../src/api.js';
-import type { ConnectSessionStorage } from '../src/session-storage-core.js';
+import { parseStoredConnectCredentials, type ConnectSessionStorage } from '../src/session-storage-core.js';
 import type { ConnectPopupWindow } from '../src/popup-core.js';
 
 const apiUrl = 'https://rare-api.test';
@@ -36,6 +36,11 @@ function storageAdapter(values: Map<string, string> = new Map()): ConnectSession
 
 function seed(storage: ConnectSessionStorage, value: ConnectAuthCredentials): void {
   storage.setItem(storageKey, JSON.stringify(value));
+}
+
+function storedCredentials(storage: ConnectSessionStorage): ConnectAuthCredentials | undefined {
+  const serialized = storage.getItem(storageKey);
+  return serialized === null ? undefined : parseStoredConnectCredentials(serialized);
 }
 
 function response(body: unknown, status = 200): Response {
@@ -142,7 +147,7 @@ describe('Connect credential lifecycle', () => {
     await expect(client.auth.getAccessToken()).resolves.toBe('access_renewed');
     expect(changes).toEqual([renewed.session]);
     expect(changes[0]).not.toHaveProperty('refreshToken');
-    expect(storage.getItem(storageKey)).toBe(JSON.stringify(renewed));
+    expect(storedCredentials(storage)).toEqual(renewed);
   });
 
   it('shares one renewal across access-token, profile, remote-session and second-client consumers', async () => {
@@ -330,6 +335,29 @@ describe('Connect credential lifecycle', () => {
     expect(client.auth.getSession()).toBeUndefined();
   });
 
+  it('completes persisted cleanup and revocation before rejecting a throwing logout observer', async () => {
+    const storage = storageAdapter();
+    seed(storage, credentials());
+    const requests: unknown[] = [];
+    const client = createSuperRareClient({
+      apiUrl,
+      sessionStorage: storage,
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requests.push(await request.json());
+        return response({ data: { revoked: true } });
+      },
+    });
+    client.auth.onChange(() => {
+      throw new Error('observer failed');
+    });
+
+    await expect(client.auth.logout()).rejects.toThrow('observer failed');
+
+    expect(storage.getItem(storageKey)).toBeNull();
+    expect(requests).toEqual([{ refreshToken: 'refresh_original' }]);
+  });
+
   it('waits for another tab to rotate before revoking its winner under the same Web Lock', async () => {
     const values = new Map<string, string>();
     const remoteStorage = storageAdapter(values);
@@ -368,6 +396,66 @@ describe('Connect credential lifecycle', () => {
       expect(localStorage.getItem(storageKey)).toBeNull();
       expect(remote.auth.getSession()).toBeUndefined();
       expect(local.auth.getSession()).toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps a newer cross-tab login when an older logout waits behind refresh', async () => {
+    const values = new Map<string, string>();
+    const loginStorage = storageAdapter(values);
+    const logoutStorage = storageAdapter(values);
+    seed(loginStorage, credentials({ accessRemaining: -1 }));
+    const refreshGate = deferred<Response>();
+    const refreshStarted = deferred<void>();
+    const newer = credentials({ sessionId: 'access_new_login', refreshToken: 'refresh_new_login' });
+    const renewed = credentials({ sessionId: 'access_rotated', refreshToken: 'refresh_rotated' });
+    const revoked: unknown[] = [];
+    let lockRequests = 0;
+    let queue = Promise.resolve();
+    vi.stubGlobal('navigator', {
+      locks: {
+        request: <T>(_name: string, operation: () => Promise<T>): Promise<T> => {
+          lockRequests += 1;
+          const pending = queue.then(operation);
+          queue = pending.then(() => undefined, () => undefined);
+          return pending;
+        },
+      },
+    });
+    try {
+      const loginHarnessResult = loginHarness({
+        storage: loginStorage,
+        exchange: newer,
+        fetchAuth: async (request) => {
+          if (request.url.endsWith('/auth/refresh')) {
+            refreshStarted.resolve();
+            return await refreshGate.promise;
+          }
+          return response({ data: { revoked: true } });
+        },
+      });
+      const logoutClient = createSuperRareClient({
+        apiUrl,
+        sessionStorage: logoutStorage,
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          revoked.push(await request.json());
+          return response({ data: { revoked: true } });
+        },
+      });
+      const token = loginHarnessResult.client.auth.getAccessToken().catch(() => undefined);
+      await refreshStarted.promise;
+      const logout = logoutClient.auth.logout();
+      const login = loginHarnessResult.login();
+      await vi.waitFor(() => expect(lockRequests).toBe(3));
+
+      refreshGate.resolve(response({ data: renewed }));
+      await Promise.all([token, logout, login]);
+
+      expect(revoked).toEqual([{ refreshToken: 'refresh_rotated' }]);
+      expect(storedCredentials(logoutStorage)).toEqual(newer);
+      expect(loginHarnessResult.client.auth.getSession()).toEqual(newer.session);
     } finally {
       vi.unstubAllGlobals();
     }
@@ -450,7 +538,7 @@ describe('Connect credential lifecycle', () => {
       await expect(login).resolves.toEqual({ status: 'cancelled' });
       refreshGate.resolve(response({ data: renewed }));
       await expect(token).resolves.toBe('access_renewed');
-      expect(storage.getItem(storageKey)).toBe(JSON.stringify(renewed));
+      expect(storedCredentials(storage)).toEqual(renewed);
       intentGate.resolve(response({ data: {
         intentId: 'intent_login',
         url: 'https://connect.superrare.test/login?intentId=intent_login',
@@ -483,7 +571,7 @@ describe('Connect credential lifecycle', () => {
     renewalFinished.resolve();
     await pendingLogin;
     expect(client.auth.getSession()).toEqual(newer.session);
-    expect(storage.getItem(storageKey)).toBe(JSON.stringify(newer));
+    expect(storedCredentials(storage)).toEqual(newer);
     await expect(client.auth.getAccessToken()).resolves.toBe('access_new_login');
   });
 
@@ -499,12 +587,12 @@ describe('Connect credential lifecycle', () => {
     const pending = client.auth.getAccessToken();
     const observed = pending.then((token) => token, () => undefined);
     await started.promise;
-    await login();
+    const loginPromise = login();
     gate.resolve(status === 200 ? response({ data: credentials({ sessionId: 'access_old_renewal', refreshToken: 'refresh_old_renewal' }) })
       : response({ error: 'renewal failed' }, status));
-    await observed;
+    await Promise.all([observed, loginPromise]);
     expect(client.auth.getSession()).toEqual(newer.session);
-    expect(storage.getItem(storageKey)).toBe(JSON.stringify(newer));
+    expect(storedCredentials(storage)).toEqual(newer);
     await expect(client.auth.getAccessToken()).resolves.toBe('access_new_login');
   });
 
@@ -523,9 +611,9 @@ describe('Connect credential lifecycle', () => {
     const token = client.auth.getAccessToken().catch(() => undefined);
     await started.promise;
     const logout = client.auth.logout();
-    await login();
+    const loginPromise = login();
     gate.resolve(response({ data: credentials({ sessionId: 'access_old_renewal', refreshToken: 'refresh_old_renewal' }) }));
-    await Promise.all([token, logout]);
+    await Promise.all([token, loginPromise, logout]);
     expect(revoked).toEqual([{ refreshToken: 'refresh_old_renewal' }]);
     expect(client.auth.getSession()).toEqual(newer.session);
   });

@@ -267,9 +267,13 @@ export function createSuperRareClient(
     }),
   });
   const createState = options.createState ?? createConnectState;
-  const commitSession = (credentials: ConnectAuthCredentials): void => {
-    sessionCommitGeneration += 1;
-    sessionLifecycle.commit(credentials);
+  const commitSession = async (
+    credentials: ConnectAuthCredentials,
+    shouldCommit: () => boolean,
+  ): Promise<boolean> => {
+    const committed = await sessionLifecycle.commit(credentials, shouldCommit);
+    if (committed) sessionCommitGeneration += 1;
+    return committed;
   };
   // `url` is the page the window opens at. A flow whose intent already
   // exists opens straight at the hosted page; the others open blank and
@@ -583,19 +587,18 @@ export function createSuperRareClient(
       ...apiOptions,
       signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
     });
-    if (
-      input.isAbandoned() || input.operationGeneration !== sessionCommitGeneration ||
-      sessionLifecycle.getReplacementGeneration() !== popupLoginReplacementGeneration
-    ) {
-      // The watcher gave up, or a logout/newer login landed on this client;
-      // the stale session is dropped rather than written over current state.
-      return { status: 'cancelled' };
-    }
+    const committed = await commitSession(credentials, () => {
+      const currentSession = sessionLifecycle.getSession();
+      return !input.isAbandoned() &&
+        input.operationGeneration === sessionCommitGeneration &&
+        (currentSession === undefined ||
+          sessionLifecycle.getReplacementGeneration() === popupLoginReplacementGeneration);
+    });
+    if (!committed) return { status: 'cancelled' };
 
     // The session is established: the login has succeeded. The profile lookup
     // is best-effort — neither a failure nor a slow response may turn a
     // committed login into an error, so the watcher stops timing it here.
-    commitSession(credentials);
     const session = credentials.session;
     input.onCommitted();
     const user = await getConnectCurrentUser({

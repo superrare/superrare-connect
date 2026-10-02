@@ -23,17 +23,42 @@ export type ConnectSessionStorage = {
   removeItem: (key: string) => void;
 };
 
-export function serializeConnectCredentials(credentials: ConnectAuthCredentials): string {
-  return JSON.stringify(credentials);
+export type ConnectStoredAuthCredentials = {
+  credentials: ConnectAuthCredentials;
+  lineageId: string;
+};
+
+const connectStoredAuthCredentialsSchema = z.object({
+  credentials: connectAuthCredentialsSchema,
+  lineageId: z.string().min(1),
+});
+
+export function serializeConnectCredentials(
+  credentials: ConnectAuthCredentials,
+  lineageId: string = credentials.session.sessionId,
+): string {
+  return JSON.stringify({ credentials, lineageId });
+}
+
+export function parseStoredConnectCredentialRecord(
+  serializedCredentials: string,
+): ConnectStoredAuthCredentials | undefined {
+  const parsedCredentials = parseJson(serializedCredentials);
+  const storedResult = connectStoredAuthCredentialsSchema.safeParse(parsedCredentials);
+  if (storedResult.success) return storedResult.data;
+
+  const legacyResult = connectAuthCredentialsSchema.safeParse(parsedCredentials);
+  return legacyResult.success
+    ? { credentials: legacyResult.data, lineageId: legacyResult.data.session.sessionId }
+    : undefined;
 }
 
 export function parseStoredConnectCredentials(
   serializedCredentials: string,
 ): ConnectAuthCredentials | undefined {
-  const parsedCredentials = parseJson(serializedCredentials);
-  const result = connectAuthCredentialsSchema.safeParse(parsedCredentials);
-  return result.success ? result.data : undefined;
+  return parseStoredConnectCredentialRecord(serializedCredentials)?.credentials;
 }
+
 
 export function readConnectCredentialsFromStorage(
   storage: ConnectSessionStorage | undefined,
