@@ -1,4 +1,5 @@
 export {
+  ConnectActionValidationError,
   ConnectAuthPendingError,
   ConnectPopupBlockedError,
   ConnectReturnPathError,
@@ -24,9 +25,11 @@ export {
   type BidActionParams,
   type BuyActionParams,
   type CancelOfferActionParams,
+  type ConnectActionValidationErrorCode,
   type MakeOfferActionParams,
   type MintActionParams,
   type SettleActionParams,
+  type TransferActionParams,
 } from './actions-flow-core.js';
 export {
   type ConnectAcceptOfferTarget,
@@ -61,6 +64,8 @@ export {
   type ConnectMintTarget,
   type ConnectOfferTerms,
   type ConnectPurchaseTerms,
+  type ConnectTransferChainId,
+  type ConnectTransferCurrency,
   type ConnectAuthPendingVerificationError,
   type ConnectAuthPendingVerificationResult,
   type PendingConnectAuth,

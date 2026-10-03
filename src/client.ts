@@ -20,13 +20,16 @@ import {
   buildConnectMakeOfferIntentRequest,
   buildConnectMintIntentRequest,
   buildConnectSettleIntentRequest,
+  buildConnectTransferIntentRequest,
   type AcceptOfferActionParams,
   type BidActionParams,
   type BuyActionParams,
   type CancelOfferActionParams,
+  type ConnectActionValidationErrorCode,
   type MakeOfferActionParams,
   type MintActionParams,
   type SettleActionParams,
+  type TransferActionParams,
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
@@ -170,6 +173,7 @@ export type SuperRareConnectActionsNamespace = {
   bid: (params: BidActionParams) => Promise<ConnectIntentCreation>;
   mint: (params: MintActionParams) => Promise<ConnectIntentCreation>;
   settle: (params: SettleActionParams) => Promise<ConnectIntentCreation>;
+  transfer: (params: TransferActionParams) => Promise<ConnectIntentCreation>;
   getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
@@ -209,6 +213,16 @@ export class ConnectReturnPathError extends Error {
   constructor() {
     super('Invalid Connect returnPath.');
     this.name = 'ConnectReturnPathError';
+  }
+}
+
+export class ConnectActionValidationError extends Error {
+  readonly code: ConnectActionValidationErrorCode;
+
+  constructor(code: ConnectActionValidationErrorCode) {
+    super(`Invalid Connect action parameters: ${code}.`);
+    this.name = 'ConnectActionValidationError';
+    this.code = code;
   }
 }
 
@@ -424,10 +438,13 @@ export function createSuperRareClient(
       | ReturnType<typeof buildConnectMintIntentRequest>
       | ReturnType<typeof buildConnectMakeOfferIntentRequest>
       | ReturnType<typeof buildConnectAcceptOfferIntentRequest>
-      | ReturnType<typeof buildConnectCancelOfferIntentRequest>,
+      | ReturnType<typeof buildConnectCancelOfferIntentRequest>
+      | ReturnType<typeof buildConnectTransferIntentRequest>,
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
-      throw new ConnectReturnPathError();
+      throw requestResult.error === 'invalid_return_path'
+        ? new ConnectReturnPathError()
+        : new ConnectActionValidationError(requestResult.error);
     }
 
     // The popup must open before the first await to stay inside the user
@@ -1017,6 +1034,13 @@ export function createSuperRareClient(
       },
       async mint(params): Promise<ConnectIntentCreation> {
         return await startIntent(buildConnectMintIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async transfer(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectTransferIntentRequest({
           ...params,
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),

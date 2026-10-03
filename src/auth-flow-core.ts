@@ -192,6 +192,21 @@ export type ConnectErc1155CheckoutTarget = {
   items: Array<ConnectErc1155CheckoutReleaseItem | ConnectErc1155CheckoutListingItem>;
 };
 
+export type ConnectTransferChainId = 1 | 11155111;
+
+export type ConnectTransferCurrency = 'ETH' | 'USDC';
+
+export type ConnectWalletTarget = {
+  kind: 'wallet';
+  chainId: ConnectTransferChainId;
+  address: ConnectEthereumAddress;
+};
+
+export type ConnectTransferTerms = {
+  currency: ConnectTransferCurrency;
+  amount: string;
+};
+
 export type ConnectBuyTarget =
   | ConnectErc721DirectListingTarget
   | ConnectErc721BatchListingTarget
@@ -271,6 +286,11 @@ export type ConnectActionInput =
   | {
     type: 'checkout';
     target: ConnectErc1155CheckoutTarget;
+  }
+  | {
+    type: 'transfer';
+    target: ConnectWalletTarget;
+    transfer: ConnectTransferTerms;
   };
 
 export type BuildConnectLoginIntentRequestInput = {
