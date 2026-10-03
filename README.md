@@ -459,7 +459,7 @@ async function isTransferPaid(order: TransferOrder): Promise<boolean> {
 }
 ```
 
-A `completed` transfer means SuperRare verified on-chain that the wallet signed in to the hosted window at confirmation paid exactly `amount` of `currency` to `recipient` on `chainId`, in a transaction mined after the intent was created. One transaction completes at most one intent.
+A `completed` transfer means SuperRare verified on-chain that the wallet signed in to the hosted window at confirmation paid exactly `amount` of `currency` to `recipient` on `chainId`, in a transaction mined after the intent was created. One transaction completes at most one transfer per paying wallet; a smart-account bundle that carries several payers' transfers completes one intent for each.
 
 If the intent is still `processing` when your backend reads it and it already carries `result.transactionHash` (the player closed the window, or confirmation took longer than usual), keep reading it: each read lets SuperRare re-verify the payment on-chain and complete the intent. Such a transfer stays readable for 24 hours after the intent's `expiresAt`, and a `completed` transfer is kept for the same 24 hours, so read and record it within that window. A transfer whose hash was not recorded before the intent expired is not completed automatically: the wallet approved it after the intent expired, the player closed the window before approving, or the player sped it up in their wallet after the window stopped watching.
 
