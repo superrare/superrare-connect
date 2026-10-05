@@ -20,13 +20,16 @@ import {
   buildConnectCancelOfferIntentRequest,
   buildConnectMakeOfferIntentRequest,
   buildConnectMintIntentRequest,
+  buildConnectSellIntentRequest,
   buildConnectSettleIntentRequest,
   type AcceptOfferActionParams,
   type BidActionParams,
   type BuyActionParams,
   type CancelOfferActionParams,
+  type ConnectActionValidationErrorCode,
   type MakeOfferActionParams,
   type MintActionParams,
+  type SellActionParams,
   type SettleActionParams,
 } from './actions-flow-core.js';
 import {
@@ -171,6 +174,7 @@ export type SuperRareConnectCheckoutNamespace = {
 
 export type SuperRareConnectActionsNamespace = {
   buy: (params: BuyActionParams) => Promise<ConnectIntentCreation>;
+  sell: (params: SellActionParams) => Promise<ConnectIntentCreation>;
   bid: (params: BidActionParams) => Promise<ConnectIntentCreation>;
   mint: (params: MintActionParams) => Promise<ConnectIntentCreation>;
   settle: (params: SettleActionParams) => Promise<ConnectIntentCreation>;
@@ -213,6 +217,16 @@ export class ConnectReturnPathError extends Error {
   constructor() {
     super('Invalid Connect returnPath.');
     this.name = 'ConnectReturnPathError';
+  }
+}
+
+export class ConnectActionValidationError extends Error {
+  readonly code: ConnectActionValidationErrorCode;
+
+  constructor(code: ConnectActionValidationErrorCode) {
+    super(`Invalid Connect action parameters: ${code}.`);
+    this.name = 'ConnectActionValidationError';
+    this.code = code;
   }
 }
 
@@ -432,7 +446,9 @@ export function createSuperRareClient(
       | ReturnType<typeof buildConnectCancelOfferIntentRequest>,
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
-      throw new ConnectReturnPathError();
+      throw requestResult.error === 'invalid_return_path'
+        ? new ConnectReturnPathError()
+        : new ConnectActionValidationError(requestResult.error);
     }
 
     // The popup must open before the first await to stay inside the user
@@ -1009,6 +1025,13 @@ export function createSuperRareClient(
     actions: {
       async buy(params): Promise<ConnectIntentCreation> {
         return await startIntent(buildConnectBuyIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async sell(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectSellIntentRequest({
           ...params,
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),

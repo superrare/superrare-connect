@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  ConnectActionValidationError,
   ConnectPopupBlockedError,
+  ConnectReturnPathError,
   createSuperRareClient,
 } from '../src/client.js';
 import type {
@@ -10,6 +12,7 @@ import type {
   ConnectErc721OfferTarget,
   ConnectErc721ReleaseTarget,
   ConnectErc721ReserveAuctionTarget,
+  ConnectLiquidEditionTarget,
 } from '../src/auth-flow-core.js';
 import type { SuperRareConnectApiError } from '../src/errors.js';
 import type { ConnectIntent } from '../src/status-core.js';
@@ -64,6 +67,12 @@ const batchOfferTarget: ConnectErc721BatchOfferTarget = {
   chainId: 1,
   creator: '0x2222222222222222222222222222222222222222',
   root: '0xroot',
+};
+
+const liquidEditionTarget: ConnectLiquidEditionTarget = {
+  kind: 'liquid-edition',
+  chainId: 11155111,
+  contract: '0x5547E40bAb6f1e967F0031A53Ea288dC22cbFA5a',
 };
 
 // Relative to the clock so tests never expire an intent on a fixed future
@@ -555,6 +564,166 @@ describe('createSuperRareClient', () => {
       });
 
       await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts liquid edition buy and sell intents through actions.buy and actions.sell', async () => {
+    vi.useFakeTimers();
+    try {
+      const createdIntentRequests: unknown[] = [];
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_liquid',
+        popup: { open: () => createPopupStub() },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'GET') return completedIntentStatusResponse(request);
+
+          createdIntentRequests.push(await request.json());
+          return connectIntentCreationResponse(`connect_intent_liquid_${createdIntentRequests.length}`);
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.buy({
+        target: liquidEditionTarget,
+        spend: { currency: 'RARE', amount: '307019230590695710510' },
+        maxSlippageBps: 100,
+        payment: { method: 'wallet' },
+        returnPath: '/liquid/complete',
+      })).resolves.toMatchObject({ intentId: 'connect_intent_liquid_1' });
+      await expect(client.actions.sell({
+        target: liquidEditionTarget,
+        sell: { amount: '44065473704606179946' },
+        receive: { currency: 'USDC' },
+        minReceived: '68306625',
+        returnPath: '/liquid/complete',
+      })).resolves.toMatchObject({ intentId: 'connect_intent_liquid_2' });
+
+      expect(createdIntentRequests).toEqual([
+        {
+          action: {
+            type: 'buy',
+            target: liquidEditionTarget,
+            spend: { currency: 'RARE', amount: '307019230590695710510' },
+            maxSlippageBps: 100,
+          },
+          returnPath: '/liquid/complete',
+          state: 'state_liquid',
+          payment: { method: 'wallet' },
+        },
+        {
+          action: {
+            type: 'sell',
+            target: liquidEditionTarget,
+            sell: { amount: '44065473704606179946' },
+            receive: { currency: 'USDC' },
+            minReceived: '68306625',
+          },
+          returnPath: '/liquid/complete',
+          state: 'state_liquid',
+        },
+      ]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects invalid liquid edition parameters before opening a window or creating an intent', async () => {
+    const open = vi.fn(() => createPopupStub());
+    const fetchImplementation = vi.fn(async () => connectIntentCreationResponse('connect_intent_liquid'));
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_liquid',
+      popup: { open },
+      fetch: fetchImplementation,
+      sessionStorage: false,
+    });
+
+    const decimalSpend = client.actions.buy({
+      target: liquidEditionTarget,
+      spend: { currency: 'ETH', amount: '0.01' },
+    });
+    await expect(decimalSpend).rejects.toBeInstanceOf(ConnectActionValidationError);
+    await expect(decimalSpend).rejects.toMatchObject({ code: 'invalid_amount' });
+    await expect(client.actions.sell({
+      target: liquidEditionTarget,
+      sell: { amount: '44065473704606179946' },
+      receive: { currency: 'ETH' },
+      minReceived: '0',
+    })).rejects.toMatchObject({ code: 'invalid_min_received' });
+    await expect(client.actions.sell({
+      target: liquidEditionTarget,
+      sell: { amount: '44065473704606179946' },
+      receive: { currency: 'ETH' },
+      maxSlippageBps: 501,
+    })).rejects.toMatchObject({ code: 'invalid_max_slippage_bps' });
+    await expect(client.actions.sell({
+      target: liquidEditionTarget,
+      sell: { amount: '44065473704606179946' },
+      receive: { currency: 'ETH' },
+      returnPath: 'https://evil.example/liquid',
+    })).rejects.toBeInstanceOf(ConnectReturnPathError);
+
+    expect(open).not.toHaveBeenCalled();
+    expect(fetchImplementation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: 'sell', targetKind: 'liquid-edition' },
+    { type: 'future-action', targetKind: 'future-target' },
+  ])('closes the window once a $type intent settles', async ({ type, targetKind }) => {
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const settled: ConnectIntent[] = [];
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_liquid',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'POST') return connectIntentCreationResponse('connect_intent_liquid');
+
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_liquid',
+              type,
+              status: 'completed',
+              returnPath: '/liquid/complete',
+              expiresAt: futureExpiry(),
+              resolvedActionSnapshot: {
+                actionKey: '11155111-0x5547e40bab6f1e967f0031a53ea288dc22cbfa5a-liquid-sell-eth',
+                actionType: type,
+                resolvedAt: '2026-09-30T00:00:00.000Z',
+                targetKind,
+                terms: { available: true },
+              },
+              result: { transactionHash: '0xtransaction' },
+            },
+          });
+        },
+        sessionStorage: false,
+      });
+
+      await client.actions.sell({
+        target: liquidEditionTarget,
+        sell: { amount: '44065473704606179946' },
+        receive: { currency: 'ETH' },
+        returnPath: '/liquid/complete',
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(popup.closed).toBe(true);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]).toMatchObject({ type, status: 'completed' });
     } finally {
       vi.useRealTimers();
     }

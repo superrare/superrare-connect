@@ -2,7 +2,7 @@
 
 Public browser SDK for starting SuperRare-hosted Connect flows from external websites.
 
-SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, open them in their own window, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, and status flows do not require an authenticated Connect session.
+SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, Liquid Edition trades, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, open them in their own window, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, and status flows do not require an authenticated Connect session.
 
 ## Install
 
@@ -187,7 +187,7 @@ The SDK never accepts arbitrary calldata, contract instructions, private keys, A
 
 ## Payment Methods
 
-Every action accepts an optional `payment` hint. Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
+Every action accepts an optional `payment` hint (Liquid Edition trades are wallet-only; see [Liquid Editions](#liquid-editions)). Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
 
 **Wallet-only is required when the sale settles on a custom contract whose mint or transfer logic depends on the receiving wallet** — for example a mint that binds a pre-registered artwork to the collector's address. Card settlement executes through a SuperRare buy-proxy that receives the asset itself and re-transfers it to the buyer, so the on-chain receiver is the proxy, not the buyer; such sales revert only after the card was charged. If your contract keys anything on the `mintTo` / transfer receiver, always create its intents wallet-only:
 
@@ -224,6 +224,70 @@ await superrare.actions.settle({
 
 Intent creation fails when the auction has not ended, has no winning bid, or was already settled.
 
+## Liquid Editions
+
+A Liquid Edition is an ERC-20 token traded against a Uniswap v4 pool through SuperRare's LiquidRouter. `actions.buy` with a `liquid-edition` target spends an exact amount of ETH, RARE, or USDC and receives at least a minimum of the edition's token. `actions.sell` delivers an exact amount of the token and receives at least a minimum of ETH, RARE, or USDC. The hosted window re-quotes the trade, asks for the ERC-20 approval when paying or selling a token, and submits the trade from the connected wallet.
+
+Amounts are raw base-unit strings: 18 decimals for the Liquid Edition token, ETH, and RARE (`'10000000000000000'` is 0.01), 6 decimals for USDC (`'25000000'` is 25 USDC). The SDK rejects decimals, zero, and leading zeros with `ConnectActionValidationError` before any window opens.
+
+```ts
+import type { ConnectLiquidEditionTarget } from '@rareprotocol/connect';
+
+const liquidEdition: ConnectLiquidEditionTarget = {
+  kind: 'liquid-edition',
+  chainId: 1,
+  contract: '0x…', // the Liquid Edition token
+};
+
+// Buy: spend exactly this much, receive at least the pinned minimum of the token.
+await superrare.actions.buy({
+  target: liquidEdition,
+  spend: { currency: 'ETH', amount: '10000000000000000' }, // 0.01 ETH
+  returnPath: '/liquid/complete',
+});
+
+await superrare.actions.buy({
+  target: liquidEdition,
+  spend: { currency: 'RARE', amount: '25000000000000000000' }, // 25 RARE
+  maxSlippageBps: 100, // accept up to 1% below the quote
+});
+
+await superrare.actions.buy({
+  target: liquidEdition,
+  spend: { currency: 'USDC', amount: '25000000' }, // 25 USDC
+});
+
+// Sell: deliver exactly this much of the token, receive at least the pinned minimum.
+await superrare.actions.sell({
+  target: liquidEdition,
+  sell: { amount: '40000000000000000000' }, // 40 tokens
+  receive: { currency: 'ETH' },
+});
+
+await superrare.actions.sell({
+  target: liquidEdition,
+  sell: { amount: '40000000000000000000' },
+  receive: { currency: 'RARE' },
+  minReceived: '270000000000000000000', // at least 270 RARE
+});
+
+await superrare.actions.sell({
+  target: liquidEdition,
+  sell: { amount: '40000000000000000000' },
+  receive: { currency: 'USDC' },
+  minReceived: '60000000', // at least 60 USDC
+});
+```
+
+The minimum received is pinned when the intent is created. Rare API quotes the whole route on-chain and stores the result in the intent's resolved terms: `amount` and `currency` are what the user delivers (for a sell, `currency` is the token address), `outputCurrency`, `estimatedAmountOut`, and `minAmountOut` are what they receive. The hosted window refuses to submit when the live quote has fallen below `minAmountOut`, and the router reverts the whole trade rather than deliver less, so the user never receives less than that minimum.
+
+- Without `minReceived`, the minimum is the quote less `maxSlippageBps`: an integer from `1` to `500` basis points, default `50` (0.5%), maximum `500` (5%).
+- With `minReceived` (base units of what the user receives: the token for a buy, the receive currency for a sell), it is the minimum as given and `maxSlippageBps` does not apply. Rare API refuses a `minReceived` above the live quote with `TERMS_STALE` (409), and one more than 5% below it with `INVALID_REQUEST` (400); both reject the call with `SuperRareConnectApiError`.
+
+Liquid Edition trades are wallet-only: `payment` accepts only `{ method: 'wallet' }` (TypeScript rejects `'card'`), and Rare API refuses card payment for these intents with `INVALID_REQUEST`.
+
+Liquid Editions trade on Ethereum mainnet (`chainId: 1`) and Sepolia (`11155111`). Production Connect executes mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia) with a `liquid-edition` target on `chainId: 11155111`.
+
 ## Intent Status
 
 ```ts
@@ -237,6 +301,8 @@ const outcome = resolveConnectIntentOutcome(intent);
 ```
 
 `outcome.kind` is `pending`, `completed`, or `failed`.
+
+`intent.type` and the snapshot's `actionType` and `targetKind` can carry values added to Rare API after your SDK version, so handle an unrecognized value instead of assuming the list is closed.
 
 ## Optional Auth Flow
 
@@ -416,7 +482,7 @@ The dev environment resolves and executes both mainnet (`1`) and Sepolia (`11155
 
 ## Hosted Windows
 
-Every hosted flow — checkout, buy, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
+Every hosted flow — checkout, buy, sell, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
 
 ```ts
 const superrare = createSuperRareClient({
@@ -458,6 +524,7 @@ const result = normalizeReturnPath('/account');
 The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
+- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_min_received`, or `invalid_max_slippage_bps`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.
