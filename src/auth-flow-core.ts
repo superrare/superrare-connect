@@ -213,7 +213,7 @@ export type ConnectLiquidEditionReceiveTerms = {
   currency: ConnectLiquidEditionCurrency;
 };
 
-export type ConnectTransferChainId = 1 | 11155111;
+export type ConnectTransferChainId = 1 | 8453 | 11155111 | 84532;
 
 export type ConnectTransferCurrency = 'ETH' | 'USDC';
 

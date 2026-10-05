@@ -592,7 +592,9 @@ describe('buildConnectTransferIntentRequest', () => {
 
   it.each([
     { chainId: 1, currency: 'ETH', amount: '50000000000000000' },
+    { chainId: 8453, currency: 'USDC', amount: '25000000' },
     { chainId: 11155111, currency: 'USDC', amount: '25000000' },
+    { chainId: 84532, currency: 'ETH', amount: '50000000000000000' },
   ] as const)('builds a $currency transfer on chain $chainId', ({ chainId, currency, amount }) => {
     expect(buildConnectTransferIntentRequest({
       chainId,

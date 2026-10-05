@@ -413,11 +413,12 @@ await fetch('/api/orders/order_123/transfer-intent', {
 });
 ```
 
-- Chains: Ethereum mainnet (`chainId: 1`) and Sepolia (`11155111`). Production accepts mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia), which accepts both.
+- Chains: Ethereum mainnet (`1`), Base (`8453`), Sepolia (`11155111`) and Base Sepolia (`84532`) are supported; each hosted Connect deployment enables a subset. Production executes mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia). On a chain the deployment does not enable, the hosted window shows the transfer as not available.
 - Currencies: `ETH` and `USDC`.
 - `amount` is a raw base-unit string, like bid and offer amounts: wei for ETH (`'50000000000000000'` is 0.05 ETH) and 6 decimals for USDC (`'25000000'` is 25 USDC). The SDK rejects decimals, zero, and leading zeros with `ConnectActionValidationError` (`code: 'invalid_amount'`) before any window opens.
 - Wallet-only: there is no `payment` option and the hosted window never offers card. The user pays from the wallet they sign in with, and the hosted window keeps the confirm button disabled while that wallet cannot cover the amount.
-- Rare API rejects the call with `SuperRareConnectApiError` (`status` 400) for a chain its deployment does not accept (any chain but mainnet in production), an invalid or zero address as `to`, an unknown currency, or a card payment or `payment.recipient` sent to the API directly.
+- Rare API rejects the call with `SuperRareConnectApiError` (`status` 400) for a chain outside those four, an invalid or zero address as `to`, an unknown currency, or a card payment or `payment.recipient` sent to the API directly.
+- Rare API accepts transfer intents on all four chains in every deployment, so a testnet intent created against production can still be completed by calling the API directly. Always compare `terms.chainId` with the order.
 
 ### Verifying a transfer before crediting
 
@@ -428,7 +429,7 @@ The user controls the page, so nothing it reports proves a payment: not the `act
 3. Credit only when all of these hold:
    - `status === 'completed'`. A `processing` intent can already carry an unverified `result.transactionHash`; never credit it.
    - `resolvedActionSnapshot.actionType === 'transfer'`.
-   - The terms `chainId`, `recipient`, `amount`, and `currency` equal the order's. `recipient` comes back checksummed, so compare addresses case-insensitively. A Sepolia transfer must never credit a mainnet order.
+   - The terms `chainId`, `recipient`, `amount`, and `currency` equal the order's. `recipient` comes back checksummed, so compare addresses case-insensitively. A testnet transfer (Sepolia or Base Sepolia) must never credit a mainnet order, and a Base transfer must never credit an Ethereum order.
    - The `intentId` was not credited before, for example with a unique constraint on the column that stores credited intent ids. `isTransferPaid` below checks everything else.
 
 ```ts
@@ -438,7 +439,7 @@ const superrare = createSuperRareClient({ sessionStorage: false });
 
 type TransferOrder = {
   intentId: string;
-  chainId: 1 | 11155111;
+  chainId: 1 | 8453 | 11155111 | 84532;
   recipient: string;
   currency: 'ETH' | 'USDC';
   amount: string;
