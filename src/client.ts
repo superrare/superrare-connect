@@ -7,6 +7,7 @@ import {
   getConnectCurrentUser,
   getConnectIntent,
   getConnectSession,
+  type ConnectAuthCredentials,
   type ConnectAuthApiOptions,
   type ConnectCurrentUser,
   type ConnectIntentCreation,
@@ -41,12 +42,13 @@ import {
 } from './checkout-flow-core.js';
 import { SuperRareConnectApiError } from './errors.js';
 import {
-  readConnectSessionFromStorage,
-  removeConnectSessionFromStorage,
-  writeConnectSessionToStorage,
   type ConnectSession,
   type ConnectSessionStorage,
 } from './session-storage-core.js';
+import {
+  createConnectSessionLifecycle,
+  getConnectCredentialStorageKey,
+} from './session-lifecycle.js';
 import {
   appendConnectPopupDisplay,
   getConnectPopupDeadline,
@@ -147,9 +149,11 @@ export type SuperRareConnectAuthNamespace = {
    */
   prepareLogin: (params?: ConnectAuthLoginParams) => Promise<ConnectPreparedLogin>;
   getSession: () => ConnectSession | undefined;
+  /** Returns a current opaque access token, renewing the session when necessary. */
+  getAccessToken: () => Promise<string>;
   getRemoteSession: () => Promise<ConnectSessionState>;
   me: () => Promise<ConnectCurrentUser>;
-  logout: () => void;
+  logout: () => Promise<void>;
   onChange: (callback: ConnectSessionChangeCallback) => () => void;
   clearSession: () => void;
 };
@@ -243,18 +247,18 @@ export function createSuperRareClient(
   options: SuperRareConnectClientOptions = {},
 ): SuperRareConnectClient {
   const storage = resolveConnectSessionStorage(options.sessionStorage);
-  const storageKey = options.sessionStorageKey ?? DEFAULT_CONNECT_SESSION_STORAGE_KEY;
-  const sessionListeners = new Set<ConnectSessionChangeCallback>();
-  // Per client: bumped by every session commit or clear on THIS client, so an
-  // exchange that resolves after this client's session changed underneath it
-  // (a logout, a newer login) does not write a stale result back. A separate
-  // client instance — a different `sessionStorageKey`, a different widget — is
-  // an independent session and does not invalidate this one.
+  const storageKey = getConnectCredentialStorageKey(
+    options.sessionStorageKey ?? DEFAULT_CONNECT_SESSION_STORAGE_KEY,
+    options.apiUrl,
+  );
+  // Login/preparation generations belong to this client. Credential renewal
+  // coordination belongs to the shared storage slot.
   let sessionCommitGeneration = 0;
   const apiOptions = {
     apiUrl: options.apiUrl,
     fetch: options.fetch,
   };
+  const sessionLifecycle = createConnectSessionLifecycle({ storage, storageKey, apiOptions });
   const resolveHostedIntent = (intent: ConnectIntentCreation): ConnectIntentCreation => ({
     ...intent,
     url: resolveHostedConnectUrl({
@@ -263,12 +267,13 @@ export function createSuperRareClient(
     }),
   });
   const createState = options.createState ?? createConnectState;
-  // The single place a session is written: bumps the generation, persists,
-  // notifies.
-  const commitSession = (session: ConnectSession): void => {
-    sessionCommitGeneration += 1;
-    writeConnectSessionToStorage(storage, storageKey, session);
-    notifySessionListeners(sessionListeners, session);
+  const commitSession = async (
+    credentials: ConnectAuthCredentials,
+    shouldCommit: () => boolean,
+  ): Promise<boolean> => {
+    const committed = await sessionLifecycle.commit(credentials, shouldCommit);
+    if (committed) sessionCommitGeneration += 1;
+    return committed;
   };
   // `url` is the page the window opens at. A flow whose intent already
   // exists opens straight at the hosted page; the others open blank and
@@ -471,7 +476,7 @@ export function createSuperRareClient(
     return intent;
   };
   const me = async (): Promise<ConnectCurrentUser> => {
-    const session = readConnectSessionFromStorage(storage, storageKey);
+    const session = await sessionLifecycle.getCurrentSession();
     if (session === undefined) {
       throw new ConnectSessionRequiredError();
     }
@@ -483,6 +488,7 @@ export function createSuperRareClient(
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
   const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
+  let popupLoginReplacementGeneration = 0;
   let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
   const createLoginIntent = async (
     params: ConnectAuthLoginParams,
@@ -577,20 +583,23 @@ export function createSuperRareClient(
     // deadline stops applying to the best-effort profile lookup that follows.
     onCommitted: () => void;
   }): Promise<ConnectPopupLoginResult> => {
-    const session = await exchangeConnectAuthCode(input.params, {
+    const credentials = await exchangeConnectAuthCode(input.params, {
       ...apiOptions,
       signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
     });
-    if (input.isAbandoned() || input.operationGeneration !== sessionCommitGeneration) {
-      // The watcher gave up, or a logout/newer login landed on this client;
-      // the stale session is dropped rather than written over current state.
-      return { status: 'cancelled' };
-    }
+    const committed = await commitSession(credentials, () => {
+      const currentSession = sessionLifecycle.getSession();
+      return !input.isAbandoned() &&
+        input.operationGeneration === sessionCommitGeneration &&
+        (currentSession === undefined ||
+          sessionLifecycle.getReplacementGeneration() === popupLoginReplacementGeneration);
+    });
+    if (!committed) return { status: 'cancelled' };
 
     // The session is established: the login has succeeded. The profile lookup
     // is best-effort — neither a failure nor a slow response may turn a
     // committed login into an error, so the watcher stops timing it here.
-    commitSession(session);
+    const session = credentials.session;
     input.onCommitted();
     const user = await getConnectCurrentUser({
       ...apiOptions,
@@ -809,10 +818,10 @@ export function createSuperRareClient(
   const runPopupLogin = async (
     params: ConnectAuthLoginParams,
   ): Promise<ConnectPopupLoginResult> => {
-    // A logout or another login on this client after this point invalidates
-    // the whole operation, so its exchange can never resurrect a replaced
-    // session.
+    const prepared = takePreparedLogin(params);
+    sessionCommitGeneration += 1;
     const operationGeneration = sessionCommitGeneration;
+    popupLoginReplacementGeneration = sessionLifecycle.getReplacementGeneration();
     if (messageEvents === undefined) {
       // Without a message source the hosted page's callback could never be
       // received, so the login could never complete — refuse before opening
@@ -829,7 +838,6 @@ export function createSuperRareClient(
     // fallback. A login prepared ahead of the tap has its intent already:
     // the window opens straight at the hosted page, with no round trip for a
     // suspended opener to leave unfinished.
-    const prepared = takePreparedLogin(params);
     const popup = openPopupWindow(
       `superrare-connect-login-${createConnectPopupName()}`,
       prepared?.popupUrl,
@@ -935,9 +943,12 @@ export function createSuperRareClient(
     // concurrent login could only race the first for the same slot. A
     // caller that asks again — a double click — joins the login already
     // running instead of opening a second window.
-    inFlightPopupLogin ??= runPopupLogin(params).finally(() => {
-      inFlightPopupLogin = undefined;
-    });
+    if (inFlightPopupLogin === undefined) {
+      const pending = runPopupLogin(params).finally(() => {
+        if (inFlightPopupLogin === pending) inFlightPopupLogin = undefined;
+      });
+      inFlightPopupLogin = pending;
+    }
 
     return await inFlightPopupLogin;
   };
@@ -947,11 +958,14 @@ export function createSuperRareClient(
       login,
       loginWithPopup: login,
       prepareLogin,
-      getSession(): ConnectSession | undefined {
-        return readConnectSessionFromStorage(storage, storageKey);
+      getSession: sessionLifecycle.getSession,
+      async getAccessToken(): Promise<string> {
+        const session = await sessionLifecycle.getCurrentSession();
+        if (session === undefined) throw new ConnectSessionRequiredError();
+        return session.sessionId;
       },
       async getRemoteSession(): Promise<ConnectSessionState> {
-        const session = readConnectSessionFromStorage(storage, storageKey);
+        const session = await sessionLifecycle.getCurrentSession();
         return await getConnectSession({
           ...apiOptions,
           sessionId: session?.sessionId,
@@ -962,17 +976,16 @@ export function createSuperRareClient(
       },
       clearSession(): void {
         sessionCommitGeneration += 1;
-        removeConnectSessionFromStorage(storage, storageKey);
-        notifySessionListeners(sessionListeners, undefined);
+        inFlightPopupLogin = undefined;
+        sessionLifecycle.clear();
       },
-      logout(): void {
-        this.clearSession();
+      async logout(): Promise<void> {
+        sessionCommitGeneration += 1;
+        inFlightPopupLogin = undefined;
+        await sessionLifecycle.logout();
       },
       onChange(callback): () => void {
-        sessionListeners.add(callback);
-        return () => {
-          sessionListeners.delete(callback);
-        };
+        return sessionLifecycle.onChange(callback);
       },
     },
     user: {
@@ -1067,15 +1080,6 @@ export function createSuperRareClient(
       },
     },
   };
-}
-
-function notifySessionListeners(
-  listeners: Set<ConnectSessionChangeCallback>,
-  session: ConnectSession | undefined,
-): void {
-  listeners.forEach((listener) => {
-    listener(session);
-  });
 }
 
 function resolveConnectSessionStorage(

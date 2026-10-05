@@ -2,12 +2,17 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createConnectIntent,
   createConnectLoginIntent,
+  exchangeConnectAuthCode,
   getConnectCheckoutStatus,
   getConnectCurrentUser,
   getConnectIntent,
   getConnectSession,
+  refreshConnectAuthSession,
+  revokeConnectAuthSession,
+  type ConnectAuthCredentials,
 } from '../src/api.js';
 import type { ConnectErc1155CheckoutTarget } from '../src/auth-flow-core.js';
+import { SuperRareConnectApiError } from '../src/errors.js';
 
 const checkoutTarget: ConnectErc1155CheckoutTarget = {
   kind: 'erc1155-checkout',
@@ -24,7 +29,168 @@ const checkoutTarget: ConnectErc1155CheckoutTarget = {
   ],
 };
 
+const credentials: ConnectAuthCredentials = {
+  session: {
+    sessionId: 'connect_session_123',
+    userId: 'user_123',
+    address: '0x0000000000000000000000000000000000000001',
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+  },
+  refreshToken: 'connect_refresh_123',
+  refreshExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+};
+
+const malformedCredentials: unknown[] = [
+  { session: credentials.session },
+  { ...credentials, refreshToken: '' },
+  { ...credentials, refreshToken: 'x'.repeat(513) },
+  { ...credentials, refreshExpiresAt: 'not a date' },
+  { ...credentials, refreshExpiresAt: '2026-02-30T00:00:00.000Z' },
+  { ...credentials, session: { ...credentials.session, expiresAt: 'not a date' } },
+  { ...credentials, session: { ...credentials.session, expiresAt: '2026-02-30T00:00:00.000Z' } },
+  { ...credentials, session: { ...credentials.session, sessionId: '' } },
+];
+
 describe('Connect API client', () => {
+  it('exchanges the callback for access and refresh credentials', async () => {
+    const params = { code: 'connect_auth_code_123', intentId: 'connect_intent_123', state: 'state_123' };
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      expect(request.url).toBe('https://rare-api.test/v1/connect/auth/exchange');
+      expect(request.method).toBe('POST');
+      expect(request.headers.get('content-type')).toBe('application/json');
+      expect(request.headers.has('authorization')).toBe(false);
+      expect(await request.json()).toEqual(params);
+      return jsonResponse({ data: credentials });
+    });
+
+    await expect(exchangeConnectAuthCode(params, {
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+    })).resolves.toEqual(credentials);
+  });
+
+  it.each(malformedCredentials)('rejects invalid exchange credentials %#', async (value) => {
+    const fetchImplementation = vi.fn(async (): Promise<Response> => jsonResponse({ data: value }));
+
+    await expect(exchangeConnectAuthCode({
+      code: 'connect_auth_code_123',
+      intentId: 'connect_intent_123',
+      state: 'state_123',
+    }, { fetch: fetchImplementation })).rejects.toThrow('Invalid Connect auth exchange response.');
+  });
+
+  it('renews using the refresh credential only and returns its replacement', async () => {
+    const controller = new AbortController();
+    const replacement: ConnectAuthCredentials = {
+      ...credentials,
+      session: { ...credentials.session, sessionId: 'connect_session_replacement' },
+      refreshToken: 'connect_refresh_replacement',
+    };
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      expect(request.url).toBe('https://rare-api.test/v1/connect/auth/refresh');
+      expect(request.method).toBe('POST');
+      expect(request.headers.get('content-type')).toBe('application/json');
+      expect(request.headers.has('authorization')).toBe(false);
+      expect(await request.json()).toEqual({ refreshToken: credentials.refreshToken });
+      expect(init?.signal).toBe(controller.signal);
+      return jsonResponse({ data: replacement });
+    });
+
+    await expect(refreshConnectAuthSession(credentials.refreshToken, {
+      apiUrl: ' https://rare-api.test/// ',
+      fetch: fetchImplementation,
+      signal: controller.signal,
+    })).resolves.toEqual(replacement);
+  });
+
+  it.each(malformedCredentials)('rejects invalid renewal credentials %#', async (value) => {
+    const fetchImplementation = vi.fn(async (): Promise<Response> => jsonResponse({ data: value }));
+
+    await expect(refreshConnectAuthSession(credentials.refreshToken, {
+      fetch: fetchImplementation,
+    })).rejects.toThrow('Invalid Connect auth refresh response.');
+  });
+
+  it('revokes the credential family through the logout endpoint without bearer auth', async () => {
+    const controller = new AbortController();
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      expect(request.url).toBe('https://api.superrare.com/v1/connect/auth/logout');
+      expect(request.method).toBe('POST');
+      expect(request.headers.get('content-type')).toBe('application/json');
+      expect(request.headers.has('authorization')).toBe(false);
+      expect(await request.json()).toEqual({ refreshToken: credentials.refreshToken });
+      expect(init?.signal).toBe(controller.signal);
+      return jsonResponse({ data: { revoked: true } });
+    });
+
+    await expect(revokeConnectAuthSession(credentials.refreshToken, {
+      fetch: fetchImplementation,
+      signal: controller.signal,
+    })).resolves.toBeUndefined();
+  });
+
+  it.each([
+    {},
+    { data: {} },
+    { data: { revoked: false } },
+    { data: { revoked: 'true' } },
+    { revoked: true },
+  ])('rejects an unconfirmed revocation response %#', async (value) => {
+    const fetchImplementation = vi.fn(async (): Promise<Response> => jsonResponse(value));
+
+    await expect(revokeConnectAuthSession(credentials.refreshToken, {
+      fetch: fetchImplementation,
+    })).rejects.toThrow('Invalid Connect auth logout response.');
+  });
+
+  describe.each([
+    { name: 'refresh', path: '/v1/connect/auth/refresh', request: refreshConnectAuthSession },
+    { name: 'logout', path: '/v1/connect/auth/logout', request: revokeConnectAuthSession },
+  ])('$name failure handling', ({ path, request }) => {
+    it.each([400, 401, 503])('preserves HTTP status %i and does not replay the credential', async (status) => {
+      const message = status === 503 ? 'Connect storage unavailable' : 'Connect refresh credential is invalid';
+      const fetchImplementation = vi.fn(async (): Promise<Response> =>
+        jsonResponse({ error: message }, { status }),
+      );
+      const operation = request(credentials.refreshToken, { fetch: fetchImplementation });
+
+      await expect(operation).rejects.toBeInstanceOf(SuperRareConnectApiError);
+      await expect(operation).rejects.toMatchObject({ status, path });
+      expect(fetchImplementation).toHaveBeenCalledTimes(1);
+    });
+
+    it('preserves network errors without silently retrying a potentially consumed credential', async () => {
+      const networkError = new TypeError('Failed to fetch');
+      const fetchImplementation = vi.fn(async (): Promise<Response> => { throw networkError; });
+
+      await expect(request(credentials.refreshToken, {
+        fetch: fetchImplementation,
+      })).rejects.toBe(networkError);
+      expect(fetchImplementation).toHaveBeenCalledTimes(1);
+    });
+
+    it('forwards an aborted request rather than replacing or retrying it', async () => {
+      const controller = new AbortController();
+      const abortError = new DOMException('The operation was aborted', 'AbortError');
+      controller.abort(abortError);
+      const fetchImplementation = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (init?.signal?.aborted) {
+          throw init.signal.reason;
+        }
+        throw new Error('Expected the aborted signal to reach the transport.');
+      });
+
+      await expect(request(credentials.refreshToken, {
+        fetch: fetchImplementation,
+        signal: controller.signal,
+      })).rejects.toBe(abortError);
+      expect(fetchImplementation).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('creates login intents', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);
