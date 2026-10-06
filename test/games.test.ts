@@ -58,13 +58,10 @@ function harness(options: {
   storage?: ConnectSessionStorage | false;
   throwOnUnsubscribe?: boolean;
 } = {}) {
-  let listener: ((event: ConnectPopupMessageEvent) => void) | undefined;
+  const listeners = new Set<(event: ConnectPopupMessageEvent) => void>();
   const windows: ConnectPopupWindow[] = [];
   const urls: string[] = [];
-  const unsubscribe = vi.fn(() => {
-    listener = undefined;
-    if (options.throwOnUnsubscribe) throw new Error('Cleanup failed.');
-  });
+  const unsubscribe = vi.fn();
   const fetchImplementation = vi.fn(options.fetch ?? (async () => sessionResponse(true)));
   const client = createSuperRareClient({
     studioUrl, initiatingOrigin: appOrigin, fetch: fetchImplementation,
@@ -80,7 +77,14 @@ function harness(options: {
         windows.push(popup);
         return popup;
       },
-      messageEvents: { subscribe(next) { listener = next; return unsubscribe; } },
+      messageEvents: { subscribe(next) {
+        listeners.add(next);
+        return () => {
+          listeners.delete(next);
+          unsubscribe();
+          if (options.throwOnUnsubscribe) throw new Error('Cleanup failed.');
+        };
+      } },
     },
   });
   const game = client.games.forGame({ appId, groupId });
@@ -90,7 +94,8 @@ function harness(options: {
     ...authorization, ...fields,
   });
   const emit = (data = message(), event: Partial<ConnectPopupMessageEvent> = {}) => {
-    listener?.({ origin: studioUrl, source: windows[windows.length - 1], data, ...event });
+    const messageEvent = { origin: studioUrl, source: windows[windows.length - 1], data, ...event };
+    listeners.forEach((listener) => listener(messageEvent));
   };
   const connect = async () => {
     const pending = game.connect();
@@ -246,6 +251,30 @@ describe('game connection', () => {
     h.emit();
     await pending;
   });
+
+  it.each(['clearSession', 'logout'] as const)(
+    'opens a fresh game authorization after pending connection %s',
+    async (replacement) => {
+      const h = harness();
+      const stale = h.game.connect();
+      if (replacement === 'clearSession') {
+        h.client.auth.clearSession();
+      } else {
+        await h.client.auth.logout();
+      }
+
+      const current = h.game.connect();
+      expect(h.urls).toHaveLength(2);
+      at(h.windows, 0).closed = true;
+      await connectionError(stale, 'cancelled');
+
+      const shared = h.game.connect();
+      expect(h.urls).toHaveLength(2);
+      h.emit();
+      await expect(current).resolves.toEqual(authorization);
+      await expect(shared).resolves.toEqual(authorization);
+    },
+  );
 
   it('shares valid authorization across instances for the same scope, not another app', async () => {
     const h = harness();

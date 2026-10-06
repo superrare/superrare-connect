@@ -1033,7 +1033,10 @@ export function createSuperRareClient(
   };
 
   const gameAuthorizations = new Map<string, { authorization: GameAuthorization; generation: number }>();
-  const gameConnections = new Map<string, Promise<GameAuthorization>>();
+  const gameConnections = new Map<string, {
+    generation: number;
+    promise: Promise<GameAuthorization>;
+  }>();
   const gameAttempts = new Map<string, GamePendingAttempt>();
   const games: SuperRareConnectGamesNamespace = {
     forGame({ appId, groupId }): SuperRareGameClient {
@@ -1142,13 +1145,17 @@ export function createSuperRareClient(
       const connect = async (): Promise<GameAuthorization> => {
         const existing = currentAuthorization();
         if (existing !== undefined) return { ...existing };
-        const inFlight = gameConnections.get(scopeKey());
-        if (inFlight !== undefined) return inFlight;
+        const connectionKey = scopeKey();
+        const generation = sessionLifecycle.getReplacementGeneration();
+        const inFlight = gameConnections.get(connectionKey);
+        if (inFlight !== undefined) {
+          if (inFlight.generation === generation) return inFlight.promise;
+          gameConnections.delete(connectionKey);
+        }
         if (groupId === undefined) throw new Error('Game connection requires groupId.');
         if (messageEvents === undefined) throw new Error('Game connection requires browser message events.');
         const appOrigin = requireAppOrigin();
         const state = createConnectState();
-        const generation = sessionLifecycle.getReplacementGeneration();
         const authorizationUrl = buildGameAuthorizationUrl({ studioUrl: requireStudioUrl(), appId, groupId, appOrigin, state });
         const popup = openPopupWindow(`superrare-connect-game-${createConnectPopupName()}`, authorizationUrl);
         if (popup === null) throw new ConnectPopupBlockedError();
@@ -1181,7 +1188,7 @@ export function createSuperRareClient(
               finish(() => reject(new GameConnectionError('authorization_required')));
               return;
             }
-            gameAuthorizations.set(scopeKey(), { authorization: { ...parsed.authorization }, generation });
+            gameAuthorizations.set(connectionKey, { authorization: { ...parsed.authorization }, generation });
             finish(() => resolve(parsed.authorization));
           });
           if (settled) {
@@ -1206,8 +1213,12 @@ export function createSuperRareClient(
           };
           void watch();
         });
-        const tracked = connection.finally(() => { gameConnections.delete(scopeKey()); });
-        gameConnections.set(scopeKey(), tracked);
+        const tracked = connection.finally(() => {
+          if (gameConnections.get(connectionKey)?.promise === tracked) {
+            gameConnections.delete(connectionKey);
+          }
+        });
+        gameConnections.set(connectionKey, { generation, promise: tracked });
         return tracked;
       };
       const requestConsent = async (
