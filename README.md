@@ -25,6 +25,66 @@ const superrare = createSuperRareClient({
 });
 ```
 
+## Studio Games, Credits, And Leaderboards
+
+Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
+
+```ts
+const superrare = createSuperRareClient({
+  studioUrl: 'https://studio.example',
+});
+const game = superrare.games.forGame({ appId: 'your-studio-product-uuid' });
+const freeStartKey = crypto.randomUUID();
+const started = await game.start({ clientBuildId: 'web-2026-10-06', idempotencyKey: freeStartKey });
+```
+Pass the same `idempotencyKey` when retrying an unresolved free start.
+
+For a Studio-configured credit-gated game, include its group and call `startWithApproval` directly from a click. The SDK opens the trusted Studio approval surface. Connect login can be reused there; approving one play does not sign a wallet transaction. Studio—not the browser—selects the approved app, origin, account, and configured cost (one credit by default).
+
+Supply and persist a caller-owned `idempotencyKey` for every paid start, including `startWithConsent` retries. The SDK requires this key so an unknown outcome can be retried with the same identity and, when recovery storage is enabled, recovered with `recoverStart`.
+
+```ts
+const paidGame = superrare.games.forGame({
+  appId: 'your-studio-product-uuid',
+  groupId: 'your-credit-group-uuid',
+});
+
+const idempotencyKey = crypto.randomUUID();
+const started = await paidGame.startWithApproval({ idempotencyKey });
+// Persist the idempotency key while the start is unresolved. Reuse it; never
+// create another start merely because the response was lost.
+```
+
+The approval produces a short-lived, one-use credential bound to the app, group, origin, request, wallet account, and configured cost. Studio reserves before initializing the real game session, captures exactly once after initialization, releases only a definite initialization failure, and leaves timeouts or unknown outcomes reserved for reconciliation. A ready or terminal play is never automatically refunded. The returned `PlaySession` is narrow and game-bound; broad Connect access/refresh credentials remain on Studio.
+
+Client-provided scores are deliberately named `submitClientAssertedScore`. They are session-bound assertions, not trusted or server-validated results:
+
+```ts
+await game.submitClientAssertedScore({
+  sessionToken: started.session.token,
+  score: 12500,
+  idempotencyKey: crypto.randomUUID(),
+});
+
+const run = await game.startServerValidatedRun({
+  sessionToken: started.session.token,
+  eventId: 'studio-scoring-event-uuid',
+  idempotencyKey: crypto.randomUUID(),
+});
+// Send supported run inputs to run.run.webSocketUrl. Studio's verifier owns
+// authoritative calculation and records the verified result.
+```
+
+Leaderboard reads use the same game client:
+
+```ts
+const leaders = await game.getLeaderboard({ leaderboardKey: 'default', limit: 25 });
+const mine = await game.getMyBest({ sessionToken: started.session.token });
+await game.complete({ sessionId: started.session.id, sessionToken: started.session.token });
+```
+
+With a `groupId`, `game.credits` exposes balance and the real quote/claim/recovery endpoints. The SDK does not fabricate a USDC transfer method: send the exact quoted transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
+
 ## Browser Embed
 
 ```html

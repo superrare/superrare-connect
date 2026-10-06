@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import {
   claimConnectAuthCode,
   createConnectIntent,
@@ -65,9 +66,36 @@ import {
   type ConnectPopupLoginResult,
 } from './popup-login-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
+import {
+  parseClientScore,
+  parseCreditBalance,
+  parseGameSessionStart,
+  parseLeaderboard,
+  parseMyBest,
+  parsePurchase,
+  parseServerRun,
+  requestStudioJson,
+  type ClientAssertedScoreResult,
+  type GameCreditBalance,
+  type GameCreditPurchase,
+  type GameLeaderboard,
+  type GameLeaderboardEntry,
+  type GameSessionStart,
+  type ServerValidatedGameRun,
+} from './games-api.js';
+import {
+  buildGameApprovalUrl,
+  createGameStartFingerprint,
+  gameIdempotencyKeySchema,
+  normalizeStudioUrl,
+  parseGameConsentMessage,
+  type GamePaidConsent,
+} from './games-core.js';
 
 export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   connectUrl?: string;
+  /** Explicit SuperRare Studio API origin used only by the games namespace. */
+  studioUrl?: string;
   initiatingOrigin?: string;
   createState?: () => string;
   /**
@@ -107,6 +135,7 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
 export type ConnectPopupMessageEvent = {
   origin: string;
   data: unknown;
+  source?: unknown;
 };
 
 export type ConnectPopupMessageEvents = {
@@ -188,6 +217,43 @@ export type SuperRareConnectIntentsNamespace = {
   get: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
+export type SuperRareGameStartParams = {
+  idempotencyKey?: string;
+  clientSessionId?: string;
+  clientBuildId?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type SuperRareGameClient = {
+  /** Starts a free session. Paid games require `startWithApproval` or `startWithConsent`. */
+  start: (params?: SuperRareGameStartParams) => Promise<GameSessionStart>;
+  /** Opens Studio for explicit paid consent, then initializes and captures one play. */
+  startWithApproval: (params: SuperRareGameStartParams & { idempotencyKey: string }) => Promise<GameSessionStart>;
+  /** Retries a paid start with the same caller-owned key and one-use consent. */
+  startWithConsent: (params: SuperRareGameStartParams & { idempotencyKey: string; consent: GamePaidConsent }) => Promise<GameSessionStart>;
+  /** Recovers a consent/start saved before a lost response or page reload. */
+  recoverStart: (params: SuperRareGameStartParams & { idempotencyKey: string }) => Promise<GameSessionStart>;
+  complete: (params: { sessionId: string; sessionToken: string }) => Promise<{ completed: true; idempotentReplay: boolean }>;
+  /** Client-provided scores are session-bound assertions, never authoritative server validation. */
+  submitClientAssertedScore: (params: {
+    sessionToken: string; leaderboardKey?: string; seasonKey?: string; score: number;
+    idempotencyKey: string; secondaryValue?: number; metadata?: Record<string, unknown>;
+  }) => Promise<ClientAssertedScoreResult>;
+  startServerValidatedRun: (params: { sessionToken: string; eventId: string; idempotencyKey: string }) => Promise<ServerValidatedGameRun>;
+  getLeaderboard: (params?: { leaderboardKey?: string; seasonKey?: string; limit?: number; cursor?: string }) => Promise<GameLeaderboard>;
+  getMyBest: (params: { sessionToken: string; leaderboardKey?: string; seasonKey?: string }) => Promise<GameLeaderboardEntry | null>;
+  credits: {
+    getBalance: () => Promise<GameCreditBalance>;
+    createPurchase: () => Promise<GameCreditPurchase>;
+    getPurchase: (purchaseId: string) => Promise<GameCreditPurchase>;
+    claimPurchase: (params: { purchaseId: string; transactionHash: string }) => Promise<{ purchase: GameCreditPurchase; balance: GameCreditBalance }>;
+  };
+};
+
+export type SuperRareConnectGamesNamespace = {
+  forGame: (params: { appId: string; groupId?: string }) => SuperRareGameClient;
+};
+
 export type SuperRareConnectClient = {
   auth: SuperRareConnectAuthNamespace;
   user: SuperRareConnectUserNamespace;
@@ -195,6 +261,7 @@ export type SuperRareConnectClient = {
   actions: SuperRareConnectActionsNamespace;
   offers: SuperRareConnectOffersNamespace;
   intents: SuperRareConnectIntentsNamespace;
+  games: SuperRareConnectGamesNamespace;
 };
 
 export class ConnectAuthPendingError extends Error {
@@ -953,6 +1020,212 @@ export function createSuperRareClient(
     return await inFlightPopupLogin;
   };
 
+  const games: SuperRareConnectGamesNamespace = {
+    forGame({ appId, groupId }): SuperRareGameClient {
+      if (appId.trim().length === 0) throw new Error('games.forGame requires appId.');
+      const studioUrl = options.studioUrl === undefined ? undefined : normalizeStudioUrl(options.studioUrl);
+      const requireStudioUrl = (): string => {
+        if (studioUrl === undefined) {
+          throw new Error('The games namespace requires an explicit studioUrl.');
+        }
+        return studioUrl;
+      };
+      const gamePath = `/api/v1/games/${encodeURIComponent(appId)}`;
+      const groupPath = groupId === undefined
+        ? undefined
+        : `/api/v1/credit-groups/${encodeURIComponent(groupId)}`;
+      const pendingConsentKey = (idempotencyKey: string): string =>
+        `superrare.connect.game-consent:${encodeURIComponent(requireStudioUrl())}:${appId}:${groupId ?? 'free'}:${idempotencyKey}`;
+      const validatePaidStart = (
+        params: SuperRareGameStartParams & { idempotencyKey: string },
+      ): SuperRareGameStartParams & { idempotencyKey: string } => {
+        if (!gameIdempotencyKeySchema.safeParse(params.idempotencyKey).success) {
+          throw new Error('Game idempotencyKey must contain 8 to 128 URL-safe characters.');
+        }
+        return params;
+      };
+      const sessionBody = (params: SuperRareGameStartParams): Record<string, unknown> => ({
+        ...(params.clientSessionId === undefined ? {} : { clientSessionId: params.clientSessionId }),
+        ...(params.clientBuildId === undefined ? {} : { clientBuildId: params.clientBuildId }),
+        ...(params.metadata === undefined ? {} : { metadata: params.metadata }),
+      });
+      const submitPaidStart = async (
+        start: SuperRareGameStartParams & { idempotencyKey: string },
+        consent: GamePaidConsent,
+      ): Promise<GameSessionStart> => {
+        if (groupPath === undefined || groupId === undefined) {
+          throw new Error('A groupId is required for a paid game start.');
+        }
+        if (consent.appId !== appId || consent.groupId !== groupId) {
+          throw new Error('The paid consent is bound to a different game or credit group.');
+        }
+        const result = parseGameSessionStart(await requestStudioJson({
+          studioUrl: requireStudioUrl(), fetch: options.fetch,
+          path: `${groupPath}/apps/${encodeURIComponent(appId)}/uses`, method: 'POST',
+          authorization: `GameConsent ${consent.consentToken}`,
+          idempotencyKey: start.idempotencyKey,
+          body: { ...sessionBody(start), idempotencyKey: start.idempotencyKey },
+        }));
+        try { storage?.removeItem(pendingConsentKey(start.idempotencyKey)); } catch { /* Recovery storage is best-effort. */ }
+        return result;
+      };
+      const startWithConsent = async (
+        params: SuperRareGameStartParams & { idempotencyKey: string; consent: GamePaidConsent },
+      ): Promise<GameSessionStart> => {
+        const start = validatePaidStart(params);
+        return await submitPaidStart(start, params.consent);
+      };
+      const requestPaidConsent = async (
+        params: SuperRareGameStartParams & { idempotencyKey: string },
+      ): Promise<GamePaidConsent> => {
+        if (groupId === undefined) throw new Error('A groupId is required for paid approval.');
+        if (messageEvents === undefined) throw new Error('Paid game approval requires browser message events.');
+        const appOrigin = options.initiatingOrigin ?? readBrowserOrigin();
+        if (appOrigin === undefined) throw new Error('Paid game approval requires an initiating browser origin.');
+        const state = createConnectState();
+        const fingerprint = createGameStartFingerprint({ appId, groupId, ...params });
+        const approvalUrl = buildGameApprovalUrl({
+          studioUrl: requireStudioUrl(), appId, groupId, appOrigin, state,
+          idempotencyKey: params.idempotencyKey, fingerprint,
+        });
+        const popup = openPopupWindow(`superrare-connect-game-${createConnectPopupName()}`, approvalUrl);
+        if (popup === null) throw new ConnectPopupBlockedError();
+        const expectedOrigin = new URL(approvalUrl).origin;
+        return await new Promise<GamePaidConsent>((resolve, reject) => {
+          let settled = false;
+          const finish = (operation: () => void): void => {
+            if (settled) return;
+            settled = true;
+            try { unsubscribe(); } catch { /* Cleanup must not prevent settlement. */ }
+            try { if (!isPopupClosed(popup)) popup.close(); } catch { /* Already gone. */ }
+            operation();
+          };
+          const unsubscribe = messageEvents.subscribe((event) => {
+            if (event.source !== popup) return;
+            const parsed = parseGameConsentMessage({
+              data: event.data, origin: event.origin, expectedOrigin, expectedState: state, appId, groupId,
+            });
+            if (!parsed.ok) return;
+            try { storage?.setItem(pendingConsentKey(params.idempotencyKey), JSON.stringify(parsed.consent)); } catch { /* Caller can retain consent manually. */ }
+            finish(() => { resolve(parsed.consent); });
+          });
+          const deadline = Date.now() + 5 * 60_000;
+          const watch = async (): Promise<void> => {
+            while (!settled) {
+              await sleep(POPUP_POLL_INTERVAL_MS);
+              if (isPopupClosed(popup)) {
+                finish(() => { reject(new Error('Paid game approval was cancelled.')); });
+                return;
+              }
+              if (Date.now() >= deadline) {
+                finish(() => { reject(new Error('Paid game approval expired.')); });
+                return;
+              }
+            }
+          };
+          void watch();
+        });
+      };
+      const connectAuthorization = async (): Promise<string> => {
+        const session = await sessionLifecycle.getCurrentSession();
+        if (session === undefined) throw new ConnectSessionRequiredError();
+        return `ConnectSession ${session.sessionId}`;
+      };
+      return {
+        async start(params = {}): Promise<GameSessionStart> {
+          if (groupId !== undefined) throw new Error('Credit-gated games must use startWithApproval or startWithConsent.');
+          if (params.idempotencyKey !== undefined && !gameIdempotencyKeySchema.safeParse(params.idempotencyKey).success) {
+            throw new Error('Game idempotencyKey must contain 8 to 128 URL-safe characters.');
+          }
+          return parseGameSessionStart(await requestStudioJson({
+            studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/sessions`, method: 'POST',
+            ...(params.idempotencyKey === undefined ? {} : { idempotencyKey: params.idempotencyKey }),
+            body: {
+              ...sessionBody(params),
+              ...(params.idempotencyKey === undefined ? {} : { idempotencyKey: params.idempotencyKey }),
+            },
+          }));
+        },
+        async startWithApproval(params: SuperRareGameStartParams & { idempotencyKey: string }): Promise<GameSessionStart> {
+          const start = validatePaidStart(params);
+          const consent = await requestPaidConsent(start);
+          return await submitPaidStart(start, consent);
+        },
+        startWithConsent,
+        async recoverStart(params): Promise<GameSessionStart> {
+          let saved: string | null | undefined;
+          try { saved = storage?.getItem(pendingConsentKey(params.idempotencyKey)); }
+          catch { throw new Error('Paid game recovery storage is unavailable.'); }
+          if (saved === null || saved === undefined) throw new Error('No recoverable paid game start was found.');
+          let value: unknown;
+          try { value = JSON.parse(saved); } catch { throw new Error('The saved paid game consent is invalid.'); }
+          const consent = z.object({ appId: z.string(), groupId: z.string(), consentId: z.string(),
+            consentToken: z.string(), expiresAt: z.string(), }).parse(value);
+          return await startWithConsent({ ...params, consent });
+        },
+        async complete(params): Promise<{ completed: true; idempotentReplay: boolean }> {
+          const value = await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/sessions/${encodeURIComponent(params.sessionId)}/complete`, method: 'POST',
+            authorization: `PlaySession ${params.sessionToken}`, body: {}, });
+          return z.object({ completed: z.literal(true), idempotentReplay: z.boolean() }).parse(value);
+        },
+        async submitClientAssertedScore(params): Promise<ClientAssertedScoreResult> {
+          const board = params.leaderboardKey ?? 'default';
+          return parseClientScore(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/leaderboards/${encodeURIComponent(board)}/scores`, method: 'POST',
+            authorization: `PlaySession ${params.sessionToken}`, idempotencyKey: params.idempotencyKey,
+            body: { score: params.score, seasonKey: params.seasonKey, secondaryValue: params.secondaryValue,
+              metadata: params.metadata, idempotencyKey: params.idempotencyKey }, }));
+        },
+        async startServerValidatedRun(params): Promise<ServerValidatedGameRun> {
+          return parseServerRun(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/scoring/events/${encodeURIComponent(params.eventId)}/runs`, method: 'POST',
+            authorization: `PlaySession ${params.sessionToken}`, body: { idempotencyKey: params.idempotencyKey }, }));
+        },
+        async getLeaderboard(params = {}): Promise<GameLeaderboard> {
+          const query = new URLSearchParams();
+          if (params.seasonKey !== undefined) query.set('season', params.seasonKey);
+          if (params.limit !== undefined) query.set('limit', String(params.limit));
+          if (params.cursor !== undefined) query.set('cursor', params.cursor);
+          const suffix = query.size === 0 ? '' : `?${query.toString()}`;
+          return parseLeaderboard(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/leaderboards/${encodeURIComponent(params.leaderboardKey ?? 'default')}/entries${suffix}`, }));
+        },
+        async getMyBest(params): Promise<GameLeaderboardEntry | null> {
+          const query = params.seasonKey === undefined ? '' : `?season=${encodeURIComponent(params.seasonKey)}`;
+          return parseMyBest(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/leaderboards/${encodeURIComponent(params.leaderboardKey ?? 'default')}/me${query}`,
+            authorization: `PlaySession ${params.sessionToken}`, }));
+        },
+        credits: {
+          async getBalance(): Promise<GameCreditBalance> {
+            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
+            return parseCreditBalance(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+              path: `${groupPath}/me`, authorization: await connectAuthorization(), }));
+          },
+          async createPurchase(): Promise<GameCreditPurchase> {
+            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
+            return parsePurchase(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+              path: `${groupPath}/purchases`, method: 'POST', authorization: await connectAuthorization(), }));
+          },
+          async getPurchase(purchaseId): Promise<GameCreditPurchase> {
+            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
+            return parsePurchase(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+              path: `${groupPath}/purchases/${encodeURIComponent(purchaseId)}`, authorization: await connectAuthorization(), }));
+          },
+          async claimPurchase(params): Promise<{ purchase: GameCreditPurchase; balance: GameCreditBalance }> {
+            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
+            const value = await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+              path: `${groupPath}/purchases/${encodeURIComponent(params.purchaseId)}/claim`, method: 'POST',
+              authorization: await connectAuthorization(), body: { transactionHash: params.transactionHash }, });
+            return { purchase: parsePurchase(value), balance: parseCreditBalance(value) };
+          },
+        },
+      };
+    },
+  };
+
   return {
     auth: {
       login,
@@ -1079,6 +1352,7 @@ export function createSuperRareClient(
         });
       },
     },
+    games,
   };
 }
 
@@ -1226,7 +1500,7 @@ function readBrowserMessageEvents(): ConnectPopupMessageEvents | undefined {
     subscribe(listener) {
       const domListener = (event: unknown): void => {
         if (isConnectPopupMessageEvent(event)) {
-          listener({ origin: event.origin, data: event.data });
+          listener({ origin: event.origin, data: event.data, source: event.source });
         }
       };
       addEventListener.call(globalThis, 'message', domListener);
@@ -1384,4 +1658,3 @@ function resolveHostedConnectUrl(input: {
   hostedUrl.password = connectUrl.password;
   return hostedUrl.toString();
 }
-
