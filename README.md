@@ -25,7 +25,9 @@ const superrare = createSuperRareClient({
 });
 ```
 
-## Studio Games, Credits, And Leaderboards
+## Studio Games, Credits, And Leaderboards (Beta)
+
+**Beta access:** This feature is not generally released. Use is limited to integrations with a beta API key. Contact SuperRare for beta access before using this SDK surface.
 
 Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
 
