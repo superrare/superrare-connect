@@ -32,7 +32,9 @@ export {
   type ServerValidatedGameRun,
 } from './games-api.js';
 export {
-  GAME_CONSENT_MESSAGE_TYPE,
+  GameConnectionError,
+  type GameAuthorization,
+  type GameCreditTerms,
   type GamePaidConsent,
 } from './games-core.js';
 export {

@@ -11,7 +11,17 @@
       <button id="login" type="button">Log in with SuperRare</button>
       <button id="buy" type="button">Buy ERC-721</button>
       <button id="start-free-game" type="button">Start free Studio game</button>
-      <button id="start-paid-game" type="button">Approve paid Studio game</button>
+      <section aria-labelledby="paid-game-heading">
+        <h2 id="paid-game-heading">Paid Studio game (beta)</h2>
+        <p>Beta access requires a beta API key from SuperRare. No API key is configured or exposed by this example.</p>
+        <p>Connect game authorizes this game without spending credits. Review the terms, then confirm a single paid play separately.</p>
+        <button id="connect-game" type="button">Connect game / renew connection</button>
+        <p id="game-terms" aria-live="polite">Connect game to load authoritative terms. No play starts automatically.</p>
+        <button id="play-game" type="button" disabled>Play — load terms first</button>
+        <button id="recover-game" type="button" disabled>Recover original play</button>
+        <p id="game-recovery" aria-live="polite">Keep an unresolved attempt's original key. Recovery retries that attempt, not a new purchase.</p>
+        <p>Cancellation or expiry requires another explicit Connect game click. A changed cost requires fresh displayed confirmation. An unknown response is not permission to start another round.</p>
+      </section>
       <pre id="output"></pre>
     </main>
     <script type="module" src="./main.ts"></script>

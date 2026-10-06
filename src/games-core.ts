@@ -1,95 +1,89 @@
 import { z } from 'zod';
 
-export const gameIdempotencyKeySchema = z
-  .string()
-  .min(8)
-  .max(128)
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._:~-]{7,127}$/);
+export const gameIdempotencyKeySchema = z.string().min(8).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._:~-]{7,127}$/);
+const identifierSchema = z.string().min(1);
+export const gamePaidConsentSchema = z.object({
+  appId: identifierSchema, groupId: identifierSchema, consentId: identifierSchema,
+  consentToken: identifierSchema, expiresAt: z.iso.datetime({ offset: true }), credits: z.number().int().positive().optional(),
+});
+export type GamePaidConsent = z.infer<typeof gamePaidConsentSchema>;
+export const gameAuthorizationSchema = z.object({
+  appId: identifierSchema, groupId: identifierSchema, appOrigin: z.url(),
+  authorizationToken: identifierSchema, expiresAt: z.iso.datetime({ offset: true }), address: identifierSchema,
+});
+export type GameAuthorization = z.infer<typeof gameAuthorizationSchema>;
+export const gameCreditTermsSchema = z.object({
+  appId: identifierSchema, groupId: identifierSchema, appOrigin: z.url(), credits: z.number().int().positive(), title: z.string(),
+});
+export type GameCreditTerms = z.infer<typeof gameCreditTermsSchema>;
+export const inlineConsentResponseSchema = z.object({ version: z.literal('1'), consent: z.object({
+  id: identifierSchema, appId: identifierSchema, groupId: identifierSchema, consentToken: identifierSchema,
+  credits: z.number().int().positive(), expiresAt: z.iso.datetime({ offset: true }),
+}) });
+export const gameTermsResponseSchema = z.object({ version: z.literal('1'), terms: gameCreditTermsSchema });
+export const gameConsentRequestSchema = z.object({
+  idempotencyKey: gameIdempotencyKeySchema, fingerprint: z.string().min(1).max(256), expectedCredits: z.number().int().positive(),
+  clientSessionId: z.string().optional(), clientBuildId: z.string().optional(), metadata: z.record(z.string(), z.unknown()).optional(),
+});
+export type GameConsentRequest = z.infer<typeof gameConsentRequestSchema>;
+export const gamePendingAttemptSchema = z.object({ request: gameConsentRequestSchema, consent: gamePaidConsentSchema.optional() });
+export type GamePendingAttempt = z.infer<typeof gamePendingAttemptSchema>;
 
-export type GameStartFingerprintInput = {
-  appId: string;
-  groupId?: string;
-  idempotencyKey: string;
-  clientSessionId?: string;
-  clientBuildId?: string;
-  metadata?: Record<string, unknown>;
-};
+export class GameConnectionError extends Error {
+  constructor(readonly code: 'cancelled' | 'expired' | 'authorization_required' | 'invalid_origin' | 'invalid_message' | 'attempt_mismatch') {
+    super(`Game connection: ${code}.`);
+    this.name = 'GameConnectionError';
+  }
+}
 
 export function normalizeStudioUrl(studioUrl: string): string {
   const parsed = new URL(studioUrl);
-  const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+  const loopback: Record<string, true | undefined> = { localhost: true, '127.0.0.1': true, '[::1]': true };
+  if (parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') {
     throw new Error('studioUrl must be an origin without credentials, a path, query, or fragment.');
   }
-  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback.has(parsed.hostname))) {
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback[parsed.hostname] === true)) {
     throw new Error('studioUrl must use HTTPS, except for loopback development.');
   }
   return parsed.origin;
 }
 
-export function createGameStartFingerprint(input: GameStartFingerprintInput): string {
-  // The fingerprint is an equality binding inside Studio's one-use consent,
-  // not an authenticator (the random consent credential is). Keep it
-  // synchronous so the approval popup can open inside the user's gesture.
-  return [input.appId, input.groupId ?? 'free', input.idempotencyKey].join(':');
-}
-
-export function buildGameApprovalUrl(input: {
-  studioUrl: string;
-  appId: string;
-  groupId: string;
-  appOrigin: string;
-  state: string;
-  idempotencyKey: string;
-  fingerprint: string;
+export function buildGameAuthorizationUrl(input: {
+  studioUrl: string; appId: string; groupId: string; appOrigin: string; state: string;
 }): string {
-  const url = new URL('/connect/games/approve', normalizeStudioUrl(input.studioUrl));
+  const url = new URL('/connect/games/authorize', normalizeStudioUrl(input.studioUrl));
   url.searchParams.set('appId', input.appId);
   url.searchParams.set('groupId', input.groupId);
   url.searchParams.set('appOrigin', input.appOrigin);
   url.searchParams.set('state', input.state);
-  url.searchParams.set('idempotencyKey', input.idempotencyKey);
-  url.searchParams.set('fingerprint', input.fingerprint);
   return url.toString();
 }
 
-export const GAME_CONSENT_MESSAGE_TYPE = 'superrare-connect:game-consent';
-
-const gameConsentMessageSchema = z.object({
-  type: z.literal(GAME_CONSENT_MESSAGE_TYPE),
-  state: z.string().min(1),
-  appId: z.string().min(1),
-  groupId: z.string().min(1),
-  consentId: z.string().min(1),
-  consentToken: z.string().min(1),
-  expiresAt: z.string().min(1),
+const authorizationMessageSchema = gameAuthorizationSchema.extend({
+  type: z.literal('superrare-connect:game-authorization'), state: z.string().min(16).max(256),
 });
-
-export type GamePaidConsent = Omit<z.infer<typeof gameConsentMessageSchema>, 'type' | 'state'>;
-
-export type GameConsentMessageResult =
-  | { ok: true; consent: GamePaidConsent }
-  | { ok: false; error: 'not_game_consent' | 'origin_mismatch' | 'state_mismatch' | 'binding_mismatch' | 'malformed_message' };
-
-export function parseGameConsentMessage(input: {
-  data: unknown;
-  origin: string;
-  expectedOrigin: string;
-  expectedState: string;
-  appId: string;
-  groupId: string;
-}): GameConsentMessageResult {
-  if (!input.data || typeof input.data !== 'object' || !('type' in input.data)
-    || input.data.type !== GAME_CONSENT_MESSAGE_TYPE) {
-    return { ok: false, error: 'not_game_consent' };
+const authorizationBindingSchema = authorizationMessageSchema.pick({
+  type: true, state: true, appId: true, groupId: true, appOrigin: true,
+});
+const cancelledMessageSchema = z.object({
+  type: z.literal('superrare-connect:game-authorization-cancelled'), state: z.string().min(16).max(256),
+  appId: identifierSchema, groupId: identifierSchema,
+});
+export function parseGameAuthorizationMessage(input: {
+  data: unknown; origin: string; expectedOrigin: string; expectedState: string;
+  appId: string; groupId: string; appOrigin: string; now: number;
+}): { status: 'ignored' } | { status: 'cancelled' } | { status: 'expired' } | { status: 'invalid_message' } | { status: 'authorized'; authorization: GameAuthorization } {
+  if (input.origin !== input.expectedOrigin) return { status: 'ignored' };
+  const cancelled = cancelledMessageSchema.safeParse(input.data);
+  if (cancelled.success && cancelled.data.state === input.expectedState && cancelled.data.appId === input.appId && cancelled.data.groupId === input.groupId) {
+    return { status: 'cancelled' };
   }
-  if (input.origin !== input.expectedOrigin) return { ok: false, error: 'origin_mismatch' };
-  const parsed = gameConsentMessageSchema.safeParse(input.data);
-  if (!parsed.success) return { ok: false, error: 'malformed_message' };
-  if (parsed.data.state !== input.expectedState) return { ok: false, error: 'state_mismatch' };
-  if (parsed.data.appId !== input.appId || parsed.data.groupId !== input.groupId) {
-    return { ok: false, error: 'binding_mismatch' };
-  }
-  const { type: _type, state: _state, ...consent } = parsed.data;
-  return { ok: true, consent };
+  const binding = authorizationBindingSchema.safeParse(input.data);
+  if (!binding.success || binding.data.state !== input.expectedState || binding.data.appId !== input.appId
+    || binding.data.groupId !== input.groupId || binding.data.appOrigin !== input.appOrigin) return { status: 'ignored' };
+  const result = authorizationMessageSchema.safeParse(input.data);
+  if (!result.success) return { status: 'invalid_message' };
+  if (Date.parse(result.data.expiresAt) <= input.now) return { status: 'expired' };
+  const { type: _type, state: _state, ...authorization } = result.data;
+  return { status: 'authorized', authorization };
 }

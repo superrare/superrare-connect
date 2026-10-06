@@ -79,11 +79,16 @@ export async function requestStudioJson(input: StudioApiOptions & {
   });
   if (!response.ok) {
     let message = response.statusText || 'Request failed';
+    let code: string | undefined;
     try {
-      const parsed = z.object({ error: z.union([z.string(), z.object({ message: z.string() })]) }).safeParse(await response.clone().json());
-      if (parsed.success) message = typeof parsed.data.error === 'string' ? parsed.data.error : parsed.data.error.message;
+      const value: unknown = await response.clone().json();
+      const parsed = z.object({ error: z.union([z.string(), z.object({ message: z.string(), code: z.string().optional() })]) }).safeParse(value);
+      if (parsed.success) {
+        message = typeof parsed.data.error === 'string' ? parsed.data.error : parsed.data.error.message;
+        code = typeof parsed.data.error === 'string' ? undefined : parsed.data.error.code;
+      }
     } catch { /* Keep the HTTP fallback. */ }
-    throw new SuperRareConnectApiError(message, response.status, input.path);
+    throw new SuperRareConnectApiError(message, response.status, input.path, code);
   }
   return await response.json();
 }
