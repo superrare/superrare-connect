@@ -386,6 +386,170 @@ describe('Connect API client', () => {
     });
   });
 
+  it('parses a liquid edition buy snapshot and keeps the quoted output terms', async () => {
+    const liquidEditionBuySnapshot = {
+      actionKey: '11155111-0x5547e40bab6f1e967f0031a53ea288dc22cbfa5a-liquid-buy-eth',
+      actionType: 'buy',
+      resolvedAt: '2026-09-30T00:00:00.000Z',
+      targetKind: 'liquid-edition',
+      terms: {
+        available: true,
+        amount: '10000000000000000',
+        currency: 'ETH',
+        outputCurrency: '0x5547E40bAb6f1e967F0031A53Ea288dC22cbFA5a',
+        estimatedAmountOut: '176261894818424719784',
+        minAmountOut: '175380585344332596185',
+        marketplace: '0x429c3Ee66E7f6CDA12C5BadE4104aF3277aA2305',
+      },
+    };
+    const fetchImplementation = vi.fn(async (): Promise<Response> => jsonResponse({
+      data: {
+        intentId: 'connect_intent_liquid_buy',
+        type: 'buy',
+        status: 'pending',
+        returnPath: '/liquid/complete',
+        expiresAt: '2026-09-30T00:15:00.000Z',
+        resolvedActionSnapshot: liquidEditionBuySnapshot,
+      },
+    }));
+
+    const intent = await getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_liquid_buy',
+    });
+
+    expect(intent.resolvedActionSnapshot).toEqual(liquidEditionBuySnapshot);
+  });
+
+  it('parses a liquid edition sell intent and its checkout status snapshot', async () => {
+    const liquidEditionSellSnapshot = {
+      actionKey: '11155111-0x5547e40bab6f1e967f0031a53ea288dc22cbfa5a-liquid-sell-usdc',
+      actionType: 'sell',
+      resolvedAt: '2026-09-30T00:00:00.000Z',
+      targetKind: 'liquid-edition',
+      terms: {
+        available: true,
+        amount: '44065473704606179946',
+        currency: '0x5547E40bAb6f1e967F0031A53Ea288dC22cbFA5a',
+        outputCurrency: 'USDC',
+        estimatedAmountOut: '68649863',
+        minAmountOut: '68306625',
+        marketplace: '0x429c3Ee66E7f6CDA12C5BadE4104aF3277aA2305',
+      },
+    };
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.url.includes('/v1/connect/checkout/')) {
+        return jsonResponse({
+          data: {
+            sessionId: 'connect_checkout_session_liquid',
+            status: 'completed',
+            intentId: 'connect_intent_liquid_sell',
+            resolvedActionSnapshot: liquidEditionSellSnapshot,
+            transactionHash: '0xtransaction',
+          },
+        });
+      }
+
+      return jsonResponse({
+        data: {
+          intentId: 'connect_intent_liquid_sell',
+          type: 'sell',
+          status: 'completed',
+          returnPath: '/liquid/complete',
+          expiresAt: '2026-09-30T00:15:00.000Z',
+          resolvedActionSnapshot: liquidEditionSellSnapshot,
+          result: { transactionHash: '0xtransaction' },
+        },
+      });
+    });
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_liquid_sell',
+    })).resolves.toMatchObject({
+      type: 'sell',
+      resolvedActionSnapshot: liquidEditionSellSnapshot,
+    });
+    await expect(getConnectCheckoutStatus({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      sessionId: 'connect_checkout_session_liquid',
+    })).resolves.toMatchObject({
+      resolvedActionSnapshot: liquidEditionSellSnapshot,
+    });
+  });
+
+  it('reads an intent whose action type and target kind this SDK does not know yet', async () => {
+    const futureSnapshot = {
+      actionKey: '1-0x1234567890123456789012345678901234567890-future',
+      actionType: 'future-action',
+      resolvedAt: '2026-09-30T00:00:00.000Z',
+      targetKind: 'future-target',
+      terms: { available: true },
+    };
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.url.includes('/v1/connect/checkout/')) {
+        return jsonResponse({
+          data: {
+            sessionId: 'connect_checkout_session_future',
+            status: 'completed',
+            resolvedActionSnapshot: futureSnapshot,
+          },
+        });
+      }
+
+      return jsonResponse({
+        data: {
+          intentId: 'connect_intent_future',
+          type: 'future-action',
+          status: 'completed',
+          returnPath: '/',
+          expiresAt: '2026-09-30T00:15:00.000Z',
+          resolvedActionSnapshot: futureSnapshot,
+        },
+      });
+    });
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_future',
+    })).resolves.toMatchObject({
+      type: 'future-action',
+      status: 'completed',
+      resolvedActionSnapshot: futureSnapshot,
+    });
+    await expect(getConnectCheckoutStatus({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      sessionId: 'connect_checkout_session_future',
+    })).resolves.toMatchObject({
+      resolvedActionSnapshot: futureSnapshot,
+    });
+  });
+
+  it('still rejects an intent without an action type', async () => {
+    const fetchImplementation = vi.fn(async (): Promise<Response> => jsonResponse({
+      data: {
+        intentId: 'connect_intent_malformed',
+        type: '',
+        status: 'completed',
+        returnPath: '/',
+        expiresAt: '2026-09-30T00:15:00.000Z',
+      },
+    }));
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_malformed',
+    })).rejects.toThrow('Invalid Connect intent response.');
+  });
+
   it('gets checkout status', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);

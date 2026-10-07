@@ -192,10 +192,32 @@ export type ConnectErc1155CheckoutTarget = {
   items: Array<ConnectErc1155CheckoutReleaseItem | ConnectErc1155CheckoutListingItem>;
 };
 
+export type ConnectLiquidEditionTarget = {
+  kind: 'liquid-edition';
+  chainId: ConnectChainId;
+  contract: ConnectEthereumAddress;
+};
+
+export type ConnectLiquidEditionCurrency = 'ETH' | 'RARE' | 'USDC';
+
+export type ConnectLiquidEditionSpendTerms = {
+  currency: ConnectLiquidEditionCurrency;
+  amount: string;
+};
+
+export type ConnectLiquidEditionSellTerms = {
+  amount: string;
+};
+
+export type ConnectLiquidEditionReceiveTerms = {
+  currency: ConnectLiquidEditionCurrency;
+};
+
 export type ConnectBuyTarget =
   | ConnectErc721DirectListingTarget
   | ConnectErc721BatchListingTarget
-  | ConnectErc1155ListingTarget;
+  | ConnectErc1155ListingTarget
+  | ConnectLiquidEditionTarget;
 
 export type ConnectBidTarget =
   | ConnectErc721ReserveAuctionTarget
@@ -229,6 +251,21 @@ export type ConnectActionInput =
     type: 'buy';
     target: ConnectErc1155ListingTarget;
     expected: ConnectExpectedUnitPriceTerms;
+  }
+  | {
+    type: 'buy';
+    target: ConnectLiquidEditionTarget;
+    spend: ConnectLiquidEditionSpendTerms;
+    minReceived?: string;
+    maxSlippageBps?: number;
+  }
+  | {
+    type: 'sell';
+    target: ConnectLiquidEditionTarget;
+    sell: ConnectLiquidEditionSellTerms;
+    receive: ConnectLiquidEditionReceiveTerms;
+    minReceived?: string;
+    maxSlippageBps?: number;
   }
   | {
     type: 'bid';
