@@ -316,6 +316,81 @@ describe('game connection', () => {
     expect(h.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
   });
 
+  it('preserves a renewed authorization in shared storage after another client receives a stale 401', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const storage = memoryStorage();
+    let resolveConsentResponse: ((response: Response) => void) | undefined;
+    const oldClient = harness({
+      storage,
+      fetch: () => new Promise<Response>((resolve) => { resolveConsentResponse = resolve; }),
+    });
+    const initial = oldClient.game.connect();
+    oldClient.emit(oldClient.message({
+      authorizationToken: 'expired-token',
+      expiresAt: '2026-01-01T00:01:00.000Z',
+    }));
+    await initial;
+
+    const oldConsentRequest = oldClient.game.requestConsent(attempt);
+    vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
+    const renewingClient = harness({ storage });
+    const renewal = renewingClient.game.connect();
+    renewingClient.emit(renewingClient.message({ authorizationToken: 'renewed-token' }));
+    await renewal;
+
+    if (resolveConsentResponse === undefined) throw new Error('Consent fetch did not start.');
+    resolveConsentResponse(Response.json({
+      error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Expired authorization.' },
+    }, { status: 401 }));
+    await expect(oldConsentRequest).rejects.toMatchObject({ status: 401 });
+
+    const reloaded = harness({ storage });
+    expect(reloaded.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
+    expect(reloaded.urls).toEqual([]);
+  });
+
+  it('uses newer stored authorization when a cached authorization expires', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const storage = memoryStorage();
+    const oldClient = harness({ storage });
+    const initial = oldClient.game.connect();
+    oldClient.emit(oldClient.message({ expiresAt: '2026-01-01T00:01:00.000Z' }));
+    await initial;
+
+    vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
+    const renewingClient = harness({ storage });
+    const renewal = renewingClient.game.connect();
+    renewingClient.emit(renewingClient.message({ authorizationToken: 'renewed-token' }));
+    await renewal;
+
+    expect(oldClient.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
+    expect(storage.values.size).toBe(1);
+  });
+
+  it.each(['connect', 'getAuthorization'] as const)(
+    'does not expose cached authorization through %s',
+    async (source) => {
+      const requests: Request[] = [];
+      const h = harness({
+        storage: memoryStorage(),
+        fetch: async (input, init) => {
+          requests.push(new Request(input, init));
+          return consentResponse();
+        },
+      });
+      const connected = await h.connect();
+      const exposed = source === 'connect' ? connected : h.game.getAuthorization();
+      if (exposed === undefined) throw new Error('Expected a connected authorization.');
+      exposed.authorizationToken = 'caller-mutated-token';
+
+      await h.game.requestConsent(attempt);
+
+      expect(at(requests, 0).headers.get('authorization')).toBe('GameAuthorization scoped-authorization');
+    },
+  );
+
   it.each(['clearSession', 'logout'] as const)(
     'opens a fresh game authorization after pending connection %s',
     async (replacement) => {

@@ -44,6 +44,7 @@ Pass the same `idempotencyKey` when retrying an unresolved free start.
 For a Studio-configured credit-gated game, include its group. Start with an explicit `game.connect()` click: it opens Studio's `/connect/games/authorize` surface when authorization is missing or expired, and reuses valid scoped authorization. Connecting never requests consent or starts a play.
 
 The SDK persists validated game authorization by Studio origin, app, credit group, and app origin in its configured storage (browser `localStorage` by default). On page load, `game.getAuthorization()` restores a valid authorization without a popup; it returns `undefined` when none is saved or access has expired. This authorization is separate from SuperRare login. A Studio `401` invalidates it; only an explicit `game.connect()` call opens a renewal popup.
+`GameAuthorization` values returned by `connect()` and `getAuthorization()` are snapshots; changing a returned object does not modify the SDK's cached credential. A Studio `401` invalidates only the matching authorization, preserving a newer authorization another client has already saved to the same storage.
 
 Your game—not the SDK—owns the one-play confirmation UI. Fetch authoritative terms with `getTerms()`, display the title and credit cost, and offer a separate **Play — spend N credits** action. Only that confirmation action may call `requestConsent`. There is no SDK confirmation popup per play:
 
