@@ -10,6 +10,7 @@ import type {
   ConnectErc721OfferTarget,
   ConnectErc721ReleaseTarget,
   ConnectErc721ReserveAuctionTarget,
+  ConnectWalletTarget,
 } from '../src/auth-flow-core.js';
 import type { SuperRareConnectApiError } from '../src/errors.js';
 import type { ConnectIntent } from '../src/status-core.js';
@@ -50,6 +51,12 @@ const checkoutTarget: ConnectErc1155CheckoutTarget = {
       expected: { currency: 'ETH', unitPrice: '1.2' },
     },
   ],
+};
+
+const walletTarget: ConnectWalletTarget = {
+  kind: 'wallet',
+  chainId: 8453,
+  address: '0x3333333333333333333333333333333333333333',
 };
 
 const offerTarget: ConnectErc721OfferTarget = {
@@ -602,6 +609,60 @@ describe('createSuperRareClient', () => {
       });
       expect(popup.replacedUrls).toEqual([
         'https://connect.superrare.test/action/connect_intent_settle?display=popup',
+      ]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts wallet-only ERC-20 transfer intents through actions.transfer', async () => {
+    vi.useFakeTimers();
+    try {
+      const requests: Request[] = [];
+      const popup = createPopupStub();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        initiatingOrigin: 'https://game.example',
+        createState: () => 'state_transfer',
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'GET') return completedIntentStatusResponse(request);
+          requests.push(request);
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_transfer',
+              url: 'https://connect.superrare.test/action/connect_intent_transfer',
+              expiresAt: futureExpiry(),
+            },
+          });
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.transfer({
+        target: walletTarget,
+        transfer: { currency: 'USDC', amount: '2500000' },
+        returnPath: '/transfer/complete',
+      })).resolves.toMatchObject({ intentId: 'connect_intent_transfer' });
+
+      const request = requests[0];
+      if (request === undefined) throw new Error('Transfer intent request was not sent.');
+      expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
+      expect(await request.json()).toEqual({
+        action: {
+          type: 'transfer',
+          target: walletTarget,
+          transfer: { currency: 'USDC', amount: '2500000' },
+        },
+        initiatingOrigin: 'https://game.example',
+        returnPath: '/transfer/complete',
+        state: 'state_transfer',
+      });
+      expect(popup.replacedUrls).toEqual([
+        'https://connect.superrare.test/action/connect_intent_transfer?display=popup',
       ]);
 
       await vi.advanceTimersByTimeAsync(2000);

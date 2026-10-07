@@ -45,6 +45,7 @@ export {
   type MakeOfferActionParams,
   type MintActionParams,
   type SettleActionParams,
+  type TransferActionParams,
 } from './actions-flow-core.js';
 export {
   type ConnectAcceptOfferTarget,
@@ -71,6 +72,9 @@ export {
   type ConnectErc721ReserveAuctionTarget,
   type ConnectErc721ScheduledAuctionTarget,
   type ConnectEthereumAddress,
+  type ConnectTransferCurrency,
+  type ConnectTransferTerms,
+  type ConnectWalletTarget,
   type ConnectExpectedOfferTerms,
   type ConnectExpectedPriceTerms,
   type ConnectExpectedUnitPriceTerms,

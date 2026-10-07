@@ -130,7 +130,7 @@ const mine = await game.getMyBest({ sessionToken: started.session.token });
 await game.complete({ sessionId: started.session.id, sessionToken: started.session.token });
 ```
 
-With a `groupId`, `game.credits` exposes balance and the real quote/claim/recovery endpoints. The SDK does not fabricate a USDC transfer method: send the exact quoted transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
+With a `groupId`, `game.credits` exposes balance and the real quote/claim/recovery endpoints. It does not create or execute the quoted USDC payment: send the exact quoted transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
 
 ## Browser Embed
 
@@ -294,7 +294,7 @@ The SDK never accepts arbitrary calldata, contract instructions, private keys, A
 
 ## Payment Methods
 
-Every action accepts an optional `payment` hint. Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
+Marketplace actions accept an optional `payment` hint. Set `payment: { method: 'wallet' }` to keep a marketplace checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent. `actions.transfer` is always wallet-only and does not accept a payment hint.
 
 **Wallet-only is required when the sale settles on a custom contract whose mint or transfer logic depends on the receiving wallet** — for example a mint that binds a pre-registered artwork to the collector's address. Card settlement executes through a SuperRare buy-proxy that receives the asset itself and re-transfers it to the buyer, so the on-chain receiver is the proxy, not the buyer; such sales revert only after the card was charged. If your contract keys anything on the `mintTo` / transfer receiver, always create its intents wallet-only:
 
@@ -311,7 +311,27 @@ await superrare.actions.mint({
 });
 ```
 
-Omit `payment` to let the hosted checkout offer every method the listing supports.
+Omit `payment` on marketplace actions to let the hosted checkout offer every method the listing supports.
+
+## Wallet Transfers
+
+`actions.transfer` starts a hosted wallet transfer to a non-zero address. The current Connect API accepts `ETH` or `USDC`—not arbitrary ERC-20 symbols—and requires `amount` as a positive integer string in the currency's smallest units (wei for ETH; for example, `'2500000'` is 2.5 USDC). The chain must be enabled by the hosted Connect deployment.
+
+```ts
+const transfer = await superrare.actions.transfer({
+  target: {
+    kind: 'wallet',
+    chainId: 8453,
+    address: '0x3333333333333333333333333333333333333333',
+  },
+  transfer: { currency: 'USDC', amount: '2500000' },
+  returnPath: '/transfer/complete',
+});
+
+const status = await superrare.actions.getStatus({ intentId: transfer.intentId });
+```
+
+The hosted Connect page handles wallet connection and transaction execution. Check the final intent status before treating the transfer as complete.
 
 ## Anonymous Auction Settlement
 

@@ -15,6 +15,7 @@ import {
   type ConnectSessionState,
 } from './api.js';
 import {
+  type BuildConnectActionIntentRequestResult,
   buildConnectAcceptOfferIntentRequest,
   buildConnectBidIntentRequest,
   buildConnectBuyIntentRequest,
@@ -22,6 +23,7 @@ import {
   buildConnectMakeOfferIntentRequest,
   buildConnectMintIntentRequest,
   buildConnectSettleIntentRequest,
+  buildConnectTransferIntentRequest,
   type AcceptOfferActionParams,
   type BidActionParams,
   type BuyActionParams,
@@ -29,6 +31,7 @@ import {
   type MakeOfferActionParams,
   type MintActionParams,
   type SettleActionParams,
+  type TransferActionParams,
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
@@ -212,6 +215,7 @@ export type SuperRareConnectActionsNamespace = {
   bid: (params: BidActionParams) => Promise<ConnectIntentCreation>;
   mint: (params: MintActionParams) => Promise<ConnectIntentCreation>;
   settle: (params: SettleActionParams) => Promise<ConnectIntentCreation>;
+  transfer: (params: TransferActionParams) => Promise<ConnectIntentCreation>;
   getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
@@ -504,14 +508,7 @@ export function createSuperRareClient(
     return hostedUrl.origin;
   };
   const startIntent = async (
-    requestResult:
-      | ReturnType<typeof buildConnectCheckoutIntentRequest>
-      | ReturnType<typeof buildConnectBuyIntentRequest>
-      | ReturnType<typeof buildConnectBidIntentRequest>
-      | ReturnType<typeof buildConnectMintIntentRequest>
-      | ReturnType<typeof buildConnectMakeOfferIntentRequest>
-      | ReturnType<typeof buildConnectAcceptOfferIntentRequest>
-      | ReturnType<typeof buildConnectCancelOfferIntentRequest>,
+    requestResult: BuildConnectActionIntentRequestResult,
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
       throw new ConnectReturnPathError();
@@ -1499,6 +1496,13 @@ export function createSuperRareClient(
       },
       async settle(params): Promise<ConnectIntentCreation> {
         return await startIntent(buildConnectSettleIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }));
+      },
+      async transfer(params): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectTransferIntentRequest({
           ...params,
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),

@@ -298,6 +298,51 @@ describe('Connect API client', () => {
     });
   });
 
+  it('parses intent status for a wallet ERC-20 transfer', async () => {
+    const fetchImplementation = vi.fn(async (): Promise<Response> => jsonResponse({
+      data: {
+        intentId: 'connect_intent_transfer',
+        type: 'transfer',
+        status: 'completed',
+        returnPath: '/transfer/complete',
+        expiresAt: '2026-06-22T00:00:00.000Z',
+        resolvedActionSnapshot: {
+          actionKey: '8453-0x3333333333333333333333333333333333333333',
+          actionType: 'transfer',
+          resolvedAt: '2026-06-21T00:00:00.000Z',
+          targetKind: 'wallet',
+          terms: {
+            available: true,
+            amount: '2500000',
+            currency: 'USDC',
+            recipient: '0x3333333333333333333333333333333333333333',
+          },
+        },
+        result: {
+          transactionHash: `0x${'1'.repeat(64)}`,
+        },
+      },
+    }));
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: fetchImplementation,
+      intentId: 'connect_intent_transfer',
+    })).resolves.toMatchObject({
+      intentId: 'connect_intent_transfer',
+      type: 'transfer',
+      resolvedActionSnapshot: {
+        actionType: 'transfer',
+        targetKind: 'wallet',
+        terms: {
+          amount: '2500000',
+          currency: 'USDC',
+          recipient: '0x3333333333333333333333333333333333333333',
+        },
+      },
+    });
+  });
+
   it('parses intent status carrying an offer snapshot with buyer and expiry terms', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);

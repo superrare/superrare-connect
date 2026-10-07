@@ -7,7 +7,8 @@ export type ConnectActionType =
   | 'offer'
   | 'offer-accept'
   | 'offer-cancel'
-  | 'settle';
+  | 'settle'
+  | 'transfer';
 
 export type ConnectIntentStatus =
   | 'pending'
@@ -36,11 +37,12 @@ export type ConnectActionTargetKind =
   | 'erc1155-release'
   | 'erc1155-checkout'
   | 'erc721-offer'
-  | 'erc721-batch-offer';
+  | 'erc721-batch-offer'
+  | 'wallet';
 
 export type ConnectResolvedActionSnapshot = {
   actionKey: string;
-  actionType: 'checkout' | 'bid' | 'buy' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel' | 'settle';
+  actionType: 'checkout' | 'bid' | 'buy' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel' | 'settle' | 'transfer';
   resolvedAt: string;
   targetKind: ConnectActionTargetKind;
   terms: {
@@ -56,6 +58,7 @@ export type ConnectResolvedActionSnapshot = {
     quantity?: string;
     quantityAvailable?: string;
     seller?: string;
+    recipient?: string;
     unitPrice?: string;
   };
 };
