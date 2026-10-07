@@ -1315,10 +1315,24 @@ export function createSuperRareClient(
         const recovery = saveAttempt({ request: confirmed, consent });
         return { consent: { ...consent }, recovery };
       };
-      const connectAuthorization = async (): Promise<string> => {
-        const session = await sessionLifecycle.getCurrentSession();
-        if (session === undefined) throw new ConnectSessionRequiredError();
-        return `ConnectSession ${session.sessionId}`;
+      const requestCreditJson = async (input: {
+        path: string; method?: 'GET' | 'POST'; body?: unknown;
+      }): Promise<unknown> => {
+        const path = `${paidPath()}${input.path}`;
+        const authorization = currentAuthorization();
+        if (authorization === undefined) throw new GameConnectionError('authorization_required');
+        if (authorization.appOrigin !== requireAppOrigin()) throw new GameConnectionError('invalid_origin');
+        try {
+          return await requestStudioJson({
+            ...input, studioUrl: requireStudioUrl(), fetch: options.fetch, path,
+            authorization: `GameAuthorization ${authorization.authorizationToken}`,
+          });
+        } catch (error) {
+          if (error instanceof SuperRareConnectApiError && error.status === 401) {
+            clearAuthorization(authorization);
+          }
+          throw error;
+        }
       };
       return {
         getAuthorization: () => {
@@ -1400,25 +1414,21 @@ export function createSuperRareClient(
         },
         credits: {
           async getBalance(): Promise<GameCreditBalance> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            return parseCreditBalance(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/me`, authorization: await connectAuthorization(), }));
+            return parseCreditBalance(await requestCreditJson({ path: '/me' }));
           },
           async createPurchase(): Promise<GameCreditPurchase> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            return parsePurchase(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/purchases`, method: 'POST', authorization: await connectAuthorization(), }));
+            return parsePurchase(await requestCreditJson({ path: '/purchases', method: 'POST' }));
           },
           async getPurchase(purchaseId): Promise<GameCreditPurchase> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            return parsePurchase(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/purchases/${encodeURIComponent(purchaseId)}`, authorization: await connectAuthorization(), }));
+            return parsePurchase(await requestCreditJson({
+              path: `/purchases/${encodeURIComponent(purchaseId)}`,
+            }));
           },
           async claimPurchase(params): Promise<{ purchase: GameCreditPurchase; balance: GameCreditBalance }> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            const value = await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/purchases/${encodeURIComponent(params.purchaseId)}/claim`, method: 'POST',
-              authorization: await connectAuthorization(), body: { transactionHash: params.transactionHash }, });
+            const value = await requestCreditJson({
+              path: `/purchases/${encodeURIComponent(params.purchaseId)}/claim`, method: 'POST',
+              body: { transactionHash: params.transactionHash },
+            });
             return { purchase: parsePurchase(value), balance: parseCreditBalance(value) };
           },
         },
