@@ -2,7 +2,7 @@ export class SuperRareConnectApiError extends Error {
   readonly status: number;
   readonly path: string;
 
-  constructor(message: string, status: number, path: string) {
+  constructor(message: string, status: number, path: string, readonly code?: string) {
     super(`API error ${status} on ${path}: ${message}`);
     this.name = 'SuperRareConnectApiError';
     this.status = status;

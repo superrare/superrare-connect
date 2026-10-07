@@ -16,9 +16,27 @@ export {
   type SuperRareConnectClient,
   type SuperRareConnectClientOptions,
   type SuperRareConnectIntentsNamespace,
+  type SuperRareConnectGamesNamespace,
+  type SuperRareGameClient,
+  type SuperRareGameStartParams,
   type SuperRareConnectOffersNamespace,
   type SuperRareConnectUserNamespace,
 } from './client.js';
+export {
+  type ClientAssertedScoreResult,
+  type GameCreditBalance,
+  type GameCreditPurchase,
+  type GameLeaderboard,
+  type GameLeaderboardEntry,
+  type GameSessionStart,
+  type ServerValidatedGameRun,
+} from './games-api.js';
+export {
+  GameConnectionError,
+  type GameAuthorization,
+  type GameCreditTerms,
+  type GamePaidConsent,
+} from './games-core.js';
 export {
   type AcceptOfferActionParams,
   type BidActionParams,

@@ -25,6 +25,110 @@ const superrare = createSuperRareClient({
 });
 ```
 
+## Studio Games, Credits, And Leaderboards (Beta)
+
+**Beta access:** This feature is not generally released. Use is limited to integrations with a beta API key. Contact SuperRare for beta access before using this SDK surface.
+
+Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
+
+```ts
+const superrare = createSuperRareClient({
+  studioUrl: 'https://studio.example',
+});
+const game = superrare.games.forGame({ appId: 'your-studio-product-uuid' });
+const freeStartKey = crypto.randomUUID();
+const started = await game.start({ clientBuildId: 'web-2026-10-06', idempotencyKey: freeStartKey });
+```
+Pass the same `idempotencyKey` when retrying an unresolved free start.
+
+For a Studio-configured credit-gated game, include its group. Connect the game once from an explicit click with `game.connect()`: it opens only Studio's `/connect/games/authorize` surface and reuses a valid scoped authorization on later calls. Studio handles Connect login and an explicit **Connect game** action. Connecting does not reserve or spend credits, request consent, or start a play.
+
+Your game—not the SDK—owns the one-play confirmation UI. Fetch authoritative terms with `getTerms()`, display the title and credit cost, and offer a separate **Play — spend N credits** action. Only that confirmation action may call `requestConsent`. There is no SDK confirmation popup per play:
+
+```ts
+const paidGame = superrare.games.forGame({
+  appId: 'your-studio-product-uuid',
+  groupId: 'your-credit-group-uuid',
+});
+const startParams = { clientBuildId: 'web-2026-10-06' };
+let displayedTerms: Awaited<ReturnType<typeof paidGame.getTerms>> | undefined;
+let pendingAttempt: {
+  idempotencyKey: string;
+  fingerprint: string;
+  expectedCredits: number;
+  clientBuildId: string;
+} | undefined;
+
+connectButton.addEventListener('click', async () => {
+  await paidGame.connect(); // Explicit initial connection or renewal only.
+  displayedTerms = await paidGame.getTerms();
+  termsText.textContent = `${displayedTerms.title}: ${displayedTerms.credits} credits per play`;
+  playButton.textContent = `Play — spend ${displayedTerms.credits} credits`;
+});
+
+playButton.addEventListener('click', async () => {
+  if (displayedTerms === undefined || pendingAttempt !== undefined) return;
+  pendingAttempt = {
+    ...startParams,
+    idempotencyKey: crypto.randomUUID(),
+    fingerprint: JSON.stringify(startParams),
+    expectedCredits: displayedTerms.credits,
+  };
+  // Retain this caller-owned key and exact confirmed binding while unresolved.
+  // requestConsent saves the attempt before issuance and its consent before start.
+  const { consent, recovery } = await paidGame.requestConsent(pendingAttempt);
+  if (recovery === 'memory') {
+    recoveryText.textContent = 'Keep this page open: reload recovery is unavailable.';
+  }
+  const started = await paidGame.startWithConsent({ ...pendingAttempt, consent });
+  pendingAttempt = undefined; // Clear only after an observed successful start.
+  // Use started.session to run this play; do not expose its token in the UI/logs.
+});
+
+recoverButton.addEventListener('click', async () => {
+  if (pendingAttempt === undefined) return;
+  const started = await paidGame.recoverStart(pendingAttempt);
+  pendingAttempt = undefined;
+  // This recovers the original play, not a new round.
+});
+```
+
+Attach error handling to these handlers in your game (see the vanilla example). Keep the caller-owned attempt key available for `recoverStart({ idempotencyKey })`, including across reloads when recovery storage works. `requestConsent` returns `recovery: 'persistent' | 'memory'`: persistent means the SDK saved the attempt/consent for recovery; disabled or failing storage falls back to memory and requires keeping the same client/page alive. Persist the caller's non-secret key separately; never put authorization, consent, or session credentials in URLs or logs. `recoverStart` also retries a saved consent issuance whose response was lost, using the current game authorization without opening a window. It preserves the original start parameters, fingerprint, and confirmed cost.
+
+Cancellation or window closure rejects `connect()` with `GameConnectionError` code `cancelled`; expiry rejects with `expired` or `authorization_required`. Stop and require another explicit **Connect game** click—never connect or spend automatically. Logout/account changes discard cached authorization. If they happen while `connect()` is pending, that attempt cannot authorize the replacement session; another explicit **Connect game** click starts a fresh connection. Consent issuance HTTP failures reject with `SuperRareConnectApiError`; inspect `error.status` and its optional structured `error.code`, not message text, to distinguish Studio rejections. A `401` clears cached authorization and requires explicit reconnection before recovering the same attempt. There is no automatic HTTP retry.
+
+On `409 CREDIT_GROUP_COST_CHANGED`, no new consent was issued: refresh terms, show the new cost, and obtain a fresh visible confirmation before creating a new attempt. Never silently accept a higher cost. `409 CREDIT_GROUP_CONSENT_EXPIRED` proves a matched consent expired unused; only a fresh explicit confirmation may create a new attempt/key. A reused-key binding error must not be repaired by silently creating a key. After a timeout, network failure, or `503`, retain the original attempt and use **Recover original play**; do not create a second key or assume a charge failed. A completed/inactive session may reject recovery with `409`; do not replay a completed round.
+
+The short-lived, one-use consent is bound to the app, group, origin, request, wallet account, and configured cost. Consent issuance itself does not reserve or deduct credits. Studio reserves before initializing the real game session, captures exactly once after initialization, releases only a definite initialization failure, and leaves timeouts or unknown outcomes reserved for reconciliation. A ready or terminal play is never automatically refunded. The returned `PlaySession` is narrow and game-bound; broad Connect access/refresh credentials remain on Studio.
+
+Client-provided scores are deliberately named `submitClientAssertedScore`. They are session-bound assertions, not trusted or server-validated results:
+
+```ts
+await game.submitClientAssertedScore({
+  sessionToken: started.session.token,
+  score: 12500,
+  idempotencyKey: crypto.randomUUID(),
+});
+
+const run = await game.startServerValidatedRun({
+  sessionToken: started.session.token,
+  eventId: 'studio-scoring-event-uuid',
+  idempotencyKey: crypto.randomUUID(),
+});
+// Send supported run inputs to run.run.webSocketUrl. Studio's verifier owns
+// authoritative calculation and records the verified result.
+```
+
+Leaderboard reads use the same game client:
+
+```ts
+const leaders = await game.getLeaderboard({ leaderboardKey: 'default', limit: 25 });
+const mine = await game.getMyBest({ sessionToken: started.session.token });
+await game.complete({ sessionId: started.session.id, sessionToken: started.session.token });
+```
+
+With a `groupId`, `game.credits` exposes balance and the real quote/claim/recovery endpoints. The SDK does not fabricate a USDC transfer method: send the exact quoted transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
+
 ## Browser Embed
 
 ```html
@@ -280,11 +384,11 @@ createSuperRareClient({
   popup: {
     open: (url, target, features) => window.open(url, target, features),
     messageEvents: {
-      // Deliver every `message` event as { origin, data }; return the
-      // unsubscribe function.
+      // Deliver every `message` event as { origin, data, source }; return the
+      // unsubscribe function. Games verify source against their opened window.
       subscribe: (listener) => {
         const handler = (event: MessageEvent) => {
-          listener({ origin: event.origin, data: event.data });
+          listener({ origin: event.origin, data: event.data, source: event.source });
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
