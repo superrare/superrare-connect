@@ -2,6 +2,7 @@ import {
   createSuperRareClient,
   GameConnectionError,
   SuperRareConnectApiError,
+  type GameAuthorization,
   type GameCreditTerms,
 } from '../../src/index.js';
 
@@ -66,15 +67,40 @@ const loadTerms = async (): Promise<void> => {
   terms = next;
   if (termsText !== null) termsText.textContent = `${next.title}: one play costs ${next.credits} credits. Confirm below to spend.`;
 };
+
+const setConnection = (authorization: GameAuthorization): void => {
+  connectedUntil = Date.parse(authorization.expiresAt);
+  if (connectGame !== null) connectGame.textContent = 'Game connected / renew connection';
+  window.setTimeout(updateControls, Math.max(0, connectedUntil - Date.now()));
+};
+
+const clearConnection = (): void => {
+  connectedUntil = 0;
+  if (connectGame !== null) connectGame.textContent = 'Connect game / renew connection';
+};
+
+const restoreGameConnection = async (): Promise<void> => {
+  if (game === undefined) return;
+  const authorization = game.getAuthorization();
+  if (authorization === undefined) return;
+  setConnection(authorization);
+  try {
+    await loadTerms();
+    render({ status: 'Game connection restored. Review the terms; connecting does not spend credits.' });
+  } catch {
+    render({ status: 'Game connection restored.', error: 'Could not refresh terms. Try again before confirming a play.' });
+  }
+  updateControls();
+};
 const handlePaidError = async (error: unknown, issuingConsent = false): Promise<void> => {
   if (error instanceof GameConnectionError) {
-    connectedUntil = 0;
+    clearConnection();
     render({ error: error.code, action: 'Connection stopped. Click Connect game explicitly; no play was started by connecting.' });
     return;
   }
   if (error instanceof SuperRareConnectApiError) {
     if (error.status === 401) {
-      connectedUntil = 0;
+      clearConnection();
       render({ error: 'Authorization required. Click Connect game, then recover the original attempt if one is pending.' });
       return;
     }
@@ -124,8 +150,7 @@ connectGame?.addEventListener('click', async () => {
   updateControls();
   try {
     const authorization = await game.connect();
-    connectedUntil = Date.parse(authorization.expiresAt);
-    window.setTimeout(updateControls, Math.max(0, connectedUntil - Date.now()));
+    setConnection(authorization);
     await loadTerms();
     render({ status: 'Game connected. Review the terms; connecting does not spend credits.' });
   } catch (error) {
@@ -191,10 +216,7 @@ recoverGame?.addEventListener('click', async () => {
   }
 });
 
-superrare.auth.onChange(() => {
-  connectedUntil = 0;
-  updateControls();
-});
 if (pendingKey !== undefined) noteRecovery('An unresolved attempt is saved. Recover the original play; explicitly reconnect first only if authorization is required.');
 if (game === undefined) render({ error: 'For paid games add ?appId=<UUID>&groupId=<UUID>&studioUrl=<Studio origin>.' });
 updateControls();
+void restoreGameConnection();

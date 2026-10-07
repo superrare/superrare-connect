@@ -240,16 +240,80 @@ describe('game connection', () => {
     await expect(renewed).resolves.toEqual(authorization);
   });
 
-  it('discards cached authorization on session clearing', async () => {
-    const h = harness();
-    await h.connect();
-    h.client.auth.clearSession();
-    await connectionError(h.game.requestConsent(attempt), 'authorization_required');
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-    const pending = h.game.connect();
-    expect(h.urls).toHaveLength(2);
-    h.emit();
-    await pending;
+  it('restores valid game authorization from storage without opening a popup', async () => {
+    const storage = memoryStorage();
+    const initial = harness({ storage });
+    await initial.connect();
+
+    const reloaded = harness({ storage });
+    expect(reloaded.game.getAuthorization()).toEqual(authorization);
+    await expect(reloaded.game.connect()).resolves.toEqual(authorization);
+    expect(reloaded.urls).toEqual([]);
+    expect(reloaded.fetchImplementation).not.toHaveBeenCalled();
+    expect(reloaded.client.games.forGame({
+      appId: '20000000-0000-0000-0000-000000000002',
+      groupId,
+    }).getAuthorization()).toBeUndefined();
+  });
+
+  it('rejects persisted authorization bound to another app origin', () => {
+    const storage = memoryStorage();
+    const key = `superrare.connect.game-authorization:${encodeURIComponent(
+      JSON.stringify([studioUrl, appId, groupId, appOrigin]),
+    )}`;
+    storage.values.set(key, JSON.stringify({
+      ...authorization,
+      appOrigin: 'https://other.game.test',
+    }));
+
+    const h = harness({ storage });
+    expect(h.game.getAuthorization()).toBeUndefined();
+    expect(storage.values.has(key)).toBe(false);
+  });
+
+  it('drops expired persisted authorization and renews only on explicit connect', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const storage = memoryStorage();
+    const initial = harness({ storage });
+    const expiresAt = '2026-01-01T00:01:00.000Z';
+    const connected = initial.game.connect();
+    initial.emit(initial.message({ expiresAt }));
+    await connected;
+
+    vi.setSystemTime(new Date(expiresAt));
+    const reloaded = harness({ storage });
+    expect(reloaded.game.getAuthorization()).toBeUndefined();
+    expect(reloaded.urls).toEqual([]);
+    const renewed = reloaded.game.connect();
+    expect(reloaded.urls).toHaveLength(1);
+    reloaded.emit();
+    await expect(renewed).resolves.toEqual(authorization);
+  });
+
+  it('keeps renewed authorization when an older request returns unauthorized', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    let resolveConsentResponse: ((response: Response) => void) | undefined;
+    const h = harness({
+      storage: memoryStorage(),
+      fetch: () => new Promise<Response>((resolve) => { resolveConsentResponse = resolve; }),
+    });
+    const initial = h.game.connect();
+    h.emit(h.message({ authorizationToken: 'expired-token', expiresAt: '2026-01-01T00:01:00.000Z' }));
+    await initial;
+
+    const oldConsentRequest = h.game.requestConsent(attempt);
+    vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
+    const renewal = h.game.connect();
+    h.emit(h.message({ authorizationToken: 'renewed-token' }));
+    await renewal;
+    if (resolveConsentResponse === undefined) throw new Error('Consent fetch did not start.');
+    resolveConsentResponse(Response.json({
+      error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Expired authorization.' },
+    }, { status: 401 }));
+    await expect(oldConsentRequest).rejects.toMatchObject({ status: 401 });
+    expect(h.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
   });
 
   it.each(['clearSession', 'logout'] as const)(
@@ -287,14 +351,18 @@ describe('game connection', () => {
     expect(h.fetchImplementation).not.toHaveBeenCalled();
   });
 
-  it('discards cached authorization on logout', async () => {
-    const h = harness();
-    await h.connect();
-    await h.client.auth.logout();
-    await connectionError(h.game.requestConsent(attempt), 'authorization_required');
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-    expect(h.urls).toHaveLength(1);
-  });
+  it.each(['clearSession', 'logout'] as const)(
+    'keeps game authorization independent from SuperRare session %s',
+    async (replacement) => {
+      const h = harness();
+      await h.connect();
+      if (replacement === 'clearSession') h.client.auth.clearSession();
+      else await h.client.auth.logout();
+      expect(h.game.getAuthorization()).toEqual(authorization);
+      await expect(h.game.connect()).resolves.toEqual(authorization);
+      expect(h.urls).toHaveLength(1);
+    },
+  );
 
   it.each(['success', 'cancelled'] as const)('settles %s even if unsubscribe throws', async (outcome) => {
     const h = harness({ throwOnUnsubscribe: true });
@@ -373,7 +441,7 @@ describe('inline paid confirmation', () => {
     [409, 'CREDIT_GROUP_COST_CHANGED'], [401, 'GAME_AUTHORIZATION_REQUIRED'],
     [403, 'FORBIDDEN'], [503, 'SERVICE_UNAVAILABLE'],
   ] as const)('propagates issuance %s %s without starting or retrying', async (status, code) => {
-    const h = harness({ fetch: async () => Response.json({ error: { code, message: code } }, { status }) });
+    const h = harness({ storage: memoryStorage(), fetch: async () => Response.json({ error: { code, message: code } }, { status }) });
     await h.connect();
     const pending = h.game.requestConsent(attempt);
     await expect(pending).rejects.toBeInstanceOf(SuperRareConnectApiError);
@@ -382,6 +450,7 @@ describe('inline paid confirmation', () => {
     expect(h.urls).toHaveLength(1);
     if (status === 401) {
       await connectionError(h.game.requestConsent(attempt), 'authorization_required');
+      expect(h.game.getAuthorization()).toBeUndefined();
       expect(h.fetchImplementation).toHaveBeenCalledTimes(1);
       const renewed = h.game.connect();
       expect(h.urls).toHaveLength(2);
@@ -502,18 +571,17 @@ describe('inline paid confirmation', () => {
     } });
     await expect(reloaded.game.getTerms()).resolves.toMatchObject({ credits: 9 });
     expect(requests).toEqual([]);
-    await connectionError(reloaded.game.recoverStart({ idempotencyKey: attempt.idempotencyKey }), 'authorization_required');
-    expect(reloaded.urls).toEqual([]);
-    await reloaded.connect();
+    expect(reloaded.game.getAuthorization()).toEqual(authorization);
     await expect(reloaded.game.recoverStart({ idempotencyKey: attempt.idempotencyKey }))
       .resolves.toMatchObject({ session: { id: 'session-1' } });
+    expect(reloaded.urls).toEqual([]);
     expect(requests.map(({ request }) => request.url)).toEqual([`${appPath}/consents`, `${appPath}/uses`]);
     expect(at(requests, 0).body).toEqual({ idempotencyKey: attempt.idempotencyKey,
       fingerprint: attempt.fingerprint, expectedCredits: 3 });
     expect(at(requests, 0).body).toEqual(originalIssuanceBody);
     expect(at(requests, 1).body).toEqual({ idempotencyKey: attempt.idempotencyKey,
       clientSessionId: attempt.clientSessionId, clientBuildId: attempt.clientBuildId, metadata: attempt.metadata });
-    expect(reloaded.urls).toHaveLength(1);
+    expect(reloaded.urls).toHaveLength(0);
   });
 
   it.each(['network', '503'] as const)('recovers a lost paid start (%s) after reload with the saved consent and original body', async (failure) => {

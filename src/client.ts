@@ -88,6 +88,7 @@ import {
   gameIdempotencyKeySchema,
   gameConsentRequestSchema,
   gamePendingAttemptSchema,
+  gameAuthorizationSchema,
   gameTermsResponseSchema,
   inlineConsentResponseSchema,
   GameConnectionError,
@@ -237,6 +238,8 @@ export type SuperRareGameClient = {
   start: (params?: SuperRareGameStartParams) => Promise<GameSessionStart>;
   /** Explicit connection or renewal only; never authorizes a play. */
   connect: () => Promise<GameAuthorization>;
+  /** Reads valid game-scoped authorization without opening or renewing a popup. */
+  getAuthorization: () => GameAuthorization | undefined;
   getTerms: () => Promise<GameCreditTerms>;
   /** Call only after the game displays and receives one-play confirmation. */
   requestConsent: (params: SuperRareGameStartParams & {
@@ -1032,7 +1035,7 @@ export function createSuperRareClient(
     return await inFlightPopupLogin;
   };
 
-  const gameAuthorizations = new Map<string, { authorization: GameAuthorization; generation: number }>();
+  const gameAuthorizations = new Map<string, GameAuthorization>();
   const gameConnections = new Map<string, {
     generation: number;
     promise: Promise<GameAuthorization>;
@@ -1060,6 +1063,8 @@ export function createSuperRareClient(
         return origin;
       };
       const scopeKey = (): string => JSON.stringify([requireStudioUrl(), appId, groupId, options.initiatingOrigin ?? readBrowserOrigin()]);
+      const authorizationStorageKey = (): string =>
+        `superrare.connect.game-authorization:${encodeURIComponent(scopeKey())}`;
       const pendingConsentKey = (idempotencyKey: string): string =>
         `superrare.connect.game-attempt:${encodeURIComponent(scopeKey())}:${idempotencyKey}`;
       const paidPath = (): string => {
@@ -1088,14 +1093,38 @@ export function createSuperRareClient(
           return 'persistent';
         } catch { return 'memory'; }
       };
+      const clearAuthorization = (): void => {
+        const key = scopeKey();
+        gameAuthorizations.delete(key);
+        try { storage?.removeItem(authorizationStorageKey()); } catch { /* Persistence cleanup is best-effort. */ }
+      };
       const currentAuthorization = (): GameAuthorization | undefined => {
-        const saved = gameAuthorizations.get(scopeKey());
-        if (saved === undefined) return undefined;
-        if (saved.generation !== sessionLifecycle.getReplacementGeneration() || Date.parse(saved.authorization.expiresAt) <= Date.now()) {
-          gameAuthorizations.delete(scopeKey());
+        const key = scopeKey();
+        const cached = gameAuthorizations.get(key);
+        if (cached !== undefined) {
+          if (Date.parse(cached.expiresAt) > Date.now()) return cached;
+          clearAuthorization();
           return undefined;
         }
-        return saved.authorization;
+        let serialized: string | null | undefined;
+        try { serialized = storage?.getItem(authorizationStorageKey()); } catch { return undefined; }
+        if (serialized === null || serialized === undefined) return undefined;
+        let value: unknown;
+        try { value = JSON.parse(serialized); } catch {
+          clearAuthorization();
+          return undefined;
+        }
+        const parsed = gameAuthorizationSchema.safeParse(value);
+        if (!parsed.success
+          || parsed.data.appId !== appId
+          || parsed.data.groupId !== groupId
+          || parsed.data.appOrigin !== requireAppOrigin()
+          || Date.parse(parsed.data.expiresAt) <= Date.now()) {
+          clearAuthorization();
+          return undefined;
+        }
+        gameAuthorizations.set(key, parsed.data);
+        return parsed.data;
       };
       const validatePaidStart = (
         params: SuperRareGameStartParams & { idempotencyKey: string },
@@ -1188,8 +1217,10 @@ export function createSuperRareClient(
               finish(() => reject(new GameConnectionError('authorization_required')));
               return;
             }
-            gameAuthorizations.set(connectionKey, { authorization: { ...parsed.authorization }, generation });
-            finish(() => resolve(parsed.authorization));
+            const authorized = parsed.authorization;
+            gameAuthorizations.set(connectionKey, authorized);
+            try { storage?.setItem(authorizationStorageKey(), JSON.stringify(authorized)); } catch { /* Connection remains usable in memory. */ }
+            finish(() => resolve(authorized));
           });
           if (settled) {
             try { unsubscribe(); } catch { /* Synchronous emitters may settle during subscription. */ }
@@ -1244,7 +1275,10 @@ export function createSuperRareClient(
             body: { idempotencyKey: confirmed.idempotencyKey, fingerprint: confirmed.fingerprint, expectedCredits: confirmed.expectedCredits },
           });
         } catch (error) {
-          if (error instanceof SuperRareConnectApiError && error.status === 401) gameAuthorizations.delete(scopeKey());
+          if (error instanceof SuperRareConnectApiError && error.status === 401
+            && gameAuthorizations.get(scopeKey())?.authorizationToken === authorization.authorizationToken) {
+            clearAuthorization();
+          }
           throw error;
         }
         const parsed = inlineConsentResponseSchema.parse(value).consent;
@@ -1264,6 +1298,7 @@ export function createSuperRareClient(
         return `ConnectSession ${session.sessionId}`;
       };
       return {
+        getAuthorization: currentAuthorization,
         async start(params = {}): Promise<GameSessionStart> {
           if (groupId !== undefined) throw new Error('Credit-gated games require inline consent and startWithConsent.');
           if (params.idempotencyKey !== undefined && !gameIdempotencyKeySchema.safeParse(params.idempotencyKey).success) {
