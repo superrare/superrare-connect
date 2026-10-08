@@ -27,6 +27,7 @@ import type {
   ConnectTransferCurrency,
   CreateConnectIntentRequest,
 } from './auth-flow-core.js';
+import type { ConnectIntentCreation } from './api.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
 
 type ActionParamsBase = {
@@ -116,6 +117,7 @@ export type TransferActionParams = Omit<ActionParamsBase, 'payment'> & {
   to: ConnectEthereumAddress;
   currency: ConnectTransferCurrency;
   amount: string;
+  beforeOpen?: (intent: ConnectIntentCreation) => Promise<void> | void;
 };
 
 export type BuildConnectBuyIntentRequestInput = BuyActionParams & {
@@ -156,6 +158,7 @@ export type BuildConnectTransferIntentRequestInput = TransferActionParams & {
 
 export type ConnectActionValidationErrorCode =
   | 'invalid_amount'
+  | 'invalid_address'
   | 'invalid_min_received'
   | 'invalid_max_slippage_bps';
 
@@ -169,6 +172,8 @@ type ConnectActionBuildResult<Action extends ConnectActionInput> =
   | { ok: false; error: ConnectActionValidationErrorCode };
 
 const baseUnitAmountPattern = /^[1-9]\d*$/;
+const ethereumAddressPattern = /^0x[0-9a-fA-F]{40}$/;
+const zeroAddressPattern = /^0x0{40}$/;
 const minimumSlippageBps = 1;
 const maximumSlippageBps = 500;
 
@@ -489,8 +494,16 @@ export function buildConnectTransferIntentRequest(
   const sharedResult = buildSharedActionFields(input);
   if (!sharedResult.ok) return sharedResult;
 
-  if (!baseUnitAmountPattern.test(input.amount)) {
+  if (typeof input.amount !== 'string' || !baseUnitAmountPattern.test(input.amount)) {
     return { ok: false, error: 'invalid_amount' };
+  }
+
+  if (
+    typeof input.to !== 'string'
+    || !ethereumAddressPattern.test(input.to)
+    || zeroAddressPattern.test(input.to)
+  ) {
+    return { ok: false, error: 'invalid_address' };
   }
 
   return {

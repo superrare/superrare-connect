@@ -629,6 +629,57 @@ describe('buildConnectTransferIntentRequest', () => {
     })).toEqual({ ok: false, error: 'invalid_amount' });
   });
 
+  it('rejects an amount that is not a string', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      // @ts-expect-error Amounts are base-unit strings.
+      amount: 50000000000000000,
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_amount' });
+  });
+
+  it.each([
+    '',
+    '52908400098527886E0F7030069857D2E4169EE7',
+    '0x52908400098527886E0F7030069857D2E4169EE',
+    '0x52908400098527886E0F7030069857D2E4169EE70',
+    '0x52908400098527886E0F7030069857D2E4169EEG',
+    ' 0x52908400098527886E0F7030069857D2E4169EE7',
+    '0x0000000000000000000000000000000000000000',
+    'alice.eth',
+  ])('rejects the recipient %j', (to) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to,
+      currency: 'ETH',
+      amount: '50000000000000000',
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_address' });
+  });
+
+  it('rejects a recipient that is not a string', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      // @ts-expect-error Recipients are address strings.
+      to: [recipient],
+      currency: 'ETH',
+      amount: '50000000000000000',
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_address' });
+  });
+
+  it('accepts a lowercase recipient', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient.toLowerCase(),
+      currency: 'ETH',
+      amount: '50000000000000000',
+      state: 'state_123',
+    })).toMatchObject({ ok: true });
+  });
+
   it.each([
     'https://evil.example/credits',
     '//evil.example/credits',

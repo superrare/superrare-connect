@@ -397,25 +397,30 @@ Liquid Editions trade on Ethereum mainnet (`chainId: 1`) and Sepolia (`11155111`
 `actions.transfer` asks the user to send an exact amount of ETH or USDC from their wallet to a wallet you name, for example to pay for off-chain goods such as game credits. The user signs in and confirms in the hosted window, which shows the amount, the network, and the full destination address before anything is sent.
 
 ```ts
-const intent = await superrare.actions.transfer({
+await superrare.actions.transfer({
   chainId: 1,
   to: '0x52908400098527886E0F7030069857D2E4169EE7',
   currency: 'USDC',
   amount: '25000000', // 25 USDC
   returnPath: '/credits/complete',
-});
-
-// Tie the intent to the order before the user can finish paying.
-await fetch('/api/orders/order_123/transfer-intent', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ intentId: intent.intentId }),
+  beforeOpen: async ({ intentId }) => {
+    const response = await fetch('/api/orders/order_123/transfer-intent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ intentId }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) throw new Error('Could not link the payment to the order.');
+  },
 });
 ```
 
+`beforeOpen` runs after the intent is created and before the hosted window shows the transfer. The window stays blank until `beforeOpen` resolves, so bound its work with a timeout. If `beforeOpen` throws, the SDK closes the window and `actions.transfer` rejects with that error, so the hosted window never shows a transfer your backend has not recorded.
+
 - Chains: Ethereum mainnet (`1`), Base (`8453`), Sepolia (`11155111`) and Base Sepolia (`84532`) are supported; each hosted Connect deployment enables a subset. Production executes mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia). On a chain the deployment does not enable, the hosted window shows the transfer as not available.
 - Currencies: `ETH` and `USDC`.
-- `amount` is a raw base-unit string, like bid and offer amounts: wei for ETH (`'50000000000000000'` is 0.05 ETH) and 6 decimals for USDC (`'25000000'` is 25 USDC). The SDK rejects decimals, zero, and leading zeros with `ConnectActionValidationError` (`code: 'invalid_amount'`) before any window opens.
+- `amount` is a raw base-unit string, like bid and offer amounts: wei for ETH (`'50000000000000000'` is 0.05 ETH) and 6 decimals for USDC (`'25000000'` is 25 USDC). The SDK rejects decimals, zero, leading zeros, and non-string amounts with `ConnectActionValidationError` (`code: 'invalid_amount'`) before any window opens.
+- `to` must be a `0x`-prefixed, 40-hex-character address other than the zero address; the SDK rejects anything else with `ConnectActionValidationError` (`code: 'invalid_address'`) before any window opens.
 - Wallet-only: there is no `payment` option and the hosted window never offers card. The user pays from the wallet they sign in with, and the hosted window keeps the confirm button disabled while that wallet cannot cover the amount.
 - Rare API rejects the call with `SuperRareConnectApiError` (`status` 400) for a chain outside those four, an invalid or zero address as `to`, an unknown currency, or a card payment or `payment.recipient` sent to the API directly.
 - Rare API accepts transfer intents on all four chains in every deployment, so a testnet intent created against production can still be completed by calling the API directly. Always compare `terms.chainId` with the order.
@@ -424,7 +429,7 @@ await fetch('/api/orders/order_123/transfer-intent', {
 
 The user controls the page, so nothing it reports proves a payment: not the `actions.transfer` result, not `onIntentSettled`, and never an amount or chain sent from the page. Grant goods only from your backend, based on the intent it reads itself:
 
-1. The page calls `actions.transfer` and sends the returned `intentId` to your backend, as in the example above. The backend records it against the pending order: player, product, and the expected `recipient`, `amount`, `currency`, and `chainId`. Always create the intent from the page: SDK actions need a page, and the SDK cannot open an intent it did not create.
+1. The page calls `actions.transfer` and sends the `intentId` to your backend from `beforeOpen`, as in the example above. The backend records it against the pending order: player, product, and the expected `recipient`, `amount`, `currency`, and `chainId`. Always create the intent from the page: SDK actions need a page, and the SDK cannot open an intent it did not create.
 2. Treat `onIntentSettled` only as a hint to check. The backend reads the intent itself with `GET /v1/connect/intents/:intentId`, or with `intents.get` server-side.
 3. Credit only when all of these hold:
    - `status === 'completed'`. A `processing` intent can already carry an unverified `result.transactionHash`; never credit it.
@@ -700,7 +705,7 @@ const result = normalizeReturnPath('/account');
 The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
-- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_min_received`, or `invalid_max_slippage_bps`.
+- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_address`, `invalid_min_received`, or `invalid_max_slippage_bps`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.
