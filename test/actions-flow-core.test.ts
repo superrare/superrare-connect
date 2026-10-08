@@ -8,6 +8,7 @@ import {
   buildConnectMintIntentRequest,
   buildConnectSellIntentRequest,
   buildConnectSettleIntentRequest,
+  buildConnectTransferIntentRequest,
 } from '../src/actions-flow-core.js';
 import type {
   ConnectErc721BatchOfferAcceptTarget,
@@ -19,6 +20,7 @@ import type {
   ConnectErc721ReserveAuctionTarget,
   ConnectErc721ScheduledAuctionTarget,
   ConnectLiquidEditionTarget,
+  ConnectWalletTarget,
 } from '../src/auth-flow-core.js';
 
 const directListingTarget: ConnectErc721DirectListingTarget = {
@@ -78,6 +80,12 @@ const batchOfferTarget: ConnectErc721BatchOfferTarget = {
   chainId: 1,
   creator: '0x2222222222222222222222222222222222222222',
   root: '0xroot',
+};
+
+const walletTarget: ConnectWalletTarget = {
+  kind: 'wallet',
+  chainId: 8453,
+  address: '0x3333333333333333333333333333333333333333',
 };
 
 const liquidEditionTarget: ConnectLiquidEditionTarget = {
@@ -369,6 +377,30 @@ describe('buildConnectSettleIntentRequest', () => {
         },
         returnPath: '/settle/complete',
         state: 'state_123',
+      },
+    });
+  });
+});
+
+describe('buildConnectTransferIntentRequest', () => {
+  it('builds a wallet-only transfer intent with base-unit currency terms', () => {
+    expect(buildConnectTransferIntentRequest({
+      target: walletTarget,
+      transfer: { currency: 'USDC', amount: '2500000' },
+      initiatingOrigin: 'https://game.example',
+      returnPath: '/transfer/complete',
+      state: 'state_transfer',
+    })).toEqual({
+      ok: true,
+      request: {
+        action: {
+          type: 'transfer',
+          target: walletTarget,
+          transfer: { currency: 'USDC', amount: '2500000' },
+        },
+        initiatingOrigin: 'https://game.example',
+        returnPath: '/transfer/complete',
+        state: 'state_transfer',
       },
     });
   });

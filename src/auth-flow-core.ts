@@ -75,6 +75,20 @@ export type ConnectCancelOfferTerms = {
   currency: string;
 };
 
+export type ConnectTransferCurrency = 'ETH' | 'USDC';
+
+export type ConnectTransferTerms = {
+  currency: ConnectTransferCurrency;
+  /** Positive integer amount in the currency's smallest units. */
+  amount: string;
+};
+
+export type ConnectWalletTarget = {
+  kind: 'wallet';
+  chainId: ConnectChainId;
+  address: ConnectEthereumAddress;
+};
+
 export type ConnectErc721DirectListingTarget = {
   kind: 'erc721-direct-listing';
   chainId: ConnectChainId;
@@ -304,6 +318,11 @@ export type ConnectActionInput =
   | {
     type: 'offer-cancel';
     target: ConnectErc721BatchOfferTarget;
+  }
+  | {
+    type: 'transfer';
+    target: ConnectWalletTarget;
+    transfer: ConnectTransferTerms;
   }
   | {
     type: 'checkout';

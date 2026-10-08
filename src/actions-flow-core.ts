@@ -15,6 +15,8 @@ import type {
   ConnectExpectedPriceTerms,
   ConnectExpectedUnitPriceTerms,
   ConnectMintTarget,
+  ConnectTransferTerms,
+  ConnectWalletTarget,
   ConnectOfferTerms,
   ConnectPurchaseTerms,
   ConnectIntentPayment,
@@ -108,6 +110,11 @@ type Erc721BatchCancelOfferActionParams = ActionParamsBase & {
 
 export type CancelOfferActionParams = Erc721CancelOfferActionParams | Erc721BatchCancelOfferActionParams;
 
+export type TransferActionParams = Omit<ActionParamsBase, 'payment'> & {
+  target: ConnectWalletTarget;
+  transfer: ConnectTransferTerms;
+};
+
 export type BuildConnectBuyIntentRequestInput = BuyActionParams & {
   state: string;
 };
@@ -121,6 +128,10 @@ export type BuildConnectBidIntentRequestInput = BidActionParams & {
 };
 
 export type BuildConnectSettleIntentRequestInput = SettleActionParams & {
+  state: string;
+};
+
+export type BuildConnectTransferIntentRequestInput = TransferActionParams & {
   state: string;
 };
 
@@ -338,6 +349,27 @@ export function buildConnectSettleIntentRequest(
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
       ...(input.payment === undefined ? {} : { payment: input.payment }),
+    },
+  };
+}
+
+export function buildConnectTransferIntentRequest(
+  input: BuildConnectTransferIntentRequestInput,
+): BuildConnectActionIntentRequestResult {
+  const sharedResult = buildSharedActionFields(input);
+  if (!sharedResult.ok) return sharedResult;
+
+  return {
+    ok: true,
+    request: {
+      action: {
+        type: 'transfer',
+        target: input.target,
+        transfer: input.transfer,
+      },
+      returnPath: sharedResult.returnPath,
+      state: input.state,
+      ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
     },
   };
 }

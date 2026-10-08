@@ -41,7 +41,10 @@ const started = await game.start({ clientBuildId: 'web-2026-10-06', idempotencyK
 ```
 Pass the same `idempotencyKey` when retrying an unresolved free start.
 
-For a Studio-configured credit-gated game, include its group. Connect the game once from an explicit click with `game.connect()`: it opens only Studio's `/connect/games/authorize` surface and reuses a valid scoped authorization on later calls. Studio handles Connect login and an explicit **Connect game** action. Connecting does not reserve or spend credits, request consent, or start a play.
+For a Studio-configured credit-gated game, include its group. Start with an explicit `game.connect()` click: it opens Studio's `/connect/games/authorize` surface when authorization is missing or expired, and reuses valid scoped authorization. Connecting never requests consent or starts a play.
+
+The SDK persists validated game authorization by Studio origin, app, credit group, and app origin in its configured storage (browser `localStorage` by default). On page load, `game.getAuthorization()` restores a valid authorization without a popup; it returns `undefined` when none is saved or access has expired. This authorization is separate from SuperRare login. A Studio `401` invalidates it; only an explicit `game.connect()` call opens a renewal popup.
+`GameAuthorization` values returned by `connect()` and `getAuthorization()` are snapshots; changing a returned object does not modify the SDK's cached credential. A Studio `401` invalidates only the matching authorization, preserving a newer authorization another client has already saved to the same storage.
 
 Your game—not the SDK—owns the one-play confirmation UI. Fetch authoritative terms with `getTerms()`, display the title and credit cost, and offer a separate **Play — spend N credits** action. Only that confirmation action may call `requestConsent`. There is no SDK confirmation popup per play:
 
@@ -95,7 +98,7 @@ recoverButton.addEventListener('click', async () => {
 
 Attach error handling to these handlers in your game (see the vanilla example). Keep the caller-owned attempt key available for `recoverStart({ idempotencyKey })`, including across reloads when recovery storage works. `requestConsent` returns `recovery: 'persistent' | 'memory'`: persistent means the SDK saved the attempt/consent for recovery; disabled or failing storage falls back to memory and requires keeping the same client/page alive. Persist the caller's non-secret key separately; never put authorization, consent, or session credentials in URLs or logs. `recoverStart` also retries a saved consent issuance whose response was lost, using the current game authorization without opening a window. It preserves the original start parameters, fingerprint, and confirmed cost.
 
-Cancellation or window closure rejects `connect()` with `GameConnectionError` code `cancelled`; expiry rejects with `expired` or `authorization_required`. Stop and require another explicit **Connect game** click—never connect or spend automatically. Logout/account changes discard cached authorization. If they happen while `connect()` is pending, that attempt cannot authorize the replacement session; another explicit **Connect game** click starts a fresh connection. Consent issuance HTTP failures reject with `SuperRareConnectApiError`; inspect `error.status` and its optional structured `error.code`, not message text, to distinguish Studio rejections. A `401` clears cached authorization and requires explicit reconnection before recovering the same attempt. There is no automatic HTTP retry.
+Cancellation or window closure rejects `connect()` with `GameConnectionError` code `cancelled`; expiry rejects with `expired` or `authorization_required`. Stop and require another explicit **Connect game** click—never connect or spend automatically. Game authorization remains valid across SuperRare logout and account changes until it expires or Studio rejects it. If session replacement happens while `connect()` is pending, that popup cannot authorize the replacement session; another explicit **Connect game** click starts a fresh connection. Consent issuance HTTP failures reject with `SuperRareConnectApiError`; inspect `error.status` and its optional structured `error.code`, not message text, to distinguish Studio rejections. A `401` clears persisted authorization and requires explicit reconnection before recovering the same attempt. There is no automatic HTTP retry.
 
 On `409 CREDIT_GROUP_COST_CHANGED`, no new consent was issued: refresh terms, show the new cost, and obtain a fresh visible confirmation before creating a new attempt. Never silently accept a higher cost. `409 CREDIT_GROUP_CONSENT_EXPIRED` proves a matched consent expired unused; only a fresh explicit confirmation may create a new attempt/key. A reused-key binding error must not be repaired by silently creating a key. After a timeout, network failure, or `503`, retain the original attempt and use **Recover original play**; do not create a second key or assume a charge failed. A completed/inactive session may reject recovery with `409`; do not replay a completed round.
 
@@ -127,7 +130,7 @@ const mine = await game.getMyBest({ sessionToken: started.session.token });
 await game.complete({ sessionId: started.session.id, sessionToken: started.session.token });
 ```
 
-With a `groupId`, `game.credits` exposes balance and the real quote/claim/recovery endpoints. The SDK does not fabricate a USDC transfer method: send the exact quoted transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
+With a `groupId`, `game.credits` exposes balance and the real quote/claim/recovery endpoints. It does not create or execute the quoted USDC payment: send the exact quoted transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
 
 ## Browser Embed
 
@@ -291,7 +294,7 @@ The SDK never accepts arbitrary calldata, contract instructions, private keys, A
 
 ## Payment Methods
 
-Every action accepts an optional `payment` hint (Liquid Edition trades are wallet-only; see [Liquid Editions](#liquid-editions)). Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
+Marketplace actions accept an optional `payment` hint (Liquid Edition trades are wallet-only; see [Liquid Editions](#liquid-editions)). Set `payment: { method: 'wallet' }` to keep a marketplace checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent. `actions.transfer` is always wallet-only and does not accept a payment hint.
 
 **Wallet-only is required when the sale settles on a custom contract whose mint or transfer logic depends on the receiving wallet** — for example a mint that binds a pre-registered artwork to the collector's address. Card settlement executes through a SuperRare buy-proxy that receives the asset itself and re-transfers it to the buyer, so the on-chain receiver is the proxy, not the buyer; such sales revert only after the card was charged. If your contract keys anything on the `mintTo` / transfer receiver, always create its intents wallet-only:
 
@@ -308,7 +311,27 @@ await superrare.actions.mint({
 });
 ```
 
-Omit `payment` to let the hosted checkout offer every method the listing supports.
+Omit `payment` on marketplace actions to let the hosted checkout offer every method the listing supports.
+
+## Wallet Transfers
+
+`actions.transfer` starts a hosted wallet transfer to a non-zero address. The current Connect API accepts `ETH` or `USDC`—not arbitrary ERC-20 symbols—and requires `amount` as a positive integer string in the currency's smallest units (wei for ETH; for example, `'2500000'` is 2.5 USDC). The chain must be enabled by the hosted Connect deployment.
+
+```ts
+const transfer = await superrare.actions.transfer({
+  target: {
+    kind: 'wallet',
+    chainId: 8453,
+    address: '0x3333333333333333333333333333333333333333',
+  },
+  transfer: { currency: 'USDC', amount: '2500000' },
+  returnPath: '/transfer/complete',
+});
+
+const status = await superrare.actions.getStatus({ intentId: transfer.intentId });
+```
+
+The hosted Connect page handles wallet connection and transaction execution. Check the final intent status before treating the transfer as complete.
 
 ## Anonymous Auction Settlement
 
