@@ -20,6 +20,10 @@ import type {
   ConnectOfferTerms,
   ConnectPurchaseTerms,
   ConnectIntentPayment,
+  ConnectLiquidEditionReceiveTerms,
+  ConnectLiquidEditionSellTerms,
+  ConnectLiquidEditionSpendTerms,
+  ConnectLiquidEditionTarget,
   CreateConnectIntentRequest,
 } from './auth-flow-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
@@ -35,8 +39,14 @@ type ActionParamsBase = {
   payment?: ConnectIntentPayment;
 };
 
+type LiquidEditionActionParamsBase = Omit<ActionParamsBase, 'payment'> & {
+  payment?: { method?: 'wallet' };
+  minReceived?: string;
+  maxSlippageBps?: number;
+};
+
 type Erc721BuyActionParams = ActionParamsBase & {
-  target: Exclude<ConnectBuyTarget, ConnectErc1155ListingTarget>;
+  target: Exclude<ConnectBuyTarget, ConnectErc1155ListingTarget | ConnectLiquidEditionTarget>;
   expected: ConnectExpectedPriceTerms;
 };
 
@@ -45,7 +55,18 @@ type Erc1155BuyActionParams = ActionParamsBase & {
   expected: ConnectExpectedUnitPriceTerms;
 };
 
-export type BuyActionParams = Erc721BuyActionParams | Erc1155BuyActionParams;
+type LiquidEditionBuyActionParams = LiquidEditionActionParamsBase & {
+  target: ConnectLiquidEditionTarget;
+  spend: ConnectLiquidEditionSpendTerms;
+};
+
+export type BuyActionParams = Erc721BuyActionParams | Erc1155BuyActionParams | LiquidEditionBuyActionParams;
+
+export type SellActionParams = LiquidEditionActionParamsBase & {
+  target: ConnectLiquidEditionTarget;
+  sell: ConnectLiquidEditionSellTerms;
+  receive: ConnectLiquidEditionReceiveTerms;
+};
 
 export type BidActionParams = ActionParamsBase & {
   target: ConnectBidTarget;
@@ -98,6 +119,10 @@ export type BuildConnectBuyIntentRequestInput = BuyActionParams & {
   state: string;
 };
 
+export type BuildConnectSellIntentRequestInput = SellActionParams & {
+  state: string;
+};
+
 export type BuildConnectBidIntentRequestInput = BidActionParams & {
   state: string;
 };
@@ -126,9 +151,23 @@ export type BuildConnectCancelOfferIntentRequestInput = CancelOfferActionParams 
   state: string;
 };
 
+export type ConnectActionValidationErrorCode =
+  | 'invalid_amount'
+  | 'invalid_min_received'
+  | 'invalid_max_slippage_bps';
+
 export type BuildConnectActionIntentRequestResult =
   | { ok: true; request: CreateConnectIntentRequest }
-  | Extract<ReturnPathNormalizationResult, { ok: false }>;
+  | Extract<ReturnPathNormalizationResult, { ok: false }>
+  | { ok: false; error: ConnectActionValidationErrorCode };
+
+type ConnectActionBuildResult<Action extends ConnectActionInput> =
+  | { ok: true; action: Action }
+  | { ok: false; error: ConnectActionValidationErrorCode };
+
+const baseUnitAmountPattern = /^[1-9]\d*$/;
+const minimumSlippageBps = 1;
+const maximumSlippageBps = 500;
 
 export function buildConnectBuyIntentRequest(
   input: BuildConnectBuyIntentRequestInput,
@@ -136,10 +175,13 @@ export function buildConnectBuyIntentRequest(
   const sharedResult = buildSharedActionFields(input);
   if (!sharedResult.ok) return sharedResult;
 
+  const actionResult = buildConnectBuyAction(input);
+  if (!actionResult.ok) return actionResult;
+
   return {
     ok: true,
     request: {
-      action: buildConnectBuyAction(input),
+      action: actionResult.action,
       returnPath: sharedResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
@@ -150,26 +192,122 @@ export function buildConnectBuyIntentRequest(
 
 function buildConnectBuyAction(
   input: BuildConnectBuyIntentRequestInput,
-): Extract<ConnectActionInput, { type: 'buy' }> {
+): ConnectActionBuildResult<Extract<ConnectActionInput, { type: 'buy' }>> {
+  if (isLiquidEditionBuyIntentRequestInput(input)) {
+    const termsResult = validateLiquidEditionTradeTerms({
+      amount: input.spend.amount,
+      minReceived: input.minReceived,
+      maxSlippageBps: input.maxSlippageBps,
+    });
+    if (!termsResult.ok) return termsResult;
+
+    return {
+      ok: true,
+      action: {
+        type: 'buy',
+        target: input.target,
+        spend: input.spend,
+        ...buildLiquidEditionTradeLimits(input),
+      },
+    };
+  }
+
   if (isErc1155BuyIntentRequestInput(input)) {
     return {
-      type: 'buy',
-      target: input.target,
-      expected: input.expected,
+      ok: true,
+      action: {
+        type: 'buy',
+        target: input.target,
+        expected: input.expected,
+      },
     };
   }
 
   return {
-    type: 'buy',
-    target: input.target,
-    expected: input.expected,
+    ok: true,
+    action: {
+      type: 'buy',
+      target: input.target,
+      expected: input.expected,
+    },
   };
+}
+
+function isLiquidEditionBuyIntentRequestInput(
+  input: BuildConnectBuyIntentRequestInput,
+): input is LiquidEditionBuyActionParams & { state: string } {
+  return input.target.kind === 'liquid-edition';
 }
 
 function isErc1155BuyIntentRequestInput(
   input: BuildConnectBuyIntentRequestInput,
 ): input is Erc1155BuyActionParams & { state: string } {
   return input.target.kind === 'erc1155-listing';
+}
+
+export function buildConnectSellIntentRequest(
+  input: BuildConnectSellIntentRequestInput,
+): BuildConnectActionIntentRequestResult {
+  const sharedResult = buildSharedActionFields(input);
+  if (!sharedResult.ok) return sharedResult;
+
+  const termsResult = validateLiquidEditionTradeTerms({
+    amount: input.sell.amount,
+    minReceived: input.minReceived,
+    maxSlippageBps: input.maxSlippageBps,
+  });
+  if (!termsResult.ok) return termsResult;
+
+  return {
+    ok: true,
+    request: {
+      action: {
+        type: 'sell',
+        target: input.target,
+        sell: input.sell,
+        receive: input.receive,
+        ...buildLiquidEditionTradeLimits(input),
+      },
+      returnPath: sharedResult.returnPath,
+      state: input.state,
+      ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.payment === undefined ? {} : { payment: input.payment }),
+    },
+  };
+}
+
+function validateLiquidEditionTradeTerms(input: {
+  amount: string;
+  minReceived: string | undefined;
+  maxSlippageBps: number | undefined;
+}): { ok: true } | { ok: false; error: ConnectActionValidationErrorCode } {
+  if (!baseUnitAmountPattern.test(input.amount)) {
+    return { ok: false, error: 'invalid_amount' };
+  }
+
+  if (input.minReceived !== undefined && !baseUnitAmountPattern.test(input.minReceived)) {
+    return { ok: false, error: 'invalid_min_received' };
+  }
+
+  if (input.maxSlippageBps !== undefined && !isSupportedSlippageBps(input.maxSlippageBps)) {
+    return { ok: false, error: 'invalid_max_slippage_bps' };
+  }
+
+  return { ok: true };
+}
+
+function isSupportedSlippageBps(value: number): boolean {
+  return Number.isInteger(value) && value >= minimumSlippageBps && value <= maximumSlippageBps;
+}
+
+function buildLiquidEditionTradeLimits(input: {
+  minReceived?: string;
+  maxSlippageBps?: number;
+}): { minReceived?: string; maxSlippageBps?: number } {
+  return {
+    ...(input.minReceived === undefined ? {} : { minReceived: input.minReceived }),
+    ...(input.maxSlippageBps === undefined ? {} : { maxSlippageBps: input.maxSlippageBps }),
+  };
 }
 
 export function buildConnectBidIntentRequest(

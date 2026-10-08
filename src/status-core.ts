@@ -8,7 +8,10 @@ export type ConnectActionType =
   | 'offer-accept'
   | 'offer-cancel'
   | 'settle'
+  | 'sell'
   | 'transfer';
+
+type ConnectOpenStringUnion<Known extends string> = Known | (string & {});
 
 export type ConnectIntentStatus =
   | 'pending'
@@ -38,22 +41,26 @@ export type ConnectActionTargetKind =
   | 'erc1155-checkout'
   | 'erc721-offer'
   | 'erc721-batch-offer'
+  | 'liquid-edition'
   | 'wallet';
 
 export type ConnectResolvedActionSnapshot = {
   actionKey: string;
-  actionType: 'checkout' | 'bid' | 'buy' | 'mint' | 'offer' | 'offer-accept' | 'offer-cancel' | 'settle' | 'transfer';
+  actionType: ConnectOpenStringUnion<Exclude<ConnectActionType, 'login'>>;
   resolvedAt: string;
-  targetKind: ConnectActionTargetKind;
+  targetKind: ConnectOpenStringUnion<ConnectActionTargetKind>;
   terms: {
     amount?: string;
     available: boolean;
     buyer?: string;
     currency?: string;
+    estimatedAmountOut?: string;
     expiry?: string;
     marketplace?: string;
     merkleRoot?: string;
     merkleProof?: string[];
+    minAmountOut?: string;
+    outputCurrency?: string;
     price?: string;
     quantity?: string;
     quantityAvailable?: string;
@@ -65,7 +72,7 @@ export type ConnectResolvedActionSnapshot = {
 
 export type ConnectIntent = {
   intentId: string;
-  type: ConnectActionType;
+  type: ConnectOpenStringUnion<ConnectActionType>;
   status: ConnectIntentStatus;
   initiatingOrigin?: string;
   returnPath: string;
