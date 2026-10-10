@@ -556,7 +556,7 @@ export function createSuperRareClient(
       requireNavigableHostedUrl(intent.url);
       await beforeOpen?.({ ...intent });
     } catch (error) {
-      popup.close();
+      try { popup.close(); } catch { /* Cleanup must not replace the caller's error. */ }
       throw error;
     }
 

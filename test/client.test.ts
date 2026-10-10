@@ -931,6 +931,40 @@ describe('createSuperRareClient', () => {
     expect(popup.closed).toBe(true);
   });
 
+  it('rejects with the beforeOpen error even if closing the window throws', async () => {
+    const linkingFailed = new Error('order link failed');
+    const popup: ConnectPopupWindow & { replacedUrls: string[] } = {
+      closed: false,
+      replacedUrls: [],
+      close(): void {
+        throw new Error('window already gone');
+      },
+      location: {
+        replace(url: string): void {
+          popup.replacedUrls.push(url);
+        },
+      },
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_transfer',
+      popup: { open: () => popup },
+      fetch: async () => connectIntentCreationResponse('connect_intent_transfer'),
+      sessionStorage: false,
+    });
+
+    await expect(client.actions.transfer({
+      chainId: 1,
+      to: '0x52908400098527886E0F7030069857D2E4169EE7',
+      currency: 'USDC',
+      amount: '25000000',
+      beforeOpen: async () => {
+        throw linkingFailed;
+      },
+    })).rejects.toBe(linkingFailed);
+    expect(popup.replacedUrls).toEqual([]);
+  });
+
   it('rejects invalid transfer parameters before opening a window or creating an intent', async () => {
     const open = vi.fn(() => createPopupStub());
     const fetchImplementation = vi.fn(async () => connectIntentCreationResponse('connect_intent_transfer'));
