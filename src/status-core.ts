@@ -8,7 +8,8 @@ export type ConnectActionType =
   | 'offer-accept'
   | 'offer-cancel'
   | 'settle'
-  | 'sell';
+  | 'sell'
+  | 'transfer';
 
 type ConnectOpenStringUnion<Known extends string> = Known | (string & {});
 
@@ -40,7 +41,8 @@ export type ConnectActionTargetKind =
   | 'erc1155-checkout'
   | 'erc721-offer'
   | 'erc721-batch-offer'
-  | 'liquid-edition';
+  | 'liquid-edition'
+  | 'wallet';
 
 export type ConnectResolvedActionSnapshot = {
   actionKey: string;
@@ -51,6 +53,7 @@ export type ConnectResolvedActionSnapshot = {
     amount?: string;
     available: boolean;
     buyer?: string;
+    chainId?: number;
     currency?: string;
     estimatedAmountOut?: string;
     expiry?: string;
@@ -62,6 +65,7 @@ export type ConnectResolvedActionSnapshot = {
     price?: string;
     quantity?: string;
     quantityAvailable?: string;
+    recipient?: string;
     seller?: string;
     unitPrice?: string;
   };

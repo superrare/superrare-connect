@@ -5,6 +5,7 @@ import {
   ConnectReturnPathError,
   createSuperRareClient,
 } from '../src/client.js';
+import type { TransferActionParams } from '../src/actions-flow-core.js';
 import type {
   ConnectErc1155CheckoutTarget,
   ConnectErc721BatchOfferTarget,
@@ -777,6 +778,234 @@ describe('createSuperRareClient', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('starts a transfer through actions.transfer and reports the completed intent', async () => {
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const settled: ConnectIntent[] = [];
+      const createdIntentRequests: unknown[] = [];
+      const recipient = '0x52908400098527886E0F7030069857D2E4169EE7';
+      const transferIntent = {
+        intentId: 'connect_intent_transfer',
+        type: 'transfer',
+        status: 'completed',
+        returnPath: '/credits/complete',
+        expiresAt: futureExpiry(),
+        resolvedActionSnapshot: {
+          actionKey: `11155111-${recipient}-transfer-USDC`,
+          actionType: 'transfer',
+          resolvedAt: '2026-10-01T00:00:00.000Z',
+          targetKind: 'wallet',
+          terms: {
+            available: true,
+            amount: '25000000',
+            currency: 'USDC',
+            recipient,
+          },
+        },
+        result: {
+          transactionHash: '0x9b1f0c4f0a5d4a3c2a1b0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b',
+        },
+      };
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_transfer',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'GET') return jsonResponse({ data: transferIntent });
+
+          expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
+          createdIntentRequests.push(await request.json());
+          return connectIntentCreationResponse('connect_intent_transfer');
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.actions.transfer({
+        chainId: 11155111,
+        to: recipient,
+        currency: 'USDC',
+        amount: '25000000',
+        returnPath: '/credits/complete',
+      })).resolves.toMatchObject({
+        intentId: 'connect_intent_transfer',
+        url: 'https://connect.superrare.test/intents/connect_intent_transfer',
+      });
+      expect(createdIntentRequests).toEqual([
+        {
+          action: {
+            type: 'transfer',
+            target: { kind: 'wallet', chainId: 11155111, address: recipient },
+            transfer: { currency: 'USDC', amount: '25000000' },
+          },
+          returnPath: '/credits/complete',
+          state: 'state_transfer',
+        },
+      ]);
+      expect(popup.replacedUrls).toEqual([
+        'https://connect.superrare.test/intents/connect_intent_transfer?display=popup',
+      ]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(popup.closed).toBe(true);
+      expect(settled).toEqual([transferIntent]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the transfer only after beforeOpen resolves', async () => {
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const urlsWhenCalled: string[][] = [];
+      let finishLinking: () => void = () => {};
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_transfer',
+        popup: { open: () => popup },
+        fetch: async () => connectIntentCreationResponse('connect_intent_transfer'),
+        sessionStorage: false,
+      });
+
+      const transfer = client.actions.transfer({
+        chainId: 1,
+        to: '0x52908400098527886E0F7030069857D2E4169EE7',
+        currency: 'USDC',
+        amount: '25000000',
+        beforeOpen: async (intent) => {
+          urlsWhenCalled.push([...popup.replacedUrls]);
+          expect(intent).toEqual({
+            intentId: 'connect_intent_transfer',
+            url: 'https://connect.superrare.test/intents/connect_intent_transfer',
+            expiresAt: '2026-06-22T00:00:00.000Z',
+          });
+          await new Promise<void>((resolve) => {
+            finishLinking = resolve;
+          });
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(urlsWhenCalled).toEqual([[]]);
+      expect(popup.replacedUrls).toEqual([]);
+
+      finishLinking();
+      await expect(transfer).resolves.toMatchObject({ intentId: 'connect_intent_transfer' });
+      expect(popup.replacedUrls).toEqual([
+        'https://connect.superrare.test/intents/connect_intent_transfer?display=popup',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('closes the window without showing the transfer when beforeOpen fails', async () => {
+    const popup = createPopupStub();
+    const linkingFailed = new Error('order link failed');
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_transfer',
+      popup: { open: () => popup },
+      fetch: async () => connectIntentCreationResponse('connect_intent_transfer'),
+      sessionStorage: false,
+    });
+
+    await expect(client.actions.transfer({
+      chainId: 1,
+      to: '0x52908400098527886E0F7030069857D2E4169EE7',
+      currency: 'USDC',
+      amount: '25000000',
+      beforeOpen: async () => {
+        throw linkingFailed;
+      },
+    })).rejects.toBe(linkingFailed);
+    expect(popup.replacedUrls).toEqual([]);
+    expect(popup.closed).toBe(true);
+  });
+
+  it('rejects with the beforeOpen error even if closing the window throws', async () => {
+    const linkingFailed = new Error('order link failed');
+    const popup: ConnectPopupWindow & { replacedUrls: string[] } = {
+      closed: false,
+      replacedUrls: [],
+      close(): void {
+        throw new Error('window already gone');
+      },
+      location: {
+        replace(url: string): void {
+          popup.replacedUrls.push(url);
+        },
+      },
+    };
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_transfer',
+      popup: { open: () => popup },
+      fetch: async () => connectIntentCreationResponse('connect_intent_transfer'),
+      sessionStorage: false,
+    });
+
+    await expect(client.actions.transfer({
+      chainId: 1,
+      to: '0x52908400098527886E0F7030069857D2E4169EE7',
+      currency: 'USDC',
+      amount: '25000000',
+      beforeOpen: async () => {
+        throw linkingFailed;
+      },
+    })).rejects.toBe(linkingFailed);
+    expect(popup.replacedUrls).toEqual([]);
+  });
+
+  it('rejects invalid transfer parameters before opening a window or creating an intent', async () => {
+    const open = vi.fn(() => createPopupStub());
+    const fetchImplementation = vi.fn(async () => connectIntentCreationResponse('connect_intent_transfer'));
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_transfer',
+      popup: { open },
+      fetch: fetchImplementation,
+      sessionStorage: false,
+    });
+    const transfer: Omit<TransferActionParams, 'amount'> = {
+      chainId: 1,
+      to: '0x52908400098527886E0F7030069857D2E4169EE7',
+      currency: 'ETH',
+    };
+
+    const decimalAmount = client.actions.transfer({ ...transfer, amount: '0.05' });
+    await expect(decimalAmount).rejects.toBeInstanceOf(ConnectActionValidationError);
+    await expect(decimalAmount).rejects.toMatchObject({ code: 'invalid_amount' });
+    await expect(client.actions.transfer({ ...transfer, amount: '0' }))
+      .rejects.toMatchObject({ code: 'invalid_amount' });
+    await expect(client.actions.transfer({ ...transfer, amount: '050000000000000000' }))
+      .rejects.toMatchObject({ code: 'invalid_amount' });
+    await expect(client.actions.transfer({
+      ...transfer,
+      // @ts-expect-error Amounts are base-unit strings.
+      amount: 50000000000000000,
+    })).rejects.toMatchObject({ code: 'invalid_amount' });
+    await expect(client.actions.transfer({
+      ...transfer,
+      to: '0x5290840009852788',
+      amount: '50000000000000000',
+    })).rejects.toMatchObject({ code: 'invalid_address' });
+    await expect(client.actions.transfer({
+      ...transfer,
+      amount: '50000000000000000',
+      returnPath: 'https://evil.example/credits',
+    })).rejects.toBeInstanceOf(ConnectReturnPathError);
+
+    expect(open).not.toHaveBeenCalled();
+    expect(fetchImplementation).not.toHaveBeenCalled();
   });
 
   it('starts make, accept, and cancel offer intents through the offers namespace', async () => {

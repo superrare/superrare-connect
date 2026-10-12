@@ -23,6 +23,7 @@ import {
   buildConnectMintIntentRequest,
   buildConnectSellIntentRequest,
   buildConnectSettleIntentRequest,
+  buildConnectTransferIntentRequest,
   type AcceptOfferActionParams,
   type BidActionParams,
   type BuyActionParams,
@@ -32,6 +33,7 @@ import {
   type MintActionParams,
   type SellActionParams,
   type SettleActionParams,
+  type TransferActionParams,
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
@@ -215,6 +217,7 @@ export type SuperRareConnectActionsNamespace = {
   bid: (params: BidActionParams) => Promise<ConnectIntentCreation>;
   mint: (params: MintActionParams) => Promise<ConnectIntentCreation>;
   settle: (params: SettleActionParams) => Promise<ConnectIntentCreation>;
+  transfer: (params: TransferActionParams) => Promise<ConnectIntentCreation>;
   getStatus: (params: { intentId: string }) => Promise<ConnectIntent>;
 };
 
@@ -522,7 +525,9 @@ export function createSuperRareClient(
       | ReturnType<typeof buildConnectMintIntentRequest>
       | ReturnType<typeof buildConnectMakeOfferIntentRequest>
       | ReturnType<typeof buildConnectAcceptOfferIntentRequest>
-      | ReturnType<typeof buildConnectCancelOfferIntentRequest>,
+      | ReturnType<typeof buildConnectCancelOfferIntentRequest>
+      | ReturnType<typeof buildConnectTransferIntentRequest>,
+    beforeOpen?: TransferActionParams['beforeOpen'],
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
       throw requestResult.error === 'invalid_return_path'
@@ -532,10 +537,11 @@ export function createSuperRareClient(
 
     // The popup must open before the first await to stay inside the user
     // gesture; otherwise browsers block it. It navigates once the intent
-    // exists. A blocked window fails the whole call before any intent is
-    // created — there is no same-page fallback. Each action gets its own
-    // window name: a shared one lets a second action reuse the first's
-    // window, so one watcher could close the window a buyer is paying in.
+    // exists and `beforeOpen` has resolved. A blocked window fails the whole
+    // call before any intent is created — there is no same-page fallback.
+    // Each action gets its own window name: a shared one lets a second
+    // action reuse the first's window, so one watcher could close the window
+    // a buyer is paying in.
     const popup = openPopupWindow(`superrare-connect-intent-${createConnectPopupName()}`);
     if (popup === null) {
       throw new ConnectPopupBlockedError();
@@ -548,8 +554,9 @@ export function createSuperRareClient(
         request: requestResult.request,
       }));
       requireNavigableHostedUrl(intent.url);
+      await beforeOpen?.({ ...intent });
     } catch (error) {
-      popup.close();
+      try { popup.close(); } catch { /* Cleanup must not replace the caller's error. */ }
       throw error;
     }
 
@@ -1469,6 +1476,13 @@ export function createSuperRareClient(
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
         }));
+      },
+      async transfer({ beforeOpen, ...params }): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectTransferIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }), beforeOpen);
       },
       async getStatus(params): Promise<ConnectIntent> {
         return await getConnectIntent({
