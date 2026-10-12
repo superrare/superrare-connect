@@ -268,7 +268,6 @@ describe('game connection', () => {
 
     const h = harness({ storage });
     expect(h.game.getAuthorization()).toBeUndefined();
-    expect(storage.values.has(key)).toBe(false);
   });
 
   it('drops expired persisted authorization and renews only on explicit connect', async () => {
@@ -350,6 +349,72 @@ describe('game connection', () => {
     expect(reloaded.urls).toEqual([]);
   });
 
+  it.each(['consent', 'credits'] as const)(
+    'requires explicit renewal in a peer client after %s rejects shared authorization',
+    async (operation) => {
+      const storage = memoryStorage();
+      const rejecting = harness({ storage, fetch: async () => Response.json({
+        error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Authorization rejected.' },
+      }, { status: 401 }) });
+      await rejecting.connect();
+      const peer = harness({ storage });
+      expect(peer.game.getAuthorization()).toEqual(authorization);
+
+      await expect(operation === 'consent'
+        ? rejecting.game.requestConsent(attempt)
+        : rejecting.game.credits.getBalance()).rejects.toMatchObject({ status: 401 });
+
+      expect(peer.game.getAuthorization()).toBeUndefined();
+      await connectionError(peer.game.requestConsent(attempt), 'authorization_required');
+      expect(peer.fetchImplementation).not.toHaveBeenCalled();
+      const renewal = peer.game.connect();
+      expect(peer.urls).toHaveLength(1);
+      peer.emit(peer.message({ authorizationToken: 'renewed-token' }));
+      await expect(renewal).resolves.toMatchObject({ authorizationToken: 'renewed-token' });
+    },
+  );
+
+  it('does not delete a renewal written during stale authorization cleanup', async () => {
+    const persistent = memoryStorage();
+    const renewed = { ...authorization, authorizationToken: 'renewed-token' };
+    let interleaveRenewal = false;
+    const storage: ConnectSessionStorage = {
+      getItem(key) {
+        const value = persistent.getItem(key);
+        if (interleaveRenewal && key.startsWith('superrare.connect.game-authorization:')) {
+          interleaveRenewal = false;
+          persistent.setItem(key, JSON.stringify(renewed));
+        }
+        return value;
+      },
+      setItem(key, value) {
+        if (interleaveRenewal && key.includes(':rejected:')) {
+          interleaveRenewal = false;
+          const authorizationKey = key.split(':rejected:')[0];
+          if (authorizationKey === undefined) throw new Error('Missing authorization key.');
+          persistent.setItem(authorizationKey, JSON.stringify(renewed));
+        }
+        persistent.setItem(key, value);
+      },
+      removeItem: persistent.removeItem,
+    };
+    let resolveResponse: ((response: Response) => void) | undefined;
+    const oldClient = harness({ storage, fetch: () => new Promise<Response>((resolve) => {
+      resolveResponse = resolve;
+    }) });
+    await oldClient.connect();
+    const pending = oldClient.game.requestConsent(attempt);
+    interleaveRenewal = true;
+    if (resolveResponse === undefined) throw new Error('Consent request did not start.');
+    resolveResponse(Response.json({
+      error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Authorization rejected.' },
+    }, { status: 401 }));
+    await expect(pending).rejects.toMatchObject({ status: 401 });
+
+    expect(harness({ storage: persistent }).game.getAuthorization()).toEqual(renewed);
+    expect(oldClient.game.getAuthorization()).toEqual(renewed);
+  });
+
   it('uses newer stored authorization when a cached authorization expires', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
@@ -366,7 +431,6 @@ describe('game connection', () => {
     await renewal;
 
     expect(oldClient.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
-    expect(storage.values.size).toBe(1);
   });
 
   it.each(['connect', 'getAuthorization'] as const)(

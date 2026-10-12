@@ -1048,7 +1048,11 @@ export function createSuperRareClient(
     return await inFlightPopupLogin;
   };
 
-  const gameAuthorizations = new Map<string, GameAuthorization>();
+  const gameAuthorizations = new Map<string, {
+    authorization: GameAuthorization;
+    persistence: 'persistent' | 'memory';
+  }>();
+  const rejectedGameAuthorizations = new Set<string>();
   const gameConnections = new Map<string, {
     generation: number;
     promise: Promise<GameAuthorization>;
@@ -1106,64 +1110,54 @@ export function createSuperRareClient(
           return 'persistent';
         } catch { return 'memory'; }
       };
-      const clearStoredAuthorization = (
-        expected: { authorizationToken: string } | { serialized: string },
-      ): void => {
-        const key = authorizationStorageKey();
-        try {
-          const serialized = storage?.getItem(key);
-          if (serialized === null || serialized === undefined) return;
-          if ('serialized' in expected) {
-            if (serialized === expected.serialized) storage?.removeItem(key);
-            return;
-          }
-          let value: unknown;
-          try { value = JSON.parse(serialized); } catch { return; }
-          const parsed = gameAuthorizationSchema.safeParse(value);
-          if (parsed.success && parsed.data.authorizationToken === expected.authorizationToken) {
-            storage?.removeItem(key);
-          }
-        } catch { /* Persistence cleanup is best-effort. */ }
-      };
+      const rejectedAuthorizationKey = (authorization: GameAuthorization): string =>
+        `${authorizationStorageKey()}:rejected:${encodeURIComponent(authorization.authorizationToken)}`;
       const clearAuthorization = (authorization: GameAuthorization): void => {
         const key = scopeKey();
-        if (gameAuthorizations.get(key)?.authorizationToken === authorization.authorizationToken) {
+        if (gameAuthorizations.get(key)?.authorization.authorizationToken === authorization.authorizationToken) {
           gameAuthorizations.delete(key);
         }
-        clearStoredAuthorization({ authorizationToken: authorization.authorizationToken });
+        // A token-scoped rejection cannot remove a concurrent renewal. Storage
+        // has no atomic compare-and-delete operation across browser tabs.
+        const rejectedKey = rejectedAuthorizationKey(authorization);
+        rejectedGameAuthorizations.add(rejectedKey);
+        try { storage?.setItem(rejectedKey, 'rejected'); } catch { /* This client still rejects the token in memory. */ }
       };
       const currentAuthorization = (): GameAuthorization | undefined => {
         const key = scopeKey();
         const cached = gameAuthorizations.get(key);
-        if (cached !== undefined && Date.parse(cached.expiresAt) > Date.now()) return cached;
-        if (cached !== undefined && gameAuthorizations.get(key)?.authorizationToken === cached.authorizationToken) {
-          gameAuthorizations.delete(key);
+        const validCached = cached !== undefined && Date.parse(cached.authorization.expiresAt) > Date.now()
+          ? cached : undefined;
+        gameAuthorizations.delete(key);
+        let authorization = validCached?.persistence === 'memory' ? validCached.authorization : undefined;
+        let persistence: 'persistent' | 'memory' = validCached?.persistence ?? 'persistent';
+        if (authorization === undefined) {
+          let serialized: string | null | undefined;
+          try { serialized = storage?.getItem(authorizationStorageKey()); } catch {
+            // Previously validated credentials remain usable if storage becomes unavailable.
+            authorization = validCached?.authorization;
+          }
+          if (serialized !== null && serialized !== undefined) {
+            let value: unknown;
+            try { value = JSON.parse(serialized); } catch { return undefined; }
+            const parsed = gameAuthorizationSchema.safeParse(value);
+            if (!parsed.success
+              || parsed.data.appId !== appId
+              || parsed.data.groupId !== groupId
+              || parsed.data.appOrigin !== requireAppOrigin()
+              || Date.parse(parsed.data.expiresAt) <= Date.now()) return undefined;
+            authorization = parsed.data;
+            persistence = 'persistent';
+          }
         }
-        let serialized: string | null | undefined;
-        try { serialized = storage?.getItem(authorizationStorageKey()); } catch { return undefined; }
-        if (serialized === null || serialized === undefined) return undefined;
-        let value: unknown;
-        try { value = JSON.parse(serialized); } catch {
-          clearStoredAuthorization({ serialized });
-          return undefined;
-        }
-        const parsed = gameAuthorizationSchema.safeParse(value);
-        if (!parsed.success) {
-          clearStoredAuthorization({ serialized });
-          return undefined;
-        }
-        if (parsed.data.appId !== appId
-          || parsed.data.groupId !== groupId
-          || parsed.data.appOrigin !== requireAppOrigin()) {
-          clearStoredAuthorization({ serialized });
-          return undefined;
-        }
-        if (Date.parse(parsed.data.expiresAt) <= Date.now()) {
-          clearAuthorization(parsed.data);
-          return undefined;
-        }
-        gameAuthorizations.set(key, parsed.data);
-        return parsed.data;
+        if (authorization === undefined) return undefined;
+        const rejectedKey = rejectedAuthorizationKey(authorization);
+        if (rejectedGameAuthorizations.has(rejectedKey)) return undefined;
+        try {
+          if (storage?.getItem(rejectedKey) === 'rejected') return undefined;
+        } catch { /* Rejection checks fall back to this client's memory. */ }
+        gameAuthorizations.set(key, { authorization, persistence });
+        return authorization;
       };
       const validatePaidStart = (
         params: SuperRareGameStartParams & { idempotencyKey: string },
@@ -1257,8 +1251,14 @@ export function createSuperRareClient(
               return;
             }
             const authorized = parsed.authorization;
-            gameAuthorizations.set(connectionKey, { ...authorized });
-            try { storage?.setItem(authorizationStorageKey(), JSON.stringify(authorized)); } catch { /* Connection remains usable in memory. */ }
+            let persistence: 'persistent' | 'memory' = 'memory';
+            try {
+              if (storage !== undefined) {
+                storage.setItem(authorizationStorageKey(), JSON.stringify(authorized));
+                persistence = 'persistent';
+              }
+            } catch { /* Connection remains usable in memory. */ }
+            gameAuthorizations.set(connectionKey, { authorization: { ...authorized }, persistence });
             finish(() => resolve({ ...authorized }));
           });
           if (settled) {
@@ -1314,8 +1314,7 @@ export function createSuperRareClient(
             body: { idempotencyKey: confirmed.idempotencyKey, fingerprint: confirmed.fingerprint, expectedCredits: confirmed.expectedCredits },
           });
         } catch (error) {
-          if (error instanceof SuperRareConnectApiError && error.status === 401
-            && gameAuthorizations.get(scopeKey())?.authorizationToken === authorization.authorizationToken) {
+          if (error instanceof SuperRareConnectApiError && error.status === 401) {
             clearAuthorization(authorization);
           }
           throw error;
