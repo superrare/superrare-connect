@@ -29,6 +29,23 @@ const superrare = createSuperRareClient({
 
 **Beta access:** This feature is not generally released. Use is limited to integrations with a beta API key. Contact SuperRare for beta access before using this SDK surface.
 
+### Copyable target game (plain JavaScript)
+
+`examples/target-game/` is the reference implementation for a credit-gated Studio game. It is standalone HTML, CSS, and JavaScript; it is excluded from the SDK TypeScript project and package build. The game uses the existing SDK browser bundle.
+
+From the repository root, build the SDK and serve the repository with any static HTTP server:
+
+```sh
+pnpm build
+python3 -m http.server 8000
+```
+
+Open `http://localhost:8000/examples/target-game/?appId=<Studio-product-UUID>&groupId=<credit-group-UUID>`. Studio must approve that exact local origin for the app and credit group. Use your approved HTTPS origin for a hosted deployment. The example uses production Studio, Rare API, Connect, and Ethereum-mainnet USDC defaults; URL parameters can override the service URLs for an approved test environment. No API key, seed phrase, or wallet secret belongs in the page.
+
+Player flow: **Connect** once → **Buy credits** with explicit wallet approval → **Play** with explicit per-round confirmation. The example restores a saved attempt after reload, retries purchase claims using the same quote and transaction hash, and presents one **Continue** action for recoverable play. A terminal expired round is preserved as history but does not block a new explicitly confirmed round. Displayed scores are client-asserted, not server-verified.
+
+The game—not the SDK—renders the play button and its confirmation. The example keeps the integration mechanics in `main.js`, `credits.js`, and `round.js`, so it can be copied without bringing React or TypeScript into a game project.
+
 Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
 
 ```ts
