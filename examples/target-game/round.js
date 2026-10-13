@@ -24,7 +24,7 @@ function isKnownUnusedConsent(error) {
 }
 
 export class PaidRound {
-  constructor({ game, root, getBalance, onStatus, storageKey = 'target-game' }) {
+  constructor({ game, root, getBalance, storageKey = 'target-game' }) {
     this.game = game;
     this.root = root;
     this.getBalance = getBalance;
@@ -68,7 +68,6 @@ export class PaidRound {
 
   announce(message) {
     if (this.statusNode) this.statusNode.textContent = message;
-    if (this.onStatus) this.onStatus(message);
   }
 
   accountStorageKey() {

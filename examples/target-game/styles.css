@@ -33,6 +33,25 @@ button:focus-visible, summary:focus-visible, #target:focus-visible { outline: 3p
 .balance { margin: 15px 0; padding: 14px; border-radius: 11px; background: #101929; color: var(--muted); }
 .balance strong { display: block; color: white; font-size: 1.9rem; }
 .connection { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+.connection p { color: var(--muted); }
+#connect-status { min-height: 1.5em; }
+#hosted-connect-dialog {
+  width: min(680px, calc(100vw - 28px));
+  max-width: none;
+  max-height: min(90vh, 860px);
+  margin: auto;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 17px;
+  color: inherit;
+  background: #192136;
+}
+#hosted-connect-dialog::backdrop { background: #050914c7; }
+.hosted-connect-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.hosted-connect-header h2 { margin: 0; }
+#hosted-connect-status { min-height: 1.5em; color: var(--muted); }
+.hosted-connect-frame { min-height: 200px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; }
+.hosted-connect-frame iframe { display: block; width: 100%; height: min(70vh, 700px); border: 0; }
 .fine-print, .developer { color: var(--muted); font-size: .84rem; }
 .developer { margin-top: 22px; }
 .developer summary { width: fit-content; cursor: pointer; }
