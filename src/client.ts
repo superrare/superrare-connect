@@ -49,6 +49,11 @@ import {
 } from './checkout-flow-core.js';
 import { SuperRareConnectApiError } from './errors.js';
 import {
+  appendConnectEmbedDisplay,
+  ConnectEmbedUnavailableError,
+  parseConnectEmbedMessage,
+} from './embed-core.js';
+import {
   type ConnectSession,
   type ConnectSessionStorage,
 } from './session-storage-core.js';
@@ -90,7 +95,6 @@ import {
   type ServerValidatedGameRun,
 } from './games-api.js';
 import {
-  buildGameAuthorizationUrl,
   gameIdempotencyKeySchema,
   gameConsentRequestSchema,
   gamePendingAttemptSchema,
@@ -99,7 +103,7 @@ import {
   inlineConsentResponseSchema,
   GameConnectionError,
   normalizeStudioUrl,
-  parseGameAuthorizationMessage,
+  validateGameAuthorizationResponse,
   type GameAuthorization,
   type GameCreditTerms,
   type GameConsentRequest,
@@ -131,9 +135,12 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
      */
     visibilityEvents?: ConnectPopupVisibilityEvents;
   };
+  /** Opt-in hosted Connect iframe transport; game authorization is an API exchange. */
+  embed?: ConnectEmbedOptions;
   /**
    * Called with the terminal status when a hosted action/checkout flow
-   * finishes (the SDK closes the window); with `status: 'expired'` when the
+   * finishes (popup mode closes the window; embedded mode leaves dismissal to the merchant);
+   * with `status: 'expired'` when the
    * server reports the intent expired (the window is left open — the hosted
    * page may be mid-payment, and only it knows whether closing is safe); or
    * with the latest known state when the user closes the window early or the
@@ -164,6 +171,18 @@ export type ConnectPopupVisibilityEvents = {
    * visible); returns the unsubscribe function.
    */
   subscribe: (listener: (visible: boolean) => void) => () => void;
+};
+
+/** Merchant-owned frame adapter; messageSource must be the iframe's contentWindow. */
+export type ConnectEmbedWindow = ConnectPopupWindow & {
+  messageSource: unknown;
+};
+
+export type ConnectEmbedOptions = {
+  open: (url: string, target: string) => ConnectEmbedWindow | null;
+  messageEvents?: ConnectPopupMessageEvents;
+  /** Offer an explicit restart with a fresh popup intent; never reuse the iframe URL. */
+  onUnavailable: (error: ConnectEmbedUnavailableError) => void;
 };
 
 export type ConnectAuthLoginParams = {
@@ -244,9 +263,9 @@ export type SuperRareGameStartParams = {
 export type SuperRareGameClient = {
   /** Starts a free session. Credit-gated games require inline consent. */
   start: (params?: SuperRareGameStartParams) => Promise<GameSessionStart>;
-  /** Explicit connection or renewal only; never authorizes a play. */
+  /** Exchanges signed-in Connect access for scoped game authorization; never authorizes a play. */
   connect: () => Promise<GameAuthorization>;
-  /** Reads valid game-scoped authorization without opening or renewing a popup. */
+  /** Reads valid game-scoped authorization without network access or UI. */
   getAuthorization: () => GameAuthorization | undefined;
   getTerms: () => Promise<GameCreditTerms>;
   /** Call only after the game displays and receives one-play confirmation. */
@@ -396,10 +415,32 @@ export function createSuperRareClient(
       }),
     );
   };
+  const embeddedMessageSources = new WeakMap<ConnectPopupWindow, unknown>();
+  const hostedDisplayUrl = (url: string): string =>
+    options.embed === undefined ? appendConnectPopupDisplay(url) : appendConnectEmbedDisplay(url);
+  const openHostedWindow = (
+    target: string,
+    url = 'about:blank',
+  ): ConnectPopupWindow | null => {
+    if (options.embed === undefined) return openPopupWindow(target, url);
+    if (hostedMessageEvents === undefined) {
+      throw new Error('Embedded Connect requires a message-event source.');
+    }
+    const frame = options.embed.open(url, target);
+    if (frame !== null) {
+      if (frame.messageSource === undefined || frame.messageSource === null) {
+        frame.close();
+        throw new Error('Embedded Connect requires the iframe contentWindow as messageSource.');
+      }
+      embeddedMessageSources.set(frame, frame.messageSource);
+    }
+    return frame;
+  };
   const watchPopupIntent = async (input: {
     popup: ConnectPopupWindow;
     intentId: string;
     deadline: number;
+    isAbandoned?: () => boolean;
   }): Promise<void> => {
     // Kept across ticks: a transient poll failure must not erase the state we
     // already know, or an early close would have nothing to report.
@@ -411,6 +452,7 @@ export function createSuperRareClient(
     let lastPollFailed = false;
     let consecutiveGoneResponses = 0;
     const closePopup = (): void => {
+      if (options.embed !== undefined) return;
       try {
         if (!isPopupClosed(input.popup)) input.popup.close();
       } catch {
@@ -430,6 +472,7 @@ export function createSuperRareClient(
     // or showing its own outcome, and the SDK cannot know closing is safe.
     for (;;) {
       await sleep(POPUP_POLL_INTERVAL_MS);
+      if (input.isAbandoned?.()) return;
       try {
         lastIntent = await pollIntent();
         lastPollFailed = false;
@@ -464,6 +507,7 @@ export function createSuperRareClient(
         }
       }
 
+      if (input.isAbandoned?.()) return;
       if (lastIntent !== undefined && isConnectIntentSettled(lastIntent.status)) {
         closePopup();
         options.onIntentSettled?.(lastIntent);
@@ -508,6 +552,33 @@ export function createSuperRareClient(
       }
     }
   };
+  const watchHostedIntent = (input: {
+    popup: ConnectPopupWindow;
+    intentId: string;
+    connectOrigin: string;
+    deadline: number;
+    isAbandoned: () => boolean;
+  }): Promise<void> => {
+    let unavailable = false;
+    const unsubscribe = options.embed === undefined ? undefined : hostedMessageEvents?.subscribe((event) => {
+      const parsed = parseConnectEmbedMessage({
+        ...event,
+        expectedOrigin: input.connectOrigin,
+        expectedSource: embeddedMessageSources.get(input.popup),
+        intentId: input.intentId,
+        source: event.source,
+      });
+      // Terminal messages are reconciled through the normal authoritative API poll.
+      if (!parsed.ok || parsed.message.type !== 'superrare-connect:embed-unavailable'
+        || unavailable || input.isAbandoned()) return;
+      unavailable = true;
+      options.embed?.onUnavailable(new ConnectEmbedUnavailableError(input.intentId));
+    });
+    return watchPopupIntent({
+      ...input,
+      isAbandoned: () => unavailable || input.isAbandoned(),
+    }).finally(() => { unsubscribe?.(); });
+  };
   // Every hosted URL the SDK navigates a window to crosses this guard: the
   // URL comes from Rare API, but a `javascript:`/`data:` URL reaching
   // `location.replace`/`assign` would execute, so only web URLs are allowed.
@@ -523,6 +594,7 @@ export function createSuperRareClient(
   };
   const startIntent = async (
     requestResult: BuildConnectActionIntentRequestResult,
+    beforeOpen?: TransferActionParams['beforeOpen'],
   ): Promise<ConnectIntentCreation> => {
     if (!requestResult.ok) {
       throw requestResult.error === 'invalid_return_path'
@@ -532,11 +604,12 @@ export function createSuperRareClient(
 
     // The popup must open before the first await to stay inside the user
     // gesture; otherwise browsers block it. It navigates once the intent
-    // exists. A blocked window fails the whole call before any intent is
-    // created — there is no same-page fallback. Each action gets its own
-    // window name: a shared one lets a second action reuse the first's
-    // window, so one watcher could close the window a buyer is paying in.
-    const popup = openPopupWindow(`superrare-connect-intent-${createConnectPopupName()}`);
+    // exists and `beforeOpen` has resolved. A blocked window fails the whole
+    // call before any intent is created — there is no same-page fallback.
+    // Each action gets its own window name: a shared one lets a second
+    // action reuse the first's window, so one watcher could close the window
+    // a buyer is paying in.
+    const popup = openHostedWindow(`superrare-connect-intent-${createConnectPopupName()}`);
     if (popup === null) {
       throw new ConnectPopupBlockedError();
     }
@@ -548,27 +621,35 @@ export function createSuperRareClient(
         request: requestResult.request,
       }));
       requireNavigableHostedUrl(intent.url);
+      await beforeOpen?.({ ...intent });
     } catch (error) {
-      popup.close();
+      try { popup.close(); } catch { /* Cleanup must not replace the caller's error. */ }
       throw error;
     }
 
-    popup.location.replace(appendConnectPopupDisplay(intent.url));
-    void watchPopupIntent({
-      popup,
-      intentId: intent.intentId,
-      deadline: getConnectPopupDeadline({
-        expiresAt: intent.expiresAt,
-        now: Date.now(),
-        fallbackMilliseconds: POPUP_FALLBACK_TIMEOUT_MS,
-      }) + POPUP_INTENT_DEADLINE_GRACE_MS,
-    }).catch(() => {
-      // The watcher owns its own cleanup; a throwing collaborator (a custom
-      // window, or the integrator's onIntentSettled) must not surface as an
-      // unhandled rejection.
-    });
-
-    return intent;
+    let abandoned = false;
+    try {
+      if (options.embed === undefined) popup.location.replace(hostedDisplayUrl(intent.url));
+      void watchHostedIntent({
+        popup,
+        intentId: intent.intentId,
+        connectOrigin: requireNavigableHostedUrl(intent.url),
+        isAbandoned: () => abandoned,
+        deadline: getConnectPopupDeadline({
+          expiresAt: intent.expiresAt,
+          now: Date.now(),
+          fallbackMilliseconds: POPUP_FALLBACK_TIMEOUT_MS,
+        }) + POPUP_INTENT_DEADLINE_GRACE_MS,
+      }).catch(() => {
+        // The watcher owns cleanup; callback failures must not become unhandled rejections.
+      });
+      if (options.embed !== undefined) popup.location.replace(hostedDisplayUrl(intent.url));
+      return intent;
+    } catch (error) {
+      abandoned = true;
+      try { popup.close(); } catch { /* Preserve the navigation/subscription error. */ }
+      throw error;
+    }
   };
   const me = async (): Promise<ConnectCurrentUser> => {
     const session = await sessionLifecycle.getCurrentSession();
@@ -582,6 +663,7 @@ export function createSuperRareClient(
     });
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
+  const hostedMessageEvents = options.embed?.messageEvents ?? messageEvents;
   const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
   let popupLoginReplacementGeneration = 0;
   let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
@@ -646,7 +728,7 @@ export function createSuperRareClient(
     preparedLogin = {
       started,
       connectOrigin,
-      popupUrl: appendConnectPopupDisplay(started.intent.url),
+      popupUrl: hostedDisplayUrl(started.intent.url),
       params: resolvedParams,
       operationGeneration,
     };
@@ -761,7 +843,7 @@ export function createSuperRareClient(
         try {
           unsubscribe();
           unsubscribeVisibility();
-          if (!isPopupClosed(input.popup)) input.popup.close();
+          if (options.embed === undefined && !isPopupClosed(input.popup)) input.popup.close();
         } catch {
           // The window/emitter is already gone; nothing left to release.
         }
@@ -811,20 +893,6 @@ export function createSuperRareClient(
         );
       };
 
-      unsubscribe = input.messageEvents.subscribe((event) => {
-        if (settled || exchanging) return;
-        const parsed = parseConnectAuthCallbackMessage({
-          data: event.data,
-          origin: event.origin,
-          expectedOrigin: input.connectOrigin,
-        });
-        // Unrelated or foreign-origin messages — keep waiting. A callback for
-        // another intent belongs to a different login, not this one.
-        if (!parsed.ok || parsed.params.intentId !== input.pendingAuth.intentId) return;
-
-        startExchange(parsed.params);
-      });
-
       // The pull side of the handoff. The hosted page posts its callback to
       // this page, but iOS Safari suspends this page while the hosted window
       // is in front and the message posted meanwhile never arrives. So on
@@ -864,6 +932,83 @@ export function createSuperRareClient(
           claiming = false;
         }
       };
+      let reconcilingEmbeddedStatus = false;
+      const reconcileEmbeddedStatus = async (): Promise<void> => {
+        if (settled || exchanging || reconcilingEmbeddedStatus) return;
+        reconcilingEmbeddedStatus = true;
+        try {
+          const intent = await getConnectIntent({
+            ...apiOptions,
+            intentId: input.pendingAuth.intentId,
+            signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
+          });
+          if (settled || exchanging) return;
+          switch (intent.status) {
+            case 'completed':
+              await claimCompletedLogin();
+              break;
+            case 'cancelled':
+              settle(() => resolve({ status: 'cancelled' }));
+              break;
+            case 'expired':
+              settle(() => resolve({ status: 'expired' }));
+              break;
+            case 'failed':
+              settle(() => reject(new Error('Embedded Connect login failed.')));
+              break;
+            case 'pending':
+            case 'requires_user':
+            case 'processing':
+              break;
+            default: {
+              const unexpectedStatus: never = intent.status;
+              throw new Error(`Unexpected Connect intent status: ${unexpectedStatus}`);
+            }
+          }
+        } catch (error) {
+          if (!settled && !exchanging) {
+            if (error instanceof SuperRareConnectApiError && error.status === 410) {
+              settle(() => resolve({ status: 'expired' }));
+            } else {
+              settle(() => reject(toRejectionError(error)));
+            }
+          }
+        } finally {
+          reconcilingEmbeddedStatus = false;
+        }
+      };
+      unsubscribe = input.messageEvents.subscribe((event) => {
+        if (settled || exchanging) return;
+        if (options.embed !== undefined) {
+          if (event.source !== embeddedMessageSources.get(input.popup)) return;
+          const embedded = parseConnectEmbedMessage({
+            ...event,
+            source: event.source,
+            expectedOrigin: input.connectOrigin,
+            expectedSource: embeddedMessageSources.get(input.popup),
+            intentId: input.pendingAuth.intentId,
+          });
+          if (embedded.ok) {
+            if (embedded.message.type === 'superrare-connect:embed-unavailable') {
+              const error = new ConnectEmbedUnavailableError(input.pendingAuth.intentId);
+              settle(() => reject(error));
+              options.embed.onUnavailable(error);
+            } else {
+              void reconcileEmbeddedStatus();
+            }
+            return;
+          }
+        }
+        const parsed = parseConnectAuthCallbackMessage({
+          data: event.data,
+          origin: event.origin,
+          expectedOrigin: input.connectOrigin,
+        });
+        // Another intent's callback must not complete this login.
+        if (!parsed.ok || parsed.params.intentId !== input.pendingAuth.intentId) return;
+        startExchange(parsed.params);
+      });
+      if (settled) unsubscribe();
 
       unsubscribeVisibility = input.visibilityEvents?.subscribe((visible) => {
         if (visible) void claimCompletedLogin();
@@ -917,13 +1062,13 @@ export function createSuperRareClient(
     sessionCommitGeneration += 1;
     const operationGeneration = sessionCommitGeneration;
     popupLoginReplacementGeneration = sessionLifecycle.getReplacementGeneration();
-    if (messageEvents === undefined) {
+    if (hostedMessageEvents === undefined) {
       // Without a message source the hosted page's callback could never be
       // received, so the login could never complete — refuse before opening
       // anything. Browsers always have one; a non-browser host supplies
       // `popup.messageEvents`.
       throw new Error(
-        'Connect login is unavailable: no message-event source. Provide popup.messageEvents on hosts without window message events.',
+        'Connect login is unavailable: no message-event source. Provide embed.messageEvents or popup.messageEvents on hosts without window message events.',
       );
     }
 
@@ -933,20 +1078,21 @@ export function createSuperRareClient(
     // fallback. A login prepared ahead of the tap has its intent already:
     // the window opens straight at the hosted page, with no round trip for a
     // suspended opener to leave unfinished.
-    const popup = openPopupWindow(
+    const popup = openHostedWindow(
       `superrare-connect-login-${createConnectPopupName()}`,
-      prepared?.popupUrl,
+      options.embed === undefined ? prepared?.popupUrl : undefined,
     );
     if (popup === null) {
       throw new ConnectPopupBlockedError();
     }
 
     if (prepared !== undefined) {
+      let completion: Promise<ConnectPopupLoginResult> | undefined;
       try {
-        return await watchPopupLogin({
+        completion = watchPopupLogin({
           popup,
           pendingAuth: prepared.started.pendingAuth,
-          messageEvents,
+          messageEvents: hostedMessageEvents,
           visibilityEvents,
           connectOrigin: prepared.connectOrigin,
           deadline: getConnectPopupDeadline({
@@ -956,8 +1102,14 @@ export function createSuperRareClient(
           }),
           operationGeneration,
         });
+        if (options.embed !== undefined) popup.location.replace(prepared.popupUrl);
+        return await completion;
       } catch (error) {
-        if (!popup.closed) popup.close();
+        // A rejected watcher is observed even if navigation failed before await.
+        void completion?.catch(() => {});
+        if (!(error instanceof ConnectEmbedUnavailableError) && !popup.closed) {
+          try { popup.close(); } catch { /* Preserve the navigation/subscription error. */ }
+        }
         throw error;
       }
     }
@@ -1005,28 +1157,34 @@ export function createSuperRareClient(
       throw error;
     }
 
-    const popupUrl = appendConnectPopupDisplay(intent.url);
+    const popupUrl = hostedDisplayUrl(intent.url);
     const deadline = getConnectPopupDeadline({
       expiresAt: intent.expiresAt,
       now: Date.now(),
       fallbackMilliseconds: POPUP_FALLBACK_TIMEOUT_MS,
     });
+    let completion: Promise<ConnectPopupLoginResult> | undefined;
     try {
-      popup.location.replace(popupUrl);
-      return await watchPopupLogin({
+      if (options.embed === undefined) popup.location.replace(popupUrl);
+      completion = watchPopupLogin({
         popup,
         pendingAuth,
-        messageEvents,
+        messageEvents: hostedMessageEvents,
         visibilityEvents,
         connectOrigin,
         deadline,
         operationGeneration,
       });
+      if (options.embed !== undefined) popup.location.replace(popupUrl);
+      return await completion;
     } catch (error) {
       // The watcher settles and cleans up on its own; this boundary covers a
       // collaborator that throws (navigation, subscription) before the watcher
       // owns the cleanup. Closing twice is harmless.
-      if (!popup.closed) popup.close();
+      void completion?.catch(() => {});
+      if (!(error instanceof ConnectEmbedUnavailableError) && !popup.closed) {
+        try { popup.close(); } catch { /* Preserve the navigation/subscription error. */ }
+      }
       throw error;
     }
   };
@@ -1048,7 +1206,11 @@ export function createSuperRareClient(
     return await inFlightPopupLogin;
   };
 
-  const gameAuthorizations = new Map<string, GameAuthorization>();
+  const gameAuthorizations = new Map<string, {
+    authorization: GameAuthorization;
+    persistence: 'persistent' | 'memory';
+  }>();
+  const rejectedGameAuthorizations = new Set<string>();
   const gameConnections = new Map<string, {
     generation: number;
     promise: Promise<GameAuthorization>;
@@ -1069,13 +1231,17 @@ export function createSuperRareClient(
         ? undefined
         : `/api/v1/credit-groups/${encodeURIComponent(groupId)}`;
       const requireAppOrigin = (): string => {
-        const value = options.initiatingOrigin ?? readBrowserOrigin();
-        if (value === undefined) throw new GameConnectionError('invalid_origin');
-        const origin = new URL(value).origin;
-        if (origin === 'null' || origin !== value) throw new GameConnectionError('invalid_origin');
+        const browserOrigin = readBrowserOrigin();
+        const value = browserOrigin ?? options.initiatingOrigin;
+        const parsed = z.url().safeParse(value);
+        if (!parsed.success) throw new GameConnectionError('invalid_origin');
+        const origin = new URL(parsed.data).origin;
+        if (origin === 'null' || origin !== value
+          || (browserOrigin !== undefined && options.initiatingOrigin !== undefined
+            && options.initiatingOrigin !== browserOrigin)) throw new GameConnectionError('invalid_origin');
         return origin;
       };
-      const scopeKey = (): string => JSON.stringify([requireStudioUrl(), appId, groupId, options.initiatingOrigin ?? readBrowserOrigin()]);
+      const scopeKey = (): string => JSON.stringify([requireStudioUrl(), appId, groupId, requireAppOrigin()]);
       const authorizationStorageKey = (): string =>
         `superrare.connect.game-authorization:${encodeURIComponent(scopeKey())}`;
       const pendingConsentKey = (idempotencyKey: string): string =>
@@ -1106,64 +1272,58 @@ export function createSuperRareClient(
           return 'persistent';
         } catch { return 'memory'; }
       };
-      const clearStoredAuthorization = (
-        expected: { authorizationToken: string } | { serialized: string },
-      ): void => {
-        const key = authorizationStorageKey();
-        try {
-          const serialized = storage?.getItem(key);
-          if (serialized === null || serialized === undefined) return;
-          if ('serialized' in expected) {
-            if (serialized === expected.serialized) storage?.removeItem(key);
-            return;
-          }
-          let value: unknown;
-          try { value = JSON.parse(serialized); } catch { return; }
-          const parsed = gameAuthorizationSchema.safeParse(value);
-          if (parsed.success && parsed.data.authorizationToken === expected.authorizationToken) {
-            storage?.removeItem(key);
-          }
-        } catch { /* Persistence cleanup is best-effort. */ }
-      };
+      const rejectedAuthorizationKey = (authorization: GameAuthorization): string =>
+        `${authorizationStorageKey()}:rejected:${encodeURIComponent(authorization.authorizationToken)}`;
       const clearAuthorization = (authorization: GameAuthorization): void => {
         const key = scopeKey();
-        if (gameAuthorizations.get(key)?.authorizationToken === authorization.authorizationToken) {
+        if (gameAuthorizations.get(key)?.authorization.authorizationToken === authorization.authorizationToken) {
           gameAuthorizations.delete(key);
         }
-        clearStoredAuthorization({ authorizationToken: authorization.authorizationToken });
+        // A token-scoped rejection cannot remove a concurrent renewal. Storage
+        // has no atomic compare-and-delete operation across browser tabs.
+        const rejectedKey = rejectedAuthorizationKey(authorization);
+        rejectedGameAuthorizations.add(rejectedKey);
+        try { storage?.setItem(rejectedKey, 'rejected'); } catch { /* This client still rejects the token in memory. */ }
       };
       const currentAuthorization = (): GameAuthorization | undefined => {
         const key = scopeKey();
         const cached = gameAuthorizations.get(key);
-        if (cached !== undefined && Date.parse(cached.expiresAt) > Date.now()) return cached;
-        if (cached !== undefined && gameAuthorizations.get(key)?.authorizationToken === cached.authorizationToken) {
-          gameAuthorizations.delete(key);
+        const validCached = cached !== undefined && Date.parse(cached.authorization.expiresAt) > Date.now()
+          ? cached : undefined;
+        gameAuthorizations.delete(key);
+        let authorization = validCached?.persistence === 'memory' ? validCached.authorization : undefined;
+        let persistence: 'persistent' | 'memory' = validCached?.persistence ?? 'persistent';
+        if (authorization === undefined) {
+          let serialized: string | null | undefined;
+          try { serialized = storage?.getItem(authorizationStorageKey()); } catch {
+            // Previously validated credentials remain usable if storage becomes unavailable.
+            authorization = validCached?.authorization;
+          }
+          if (serialized !== null && serialized !== undefined) {
+            let value: unknown;
+            try { value = JSON.parse(serialized); } catch { return undefined; }
+            const parsed = gameAuthorizationSchema.safeParse(value);
+            if (!parsed.success
+              || parsed.data.appId !== appId
+              || parsed.data.groupId !== groupId
+              || parsed.data.appOrigin !== requireAppOrigin()
+              || Date.parse(parsed.data.expiresAt) <= Date.now()) return undefined;
+            authorization = parsed.data;
+            persistence = 'persistent';
+          }
         }
-        let serialized: string | null | undefined;
-        try { serialized = storage?.getItem(authorizationStorageKey()); } catch { return undefined; }
-        if (serialized === null || serialized === undefined) return undefined;
-        let value: unknown;
-        try { value = JSON.parse(serialized); } catch {
-          clearStoredAuthorization({ serialized });
+        if (authorization === undefined) return undefined;
+        const session = sessionLifecycle.getSession();
+        if (session !== undefined && session.address.toLowerCase() !== authorization.address.toLowerCase()) {
           return undefined;
         }
-        const parsed = gameAuthorizationSchema.safeParse(value);
-        if (!parsed.success) {
-          clearStoredAuthorization({ serialized });
-          return undefined;
-        }
-        if (parsed.data.appId !== appId
-          || parsed.data.groupId !== groupId
-          || parsed.data.appOrigin !== requireAppOrigin()) {
-          clearStoredAuthorization({ serialized });
-          return undefined;
-        }
-        if (Date.parse(parsed.data.expiresAt) <= Date.now()) {
-          clearAuthorization(parsed.data);
-          return undefined;
-        }
-        gameAuthorizations.set(key, parsed.data);
-        return parsed.data;
+        const rejectedKey = rejectedAuthorizationKey(authorization);
+        if (rejectedGameAuthorizations.has(rejectedKey)) return undefined;
+        try {
+          if (storage?.getItem(rejectedKey) === 'rejected') return undefined;
+        } catch { /* Rejection checks fall back to this client's memory. */ }
+        gameAuthorizations.set(key, { authorization, persistence });
+        return authorization;
       };
       const validatePaidStart = (
         params: SuperRareGameStartParams & { idempotencyKey: string },
@@ -1221,68 +1381,37 @@ export function createSuperRareClient(
           gameConnections.delete(connectionKey);
         }
         if (groupId === undefined) throw new Error('Game connection requires groupId.');
-        if (messageEvents === undefined) throw new Error('Game connection requires browser message events.');
         const appOrigin = requireAppOrigin();
-        const state = createConnectState();
-        const authorizationUrl = buildGameAuthorizationUrl({ studioUrl: requireStudioUrl(), appId, groupId, appOrigin, state });
-        const popup = openPopupWindow(`superrare-connect-game-${createConnectPopupName()}`, authorizationUrl);
-        if (popup === null) throw new ConnectPopupBlockedError();
-        const connection = new Promise<GameAuthorization>((resolve, reject) => {
-          let settled = false;
-          let unsubscribe = (): void => {};
-          const finish = (operation: () => void): void => {
-            if (settled) return;
-            settled = true;
-            try { unsubscribe(); } catch { /* Cleanup must not prevent settlement. */ }
-            try { if (!isPopupClosed(popup)) popup.close(); } catch { /* Already gone. */ }
-            operation();
-          };
-          unsubscribe = messageEvents.subscribe((event) => {
-            const parsed = parseGameAuthorizationMessage({
-              data: event.data, origin: event.origin, expectedOrigin: requireStudioUrl(), expectedState: state,
-              appId, groupId, appOrigin, now: Date.now(),
-            });
-            if (parsed.status === 'ignored') return;
-            if (event.source === undefined) {
-              finish(() => reject(new GameConnectionError('invalid_message')));
-              return;
-            }
-            if (event.source !== popup) return;
-            if (parsed.status === 'cancelled' || parsed.status === 'expired' || parsed.status === 'invalid_message') {
-              finish(() => reject(new GameConnectionError(parsed.status)));
-              return;
-            }
-            if (generation !== sessionLifecycle.getReplacementGeneration()) {
-              finish(() => reject(new GameConnectionError('authorization_required')));
-              return;
-            }
-            const authorized = parsed.authorization;
-            gameAuthorizations.set(connectionKey, { ...authorized });
-            try { storage?.setItem(authorizationStorageKey(), JSON.stringify(authorized)); } catch { /* Connection remains usable in memory. */ }
-            finish(() => resolve({ ...authorized }));
-          });
-          if (settled) {
-            try { unsubscribe(); } catch { /* Synchronous emitters may settle during subscription. */ }
+        const connection = (async (): Promise<GameAuthorization> => {
+          const session = await sessionLifecycle.getCurrentSession();
+          if (session === undefined) throw new ConnectSessionRequiredError();
+          if (generation !== sessionLifecycle.getReplacementGeneration()) {
+            throw new GameConnectionError('authorization_required');
           }
-          const deadline = Date.now() + 5 * 60_000;
-          const watch = async (): Promise<void> => {
-            try {
-              while (!settled) {
-                await sleep(POPUP_POLL_INTERVAL_MS);
-                if (settled) return;
-                if (isPopupClosed(popup)) {
-                  finish(() => reject(new GameConnectionError('cancelled')));
-                  return;
-                }
-                if (Date.now() >= deadline) {
-                  finish(() => reject(new GameConnectionError('expired')));
-                  return;
-                }
-              }
-            } catch (error) { finish(() => reject(error)); }
-          };
-          void watch();
-        });
+          const value = await requestStudioJson({
+            studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${paidPath()}/authorizations`, method: 'POST',
+            authorization: `ConnectSession ${session.sessionId}`, body: { appOrigin },
+          });
+          if (generation !== sessionLifecycle.getReplacementGeneration()) {
+            throw new GameConnectionError('authorization_required');
+          }
+          const result = validateGameAuthorizationResponse({
+            value, appId, groupId, appOrigin, now: Date.now(),
+            sessionExpiresAt: session.expiresAt, address: session.address,
+          });
+          if (!result.ok) throw new GameConnectionError(result.error);
+          const authorized = result.authorization;
+          let persistence: 'persistent' | 'memory' = 'memory';
+          try {
+            if (storage !== undefined) {
+              storage.setItem(authorizationStorageKey(), JSON.stringify(authorized));
+              persistence = 'persistent';
+            }
+          } catch { /* Connection remains usable in memory. */ }
+          gameAuthorizations.set(connectionKey, { authorization: { ...authorized }, persistence });
+          return { ...authorized };
+        })();
         const tracked = connection.finally(() => {
           if (gameConnections.get(connectionKey)?.promise === tracked) {
             gameConnections.delete(connectionKey);
@@ -1314,8 +1443,7 @@ export function createSuperRareClient(
             body: { idempotencyKey: confirmed.idempotencyKey, fingerprint: confirmed.fingerprint, expectedCredits: confirmed.expectedCredits },
           });
         } catch (error) {
-          if (error instanceof SuperRareConnectApiError && error.status === 401
-            && gameAuthorizations.get(scopeKey())?.authorizationToken === authorization.authorizationToken) {
+          if (error instanceof SuperRareConnectApiError && error.status === 401) {
             clearAuthorization(authorization);
           }
           throw error;
@@ -1534,19 +1662,19 @@ export function createSuperRareClient(
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
         }));
       },
-      async transfer(params): Promise<ConnectIntentCreation> {
-        return await startIntent(buildConnectTransferIntentRequest({
-          ...params,
-          state: createState(),
-          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
-        }));
-      },
       async mint(params): Promise<ConnectIntentCreation> {
         return await startIntent(buildConnectMintIntentRequest({
           ...params,
           state: createState(),
           initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
         }));
+      },
+      async transfer({ beforeOpen, ...params }): Promise<ConnectIntentCreation> {
+        return await startIntent(buildConnectTransferIntentRequest({
+          ...params,
+          state: createState(),
+          initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        }), beforeOpen);
       },
       async getStatus(params): Promise<ConnectIntent> {
         return await getConnectIntent({

@@ -20,7 +20,6 @@ import type {
   ConnectErc721ReserveAuctionTarget,
   ConnectErc721ScheduledAuctionTarget,
   ConnectLiquidEditionTarget,
-  ConnectWalletTarget,
 } from '../src/auth-flow-core.js';
 
 const directListingTarget: ConnectErc721DirectListingTarget = {
@@ -80,12 +79,6 @@ const batchOfferTarget: ConnectErc721BatchOfferTarget = {
   chainId: 1,
   creator: '0x2222222222222222222222222222222222222222',
   root: '0xroot',
-};
-
-const walletTarget: ConnectWalletTarget = {
-  kind: 'wallet',
-  chainId: 8453,
-  address: '0x3333333333333333333333333333333333333333',
 };
 
 const liquidEditionTarget: ConnectLiquidEditionTarget = {
@@ -382,30 +375,6 @@ describe('buildConnectSettleIntentRequest', () => {
   });
 });
 
-describe('buildConnectTransferIntentRequest', () => {
-  it('builds a wallet-only transfer intent with base-unit currency terms', () => {
-    expect(buildConnectTransferIntentRequest({
-      target: walletTarget,
-      transfer: { currency: 'USDC', amount: '2500000' },
-      initiatingOrigin: 'https://game.example',
-      returnPath: '/transfer/complete',
-      state: 'state_transfer',
-    })).toEqual({
-      ok: true,
-      request: {
-        action: {
-          type: 'transfer',
-          target: walletTarget,
-          transfer: { currency: 'USDC', amount: '2500000' },
-        },
-        initiatingOrigin: 'https://game.example',
-        returnPath: '/transfer/complete',
-        state: 'state_transfer',
-      },
-    });
-  });
-});
-
 describe('buildConnectBuyIntentRequest with a liquid edition', () => {
   it.each([
     { currency: 'ETH', amount: '10000000000000000' },
@@ -615,5 +584,137 @@ describe('buildConnectSellIntentRequest', () => {
     });
 
     expect(result).toMatchObject({ ok: true });
+  });
+});
+
+describe('buildConnectTransferIntentRequest', () => {
+  const recipient = '0x52908400098527886E0F7030069857D2E4169EE7';
+
+  it.each([
+    { chainId: 1, currency: 'ETH', amount: '50000000000000000' },
+    { chainId: 8453, currency: 'USDC', amount: '25000000' },
+    { chainId: 11155111, currency: 'USDC', amount: '25000000' },
+    { chainId: 84532, currency: 'ETH', amount: '50000000000000000' },
+  ] as const)('builds a $currency transfer on chain $chainId', ({ chainId, currency, amount }) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId,
+      to: recipient,
+      currency,
+      amount,
+      returnPath: '/credits/complete',
+      initiatingOrigin: 'https://game.example',
+      state: 'state_123',
+    })).toEqual({
+      ok: true,
+      request: {
+        action: {
+          type: 'transfer',
+          target: { kind: 'wallet', chainId, address: recipient },
+          transfer: { currency, amount },
+        },
+        returnPath: '/credits/complete',
+        state: 'state_123',
+        initiatingOrigin: 'https://game.example',
+      },
+    });
+  });
+
+  it.each(['0', '00', '01', '0.05', '1.5', '-1', '1e18', ' 1', '1 ', ''])('rejects the amount %j', (amount) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      amount,
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_amount' });
+  });
+
+  it('rejects an amount that is not a string', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      // @ts-expect-error Amounts are base-unit strings.
+      amount: 50000000000000000,
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_amount' });
+  });
+
+  it.each([
+    '',
+    '52908400098527886E0F7030069857D2E4169EE7',
+    '0x52908400098527886E0F7030069857D2E4169EE',
+    '0x52908400098527886E0F7030069857D2E4169EE70',
+    '0x52908400098527886E0F7030069857D2E4169EEG',
+    ' 0x52908400098527886E0F7030069857D2E4169EE7',
+    '0x0000000000000000000000000000000000000000',
+    'alice.eth',
+  ])('rejects the recipient %j', (to) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to,
+      currency: 'ETH',
+      amount: '50000000000000000',
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_address' });
+  });
+
+  it('rejects a recipient that is not a string', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      // @ts-expect-error Recipients are address strings.
+      to: [recipient],
+      currency: 'ETH',
+      amount: '50000000000000000',
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_address' });
+  });
+
+  it('accepts a lowercase recipient', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient.toLowerCase(),
+      currency: 'ETH',
+      amount: '50000000000000000',
+      state: 'state_123',
+    })).toMatchObject({ ok: true });
+  });
+
+  it.each([
+    'https://evil.example/credits',
+    '//evil.example/credits',
+    '/credits%2f..%2fevil',
+  ])('rejects the unsafe return path %j before validating the amount', (returnPath) => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      amount: '0',
+      returnPath,
+      state: 'state_123',
+    })).toEqual({ ok: false, error: 'invalid_return_path' });
+  });
+
+  it('does not type a payment and never forwards one', () => {
+    expect(buildConnectTransferIntentRequest({
+      chainId: 1,
+      to: recipient,
+      currency: 'ETH',
+      amount: '50000000000000000',
+      // @ts-expect-error Transfers are wallet-only.
+      payment: { method: 'card' },
+      state: 'state_123',
+    })).toEqual({
+      ok: true,
+      request: {
+        action: {
+          type: 'transfer',
+          target: { kind: 'wallet', chainId: 1, address: recipient },
+          transfer: { currency: 'ETH', amount: '50000000000000000' },
+        },
+        returnPath: '/',
+        state: 'state_123',
+      },
+    });
   });
 });

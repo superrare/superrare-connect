@@ -2,7 +2,7 @@
 
 Public browser SDK for starting SuperRare-hosted Connect flows from external websites.
 
-SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, Liquid Edition trades, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, open them in their own window, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, and status flows do not require an authenticated Connect session.
+SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auction settlement, Liquid Edition trades, wallet-to-wallet transfers, payment, and transaction execution on SuperRare-controlled origins. Integrator sites use this SDK to create hosted intents, open them in their own window, and read intent status. Auth helpers are available, but checkout, buy, bid, mint, settle, transfer, and status flows do not require an authenticated Connect session.
 
 ## Install
 
@@ -31,20 +31,11 @@ const superrare = createSuperRareClient({
 
 ### Copyable target game (plain JavaScript)
 
-`examples/target-game/` is the reference implementation for a credit-gated Studio game. It is standalone HTML, CSS, and JavaScript; it is excluded from the SDK TypeScript project and package build. The game uses the existing SDK browser bundle.
+`examples/target-game/` is the standalone plain-JavaScript credit-gated game reference, excluded from the SDK TypeScript project and package build. Follow [`examples/target-game/README.md`](examples/target-game/README.md) to build and run its allowlisted loopback server with the repository's `dist/superrare-connect.global.js` bundle.
 
-From the repository root, build the SDK and serve the repository with any static HTTP server:
+Configure your approved Studio app, credit group, exact browser origin, and environment service URLs. The game signs in through hosted Connect using an explicit embedded or popup transport, then authorizes the scoped game session directly through the Studio API with current Connect access. `game.connect()` never opens a hosted authorization surface, falls back between transports, or starts a paid play.
 
-```sh
-pnpm build
-python3 -m http.server 8000
-```
-
-Open `http://localhost:8000/examples/target-game/?appId=<Studio-product-UUID>&groupId=<credit-group-UUID>`. Studio must approve that exact local origin for the app and credit group. Use your approved HTTPS origin for a hosted deployment. The example uses production Studio, Rare API, Connect, and Ethereum-mainnet USDC defaults; URL parameters can override the service URLs for an approved test environment. No API key, seed phrase, or wallet secret belongs in the page.
-
-Player flow: **Connect** once → **Buy credits** with explicit wallet approval → **Play** with explicit per-round confirmation. The example restores a saved attempt after reload, retries purchase claims using the same quote and transaction hash, and presents one **Continue** action for recoverable play. A terminal expired round is preserved as history but does not block a new explicitly confirmed round. Displayed scores are client-asserted, not server-verified.
-
-The game—not the SDK—renders the play button and its confirmation. The example keeps the integration mechanics in `main.js`, `credits.js`, and `round.js`, so it can be copied without bringing React or TypeScript into a game project.
+Credit purchases require an explicit wallet approval and retry the same quote/transaction hash until Studio reconciliation completes. Each paid round has separate explicit confirmation and retains its original idempotency key for recovery. Displayed scores are client-asserted, not server-verified. Production Connect requires the example's explicit popup choice; the known dev-mainnet host may use the documented embedded flow.
 
 Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
 
@@ -58,10 +49,14 @@ const started = await game.start({ clientBuildId: 'web-2026-10-06', idempotencyK
 ```
 Pass the same `idempotencyKey` when retrying an unresolved free start.
 
-For a Studio-configured credit-gated game, include its group. Start with an explicit `game.connect()` click: it opens Studio's `/connect/games/authorize` surface when authorization is missing or expired, and reuses valid scoped authorization. Connecting never requests consent or starts a play.
+For a Studio-configured credit-gated game, include its group. Your app owns the connection UI: explicitly sign in with `superrare.auth.login()` when needed, then call `game.connect()` from your **Connect game** action. With no valid cached authorization, `connect()` exchanges current Connect access through Studio API; it never opens a popup or iframe, requests consent, buys credits, or starts a play.
 
-The SDK persists validated game authorization by Studio origin, app, credit group, and app origin in its configured storage (browser `localStorage` by default). On page load, `game.getAuthorization()` restores a valid authorization without a popup; it returns `undefined` when none is saved or access has expired. This authorization is separate from SuperRare login. A Studio `401` invalidates it; only an explicit `game.connect()` call opens a renewal popup.
-`GameAuthorization` values returned by `connect()` and `getAuthorization()` are snapshots; changing a returned object does not modify the SDK's cached credential. A Studio `401` invalidates only the matching authorization, preserving a newer authorization another client has already saved to the same storage.
+The SDK persists validated game authorization by Studio origin, app, credit group, and actual browser origin in its configured storage (browser `localStorage` by default). On page load, `game.getAuthorization()` restores valid authorization without network access or UI; it returns `undefined` when none is saved, access has expired, or a different wallet is signed in. A valid cached authorization can still be reused after SuperRare logout. Switching to a different signed-in wallet requires an explicit `game.connect()` for that wallet; the SDK preserves pending purchases and paid-start attempts. A Studio `401` rejects that game token; only an explicit `game.connect()` exchanges signed-in access for a renewal.
+`GameAuthorization` values returned by `connect()` and `getAuthorization()` are snapshots; changing a returned object does not modify the SDK's cached credential. Clients re-read persisted authorization before reusing it. A Studio `401` records a token-scoped rejection that other clients sharing readable storage observe, without deleting a concurrently renewed authorization. Invalid or expired stored records are ignored and replaced on the next successful connection. Disabled or failing persistence keeps authorization and rejection state in memory only; it cannot synchronize other clients.
+
+The SDK posts to `studioUrl/api/v1/credit-groups/:groupId/apps/:appId/authorizations` with `Authorization: ConnectSession <current access token>` and JSON `{ appOrigin: actualBrowserOrigin }`. The browser supplies `Origin`; Studio requires it to match the body and the approved app/group registry. Do not proxy or manufacture that header. In a browser, an `initiatingOrigin` option that differs from the actual origin is rejected. The response is `{ version: '1', authorization: GameAuthorization }`; the SDK validates app, group, origin, wallet address, and expiry before saving. Authorization cannot outlive the Connect access session or 15 minutes. Non-browser integrations must provide an explicit `initiatingOrigin` and a transport/environment that satisfies Studio's origin rules.
+
+The vanilla example ignores superseded terms responses and prevents delayed page-load restoration from replacing a newer connection or recovery error. Keep the same latest-request ownership rule in your integration when refreshing terms concurrently.
 
 Your game—not the SDK—owns the one-play confirmation UI. Fetch authoritative terms with `getTerms()`, display the title and credit cost, and offer a separate **Play — spend N credits** action. Only that confirmation action may call `requestConsent`. There is no SDK confirmation popup per play:
 
@@ -115,7 +110,7 @@ recoverButton.addEventListener('click', async () => {
 
 Attach error handling to these handlers in your game (see the vanilla example). Keep the caller-owned attempt key available for `recoverStart({ idempotencyKey })`, including across reloads when recovery storage works. `requestConsent` returns `recovery: 'persistent' | 'memory'`: persistent means the SDK saved the attempt/consent for recovery; disabled or failing storage falls back to memory and requires keeping the same client/page alive. Persist the caller's non-secret key separately; never put authorization, consent, or session credentials in URLs or logs. `recoverStart` also retries a saved consent issuance whose response was lost, using the current game authorization without opening a window. It preserves the original start parameters, fingerprint, and confirmed cost.
 
-Cancellation or window closure rejects `connect()` with `GameConnectionError` code `cancelled`; expiry rejects with `expired` or `authorization_required`. Stop and require another explicit **Connect game** click—never connect or spend automatically. Game authorization remains valid across SuperRare logout and account changes until it expires or Studio rejects it. If session replacement happens while `connect()` is pending, that popup cannot authorize the replacement session; another explicit **Connect game** click starts a fresh connection. Consent issuance HTTP failures reject with `SuperRareConnectApiError`; inspect `error.status` and its optional structured `error.code`, not message text, to distinguish Studio rejections. A `401` clears persisted authorization and requires explicit reconnection before recovering the same attempt. There is no automatic HTTP retry.
+An uncached signed-out `connect()` rejects with `ConnectSessionRequiredError`; the app may offer an explicit login before retrying. Expired responses reject with `GameConnectionError` code `expired`; malformed, incorrectly bound, or overlong responses use `invalid_authorization`, and session replacement during an exchange uses `authorization_required`. These failures never fall back to hosted authorization UI or silently retry. Saved game authorization can remain usable after logout until it expires or Studio rejects its token, but cannot select a different signed-in wallet's game account. Studio HTTP failures reject with `SuperRareConnectApiError`; inspect `status` and optional `code`, not message text (`401 CONNECT_UNAUTHORIZED`, `403 FORBIDDEN` / `CREDIT_GROUP_APP_NOT_APPROVED`, or `503 CONNECT_UNAVAILABLE`, for example). A rejected token does not delete a concurrent renewal. Preserve pending purchases and paid-start attempts while requiring a new explicit connection.
 
 On `409 CREDIT_GROUP_COST_CHANGED`, no new consent was issued: refresh terms, show the new cost, and obtain a fresh visible confirmation before creating a new attempt. Never silently accept a higher cost. `409 CREDIT_GROUP_CONSENT_EXPIRED` proves a matched consent expired unused; only a fresh explicit confirmation may create a new attempt/key. A reused-key binding error must not be repaired by silently creating a key. After a timeout, network failure, or `503`, retain the original attempt and use **Recover original play**; do not create a second key or assume a charge failed. A completed/inactive session may reject recovery with `409`; do not replay a completed round.
 
@@ -188,6 +183,68 @@ ESM CDN-style usage:
   const superrare = createSuperRareClient();
 </script>
 ```
+
+## Embedded Hosted Login And Checkout
+
+Set `embed` on the client to run hosted Connect login, checkout, actions, and offers in a merchant-owned iframe. Popup mode remains the default. The SDK owns intent creation, callback verification, and status reconciliation; your adapter owns the iframe DOM and dismissal. The public adapter types are `ConnectEmbedOptions` and `ConnectEmbedWindow`.
+
+Create `#connect-embed`, `#connect-status`, and a `#sign-in` button before this script:
+
+```ts
+import { createSuperRareClient, ConnectEmbedUnavailableError } from '@rareprotocol/connect';
+
+const container = document.querySelector('#connect-embed');
+const status = document.querySelector('#connect-status');
+if (container === null || status === null) throw new Error('Missing Connect embed elements.');
+
+const superrare = createSuperRareClient({
+  embed: {
+    open(url) {
+      const frame = document.createElement('iframe');
+      frame.title = 'SuperRare Connect';
+      frame.allow = 'payment';
+      frame.style.width = '100%';
+      frame.style.height = '720px';
+      container.append(frame);
+      const messageSource = frame.contentWindow;
+      if (messageSource === null) {
+        frame.remove();
+        return null;
+      }
+      frame.src = url;
+      return {
+        messageSource,
+        get closed() { return !frame.isConnected; },
+        close() { frame.remove(); },
+        location: { replace(nextUrl) { frame.src = nextUrl; } },
+      };
+    },
+    onUnavailable(error) {
+      status.textContent = `${error.code}: restart explicitly using a new popup flow.`;
+    },
+  },
+});
+
+document.querySelector('#sign-in')?.addEventListener('click', async () => {
+  try {
+    const result = await superrare.auth.login();
+    status.textContent = result.status;
+  } catch (error) {
+    status.textContent = error instanceof ConnectEmbedUnavailableError
+      ? 'Embedded storage is unavailable. Offer a new popup login.'
+      : 'Login failed.';
+  }
+});
+```
+
+- The adapter opens a blank frame synchronously. The SDK subscribes before assigning the hosted URL with `display=embed`; `messageSource` must be that exact iframe's `contentWindow`. Browser message events are used by default; non-browser hosts can inject `embed.messageEvents`.
+- Call `auth.login()`, `checkout.start()`, `actions.transfer()` and other hosted methods normally. `transfer.beforeOpen(intent)` still finishes before the iframe navigates, allowing your backend to record the intent before checkout is shown.
+- Auth callbacks require the hosted origin, frame source, intent ID, and original state. Terminal outcomes are reconciled through authoritative API reads, not frontend payment crediting. `onIntentSettled` retains its existing status contract, including possibly non-terminal state after dismissal; check status and reconcile purchases on your backend.
+- Successful login and authoritative terminal outcomes leave dismissal to the merchant. Remove the iframe to dismiss it; login checks the API for a missed completion before returning `cancelled`. Intent creation, `beforeOpen`, navigation, subscription, or login exchange failures clean up the adapter and reject the operation; the original failure is preserved.
+- `superrare-connect:embed-unavailable` invokes `embed.onUnavailable` with `ConnectEmbedUnavailableError` (`code: 'embed_unavailable'`, `intentId`). An embedded login also rejects with that error; an already-created action stops its watcher without reporting a fabricated completion. The SDK never silently opens a popup. A user-initiated restart must use a separate popup-mode client and a fresh intent, never the consumed iframe URL.
+- **Studio `game.connect()` is API-only**, including on an embedded client. Use the existing embedded `auth.login()` separately if signed out; connecting never creates a hosted game-authorization URL or starts a paid play.
+- Use an HTTPS merchant origin; HTTP loopback origins are supported for local development. The SDK creates intents directly against `apiUrl` from the merchant browser so the browser's `Origin` matches `initiatingOrigin`; configure CORS and the matching `connectUrl` rather than proxying an untrusted body origin.
+- Embedded sessions use the hosted app's partitioned cookies and can be unavailable in some browsers. Reown, OAuth, external wallets, and provider confirmations retain their own UI. Do not impose an opaque iframe sandbox; preserve the script, same-origin, form, popup, and payment permissions required by the hosted providers. Arbitrary merchant embedding accepts framing/clickjacking risk; origin-bound messages do not make the surrounding merchant UI trustworthy.
 
 ## Anonymous ERC-721 Buy
 
@@ -311,7 +368,7 @@ The SDK never accepts arbitrary calldata, contract instructions, private keys, A
 
 ## Payment Methods
 
-Marketplace actions accept an optional `payment` hint (Liquid Edition trades are wallet-only; see [Liquid Editions](#liquid-editions)). Set `payment: { method: 'wallet' }` to keep a marketplace checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent. `actions.transfer` is always wallet-only and does not accept a payment hint.
+Every action except `transfer` accepts an optional `payment` hint (transfers are wallet-only, see [Transfers](#transfers); Liquid Edition trades accept only `{ method: 'wallet' }`, see [Liquid Editions](#liquid-editions)). Set `payment: { method: 'wallet' }` to keep the hosted checkout wallet-only: the hosted page never offers card payment, and Rare API refuses card preparation for the intent.
 
 **Wallet-only is required when the sale settles on a custom contract whose mint or transfer logic depends on the receiving wallet** — for example a mint that binds a pre-registered artwork to the collector's address. Card settlement executes through a SuperRare buy-proxy that receives the asset itself and re-transfers it to the buyer, so the on-chain receiver is the proxy, not the buyer; such sales revert only after the card was charged. If your contract keys anything on the `mintTo` / transfer receiver, always create its intents wallet-only:
 
@@ -329,26 +386,6 @@ await superrare.actions.mint({
 ```
 
 Omit `payment` on marketplace actions to let the hosted checkout offer every method the listing supports.
-
-## Wallet Transfers
-
-`actions.transfer` starts a hosted wallet transfer to a non-zero address. The current Connect API accepts `ETH` or `USDC`—not arbitrary ERC-20 symbols—and requires `amount` as a positive integer string in the currency's smallest units (wei for ETH; for example, `'2500000'` is 2.5 USDC). The chain must be enabled by the hosted Connect deployment.
-
-```ts
-const transfer = await superrare.actions.transfer({
-  target: {
-    kind: 'wallet',
-    chainId: 8453,
-    address: '0x3333333333333333333333333333333333333333',
-  },
-  transfer: { currency: 'USDC', amount: '2500000' },
-  returnPath: '/transfer/complete',
-});
-
-const status = await superrare.actions.getStatus({ intentId: transfer.intentId });
-```
-
-The hosted Connect page handles wallet connection and transaction execution. Check the final intent status before treating the transfer as complete.
 
 ## Anonymous Auction Settlement
 
@@ -432,6 +469,83 @@ Liquid Edition trades are wallet-only: `payment` accepts only `{ method: 'wallet
 
 Liquid Editions trade on Ethereum mainnet (`chainId: 1`) and Sepolia (`11155111`). Production Connect executes mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia) with a `liquid-edition` target on `chainId: 11155111`.
 
+## Transfers
+
+`actions.transfer` asks the user to send an exact amount of ETH or USDC from their wallet to a wallet you name, for example to pay for off-chain goods such as game credits. The user signs in and confirms in the hosted window, which shows the amount, the network, and the full destination address before anything is sent.
+
+```ts
+await superrare.actions.transfer({
+  chainId: 1,
+  to: '0x52908400098527886E0F7030069857D2E4169EE7',
+  currency: 'USDC',
+  amount: '25000000', // 25 USDC
+  returnPath: '/credits/complete',
+  beforeOpen: async ({ intentId }) => {
+    const response = await fetch('/api/orders/order_123/transfer-intent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ intentId }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) throw new Error('Could not link the payment to the order.');
+  },
+});
+```
+
+`beforeOpen` runs after the intent is created and before the hosted window shows the transfer. The window stays blank until `beforeOpen` resolves, so bound its work with a timeout. If `beforeOpen` throws, the SDK closes the window and `actions.transfer` rejects with that error, so the hosted window never shows a transfer your backend has not recorded.
+
+- Chains: Ethereum mainnet (`1`), Base (`8453`), Sepolia (`11155111`) and Base Sepolia (`84532`) are supported; each hosted Connect deployment enables a subset. Production executes mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia). On a chain the deployment does not enable, the hosted window shows the transfer as not available.
+- Currencies: `ETH` and `USDC`.
+- `amount` is a raw base-unit string, like bid and offer amounts: wei for ETH (`'50000000000000000'` is 0.05 ETH) and 6 decimals for USDC (`'25000000'` is 25 USDC). The SDK rejects decimals, zero, leading zeros, and non-string amounts with `ConnectActionValidationError` (`code: 'invalid_amount'`) before any window opens.
+- `to` must be a `0x`-prefixed, 40-hex-character address other than the zero address; the SDK rejects anything else with `ConnectActionValidationError` (`code: 'invalid_address'`) before any window opens.
+- Wallet-only: there is no `payment` option and the hosted window never offers card. The user pays from the wallet they sign in with, and the hosted window keeps the confirm button disabled while that wallet cannot cover the amount.
+- Rare API rejects the call with `SuperRareConnectApiError` (`status` 400) for a chain outside those four, an invalid or zero address as `to`, an unknown currency, or a card payment or `payment.recipient` sent to the API directly.
+- Rare API accepts transfer intents on all four chains in every deployment, so a testnet intent created against production can still be completed by calling the API directly. Always compare `terms.chainId` with the order.
+
+### Verifying a transfer before crediting
+
+The user controls the page, so nothing it reports proves a payment: not the `actions.transfer` result, not `onIntentSettled`, and never an amount or chain sent from the page. Grant goods only from your backend, based on the intent it reads itself:
+
+1. The page calls `actions.transfer` and sends the `intentId` to your backend from `beforeOpen`, as in the example above. The backend records it against the pending order: player, product, and the expected `recipient`, `amount`, `currency`, and `chainId`. Always create the intent from the page: SDK actions need a page, and the SDK cannot open an intent it did not create.
+2. Treat `onIntentSettled` only as a hint to check. The backend reads the intent itself with `GET /v1/connect/intents/:intentId`, or with `intents.get` server-side.
+3. Credit only when all of these hold:
+   - `status === 'completed'`. A `processing` intent can already carry an unverified `result.transactionHash`; never credit it.
+   - `resolvedActionSnapshot.actionType === 'transfer'`.
+   - The terms `chainId`, `recipient`, `amount`, and `currency` equal the order's. `recipient` comes back checksummed, so compare addresses case-insensitively. A testnet transfer (Sepolia or Base Sepolia) must never credit a mainnet order, and a Base transfer must never credit an Ethereum order.
+   - The `intentId` was not credited before, for example with a unique constraint on the column that stores credited intent ids. `isTransferPaid` below checks everything else.
+
+```ts
+import { createSuperRareClient } from '@rareprotocol/connect';
+
+const superrare = createSuperRareClient({ sessionStorage: false });
+
+type TransferOrder = {
+  intentId: string;
+  chainId: 1 | 8453 | 11155111 | 84532;
+  recipient: string;
+  currency: 'ETH' | 'USDC';
+  amount: string;
+};
+
+async function isTransferPaid(order: TransferOrder): Promise<boolean> {
+  const intent = await superrare.intents.get({ intentId: order.intentId });
+  const snapshot = intent.resolvedActionSnapshot;
+
+  return (
+    intent.status === 'completed' &&
+    snapshot?.actionType === 'transfer' &&
+    snapshot.terms.chainId === order.chainId &&
+    snapshot.terms.recipient?.toLowerCase() === order.recipient.toLowerCase() &&
+    snapshot.terms.amount === order.amount &&
+    snapshot.terms.currency === order.currency
+  );
+}
+```
+
+A `completed` transfer means SuperRare verified on-chain that the wallet signed in to the hosted window at confirmation paid exactly `amount` of `currency` to `recipient` on `chainId`, in a transaction mined after the intent was created. One transaction completes at most one transfer per paying wallet; a smart-account bundle that carries several payers' transfers completes one intent for each.
+
+If the intent is still `processing` when your backend reads it and it already carries `result.transactionHash` (the player closed the window, or confirmation took longer than usual), keep reading it: each read lets SuperRare re-verify the payment on-chain and complete the intent. Such a transfer stays readable for 24 hours after the intent's `expiresAt`, and a `completed` transfer is kept for the same 24 hours, so read and record it within that window. A transfer whose hash was not recorded before the intent expired is not completed automatically: the wallet approved it after the intent expired, the player closed the window before approving, or the player sped it up in their wallet after the window stopped watching.
+
 ## Intent Status
 
 ```ts
@@ -450,7 +564,7 @@ const outcome = resolveConnectIntentOutcome(intent);
 
 ## Optional Auth Flow
 
-Auth is available for integrations that need a Connect session or `user.me()`. It is not required for checkout, buy, bid, mint, or intent status.
+Auth is available for integrations that need a Connect session or `user.me()`. It is not required for checkout, buy, bid, mint, transfer, or intent status.
 
 `auth.login()` runs the login in a small centered window: the user authenticates on SuperRare Connect, the window closes itself, and the promise resolves with the session — including the authenticated wallet address — plus the signed-in user's profile. Your page never navigates away.
 
@@ -491,7 +605,7 @@ createSuperRareClient({
     open: (url, target, features) => window.open(url, target, features),
     messageEvents: {
       // Deliver every `message` event as { origin, data, source }; return the
-      // unsubscribe function. Games verify source against their opened window.
+      // unsubscribe function. Hosted login verifies origin, intent, and state.
       subscribe: (listener) => {
         const handler = (event: MessageEvent) => {
           listener({ origin: event.origin, data: event.data, source: event.source });
@@ -626,7 +740,7 @@ The dev environment resolves and executes both mainnet (`1`) and Sepolia (`11155
 
 ## Hosted Windows
 
-Every hosted flow — checkout, buy, sell, bid, mint, settle, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
+Every hosted flow — checkout, buy, sell, bid, mint, settle, transfer, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
 
 ```ts
 const superrare = createSuperRareClient({
@@ -668,7 +782,7 @@ const result = normalizeReturnPath('/account');
 The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
-- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_min_received`, or `invalid_max_slippage_bps`.
+- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_address`, `invalid_min_received`, or `invalid_max_slippage_bps`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.

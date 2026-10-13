@@ -7,6 +7,8 @@ export {
   createSuperRareClient,
   type SuperRareConnectActionsNamespace,
   type ConnectAuthLoginParams,
+  type ConnectEmbedOptions,
+  type ConnectEmbedWindow,
   type ConnectPopupMessageEvent,
   type ConnectPopupMessageEvents,
   type ConnectPopupVisibilityEvents,
@@ -23,6 +25,7 @@ export {
   type SuperRareConnectOffersNamespace,
   type SuperRareConnectUserNamespace,
 } from './client.js';
+export { ConnectEmbedUnavailableError } from './embed-core.js';
 export {
   type ClientAssertedScoreResult,
   type GameCreditBalance,
@@ -75,9 +78,6 @@ export {
   type ConnectErc721ReserveAuctionTarget,
   type ConnectErc721ScheduledAuctionTarget,
   type ConnectEthereumAddress,
-  type ConnectTransferCurrency,
-  type ConnectTransferTerms,
-  type ConnectWalletTarget,
   type ConnectExpectedOfferTerms,
   type ConnectExpectedPriceTerms,
   type ConnectExpectedUnitPriceTerms,
@@ -91,6 +91,8 @@ export {
   type ConnectMintTarget,
   type ConnectOfferTerms,
   type ConnectPurchaseTerms,
+  type ConnectTransferChainId,
+  type ConnectTransferCurrency,
   type ConnectAuthPendingVerificationError,
   type ConnectAuthPendingVerificationResult,
   type PendingConnectAuth,

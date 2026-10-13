@@ -1,6 +1,7 @@
 import {
   createSuperRareClient,
   GameConnectionError,
+  ConnectSessionRequiredError,
   SuperRareConnectApiError,
   type GameAuthorization,
   type GameCreditTerms,
@@ -26,6 +27,8 @@ let connectedUntil = 0;
 let busy = false;
 let pendingKey: string | undefined;
 let callerStorageWorks = true;
+let operationGeneration = 0;
+let termsRequestGeneration = 0;
 
 const render = (value: unknown): void => {
   if (output !== null) output.textContent = JSON.stringify(value, null, 2);
@@ -59,13 +62,24 @@ const updateControls = (): void => {
   }
   if (recoverGame !== null) recoverGame.disabled = busy || pendingKey === undefined || game === undefined;
 };
-const loadTerms = async (): Promise<void> => {
-  if (game === undefined) return;
+const loadTerms = async (): Promise<boolean> => {
+  if (game === undefined) return false;
+  // Superseded requests return false so their callers also skip stale status updates.
+  const request = ++termsRequestGeneration;
   terms = undefined;
   updateControls();
-  const next = await game.getTerms();
-  terms = next;
-  if (termsText !== null) termsText.textContent = `${next.title}: one play costs ${next.credits} credits. Confirm below to spend.`;
+  try {
+    const next = await game.getTerms();
+    if (request !== termsRequestGeneration) return false;
+    terms = next;
+    if (termsText !== null) termsText.textContent = `${next.title}: one play costs ${next.credits} credits. Confirm below to spend.`;
+    return true;
+  } catch (error) {
+    if (request !== termsRequestGeneration) return false;
+    throw error;
+  } finally {
+    if (request === termsRequestGeneration) updateControls();
+  }
 };
 
 const setConnection = (authorization: GameAuthorization): void => {
@@ -75,6 +89,7 @@ const setConnection = (authorization: GameAuthorization): void => {
 };
 
 const clearConnection = (): void => {
+  operationGeneration += 1;
   connectedUntil = 0;
   if (connectGame !== null) connectGame.textContent = 'Connect game / renew connection';
 };
@@ -83,16 +98,24 @@ const restoreGameConnection = async (): Promise<void> => {
   if (game === undefined) return;
   const authorization = game.getAuthorization();
   if (authorization === undefined) return;
+  const operation = operationGeneration;
   setConnection(authorization);
   try {
-    await loadTerms();
-    render({ status: 'Game connection restored. Review the terms; connecting does not spend credits.' });
+    if (await loadTerms() && operation === operationGeneration) {
+      render({ status: 'Game connection restored. Review the terms; connecting does not spend credits.' });
+    }
   } catch {
-    render({ status: 'Game connection restored.', error: 'Could not refresh terms. Try again before confirming a play.' });
+    if (operation === operationGeneration) {
+      render({ status: 'Game connection restored.', error: 'Could not refresh terms. Try again before confirming a play.' });
+    }
   }
   updateControls();
 };
 const handlePaidError = async (error: unknown, issuingConsent = false): Promise<void> => {
+  if (error instanceof ConnectSessionRequiredError) {
+    render({ error: 'Sign in to SuperRare first, then click Connect game. No play was started.' });
+    return;
+  }
   if (error instanceof GameConnectionError) {
     clearConnection();
     render({ error: error.code, action: 'Connection stopped. Click Connect game explicitly; no play was started by connecting.' });
@@ -124,11 +147,13 @@ const handlePaidError = async (error: unknown, issuingConsent = false): Promise<
 
 // Hosted windows must be opened directly from a click. Paid consent/start never open one.
 document.querySelector('#login')?.addEventListener('click', () => {
+  operationGeneration += 1;
   void superrare.auth.login()
     .then((result) => render({ status: result.status }))
     .catch(() => render({ error: 'Login failed.' }));
 });
 document.querySelector('#buy')?.addEventListener('click', () => {
+  operationGeneration += 1;
   void superrare.actions.buy({
     target: {
       kind: 'erc721-direct-listing', chainId: 11155111,
@@ -139,6 +164,7 @@ document.querySelector('#buy')?.addEventListener('click', () => {
 });
 document.querySelector('#start-free-game')?.addEventListener('click', () => {
   if (appId === null) return render({ error: 'Add ?appId=<Studio product UUID> to the URL.' });
+  operationGeneration += 1;
   void superrare.games.forGame({ appId }).start({ idempotencyKey: crypto.randomUUID() })
     .then((started) => render({ sessionId: started.session.id }))
     .catch(() => render({ error: 'Free start failed.' }));
@@ -146,13 +172,15 @@ document.querySelector('#start-free-game')?.addEventListener('click', () => {
 
 connectGame?.addEventListener('click', async () => {
   if (game === undefined || busy) return;
+  operationGeneration += 1;
   busy = true;
   updateControls();
   try {
     const authorization = await game.connect();
     setConnection(authorization);
-    await loadTerms();
-    render({ status: 'Game connected. Review the terms; connecting does not spend credits.' });
+    if (await loadTerms()) {
+      render({ status: 'Game connected. Review the terms; connecting does not spend credits.' });
+    }
   } catch (error) {
     await handlePaidError(error);
   } finally {
@@ -163,6 +191,7 @@ connectGame?.addEventListener('click', async () => {
 
 playGame?.addEventListener('click', async () => {
   if (game === undefined || terms === undefined || busy || pendingKey !== undefined) return;
+  operationGeneration += 1;
   if (Date.now() >= connectedUntil) {
     render({ error: 'Connection expired. Click Connect game explicitly before confirming a play.' });
     updateControls();
@@ -200,6 +229,7 @@ playGame?.addEventListener('click', async () => {
 
 recoverGame?.addEventListener('click', async () => {
   if (game === undefined || pendingKey === undefined || busy) return;
+  operationGeneration += 1;
   busy = true;
   updateControls();
   try {
