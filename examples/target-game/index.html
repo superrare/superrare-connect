@@ -18,12 +18,22 @@
           <h2>Your credits</h2>
           <section id="credits" aria-label="Credit balance and purchases"></section>
           <div class="connection">
-            <button id="connect" class="secondary" type="button">Connect</button>
-            <p id="connection-status" role="status" aria-live="polite">Connect to load your game access and balance.</p>
+            <button id="sign-in" class="secondary" type="button" disabled>Checking Connect sign-in…</button>
+            <p id="connect-status" role="status" aria-live="polite">Checking the saved SuperRare Connect session…</p>
+            <button id="connect" class="secondary" type="button">Authorize game</button>
+            <p id="connection-status" role="status" aria-live="polite">Studio game authorization is separate from Connect sign-in.</p>
           </div>
           <p class="fine-print">Payments are real USDC on Ethereum. Every purchase needs wallet approval. Each round needs a separate explicit play confirmation.</p>
         </aside>
       </section>
+      <dialog id="hosted-connect-dialog" aria-labelledby="hosted-connect-title">
+        <div class="hosted-connect-header">
+          <h2 id="hosted-connect-title">SuperRare Connect</h2>
+          <button id="close-hosted-connect" class="secondary" type="button">Close</button>
+        </div>
+        <p id="hosted-connect-status" role="status" aria-live="polite">Hosted Connect flows are displayed here.</p>
+        <div id="hosted-connect-frame" class="hosted-connect-frame"></div>
+      </dialog>
       <details class="developer"><summary>Integration details</summary><p id="configuration"></p><p>Scores are client-asserted and are not server-verified. This example demonstrates payment and paid-session integration only.</p></details>
     </main>
     <script src="../../dist/superrare-connect.global.js"></script>

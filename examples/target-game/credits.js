@@ -1,3 +1,4 @@
+import { describeSdkFailure } from './hosted-flow.js';
 const MAINNET_USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 const STORAGE_VERSION = 'v1';
 
@@ -18,11 +19,11 @@ function errorMessage(error) {
 }
 
 export class Credits {
-  constructor({ client, game, root, onStatus, connectUrl, storageKey, usdcAddress, changed }) {
+  constructor({ client, game, root, display, connectUrl, storageKey, usdcAddress, changed }) {
     this.client = client;
     this.game = game;
     this.root = root;
-    this.onStatus = onStatus ?? (() => {});
+    this.display = display;
     this.connectUrl = connectUrl;
     this.storageKey = storageKey ?? 'superrare-target-game';
     this.usdcAddress = (usdcAddress ?? MAINNET_USDC).toLowerCase();
@@ -99,7 +100,9 @@ export class Credits {
 
   _showDetails() {
     if (!this.record) {
-      text(this.detailsText, 'No purchase is in progress.');
+      text(this.detailsText, this.accountAddress
+        ? 'No purchase is in progress for this game account.'
+        : 'Saved purchases remain isolated per game account. Reauthorize the same account to resume or reconcile them; this page does not clear saved purchase state.');
       return;
     }
     const purchase = this.record.purchase;
@@ -113,7 +116,6 @@ export class Credits {
 
   _say(message) {
     text(this.statusLabel, message);
-    this.onStatus(message);
   }
 
   _renderActions() {
@@ -183,19 +185,50 @@ export class Credits {
     this._renderActions();
     try {
       const balance = await this.game.credits.getBalance();
-      if (this._authorization()?.address !== authorization.address) return;
+      const currentAuthorization = this._authorization();
+      if (currentAuthorization?.address !== authorization.address) {
+        this.balance = undefined;
+        text(this.balanceLabel, currentAuthorization
+          ? 'Credits: loading current game account…'
+          : 'Credits: connect your game account to load balance.');
+        this.accountAddress = currentAuthorization?.address;
+        this.record = currentAuthorization ? this._loadRecord(currentAuthorization.address) : undefined;
+        this._say(currentAuthorization
+          ? 'Game account changed while loading. Showing only the newly authorized account; saved purchases remain isolated per account.'
+          : 'Game authorization expired while loading. Saved purchase records remain preserved per account; authorize the game again to resume.');
+        this._showDetails();
+        this._renderActions();
+        this.changed();
+        if (currentAuthorization) void this.refresh();
+        return;
+      }
       this.balance = balance;
       text(this.balanceLabel, `Credits: ${balance.available} available`);
       if (this.record) {
-        await this._reconcilePurchase();
-        if (this.record?.transactionHash && !this.record.credited) {
+        if (this.record.transactionHash && !this.record.credited && !this.record.intentId) {
           await this._claim(this.record.transactionHash);
         }
       }
       this._renderActions();
     } catch (error) {
-      text(this.balanceLabel, 'Credits: balance could not be loaded.');
-      this._say(`Could not load credit balance: ${errorMessage(error)} Connect again or retry.`);
+      const currentAuthorization = this._authorization();
+      this.balance = undefined;
+      text(this.balanceLabel, currentAuthorization
+        ? 'Credits: balance could not be loaded.'
+        : 'Credits: connect your game account to load balance.');
+      if (currentAuthorization?.address !== authorization.address) {
+        this.accountAddress = currentAuthorization?.address;
+        this.record = currentAuthorization ? this._loadRecord(currentAuthorization.address) : undefined;
+        this._say(currentAuthorization
+          ? 'Game account changed while loading. Showing only the newly authorized account; saved purchases remain isolated per account.'
+          : `Could not load credit balance (${describeSdkFailure(error)}); game authorization is no longer available. Saved purchase records remain preserved per account.`);
+        this._showDetails();
+        this._renderActions();
+        this.changed();
+        if (currentAuthorization) void this.refresh();
+        return;
+      }
+      this._say(`Could not load credit balance (${describeSdkFailure(error)}). The current authorization is preserved; retry the balance request.`);
     }
   }
 
@@ -261,13 +294,16 @@ export class Credits {
     this.busy = true;
     this._renderActions();
     try {
-      // Persist the quote and the transfer-in-progress marker before creating the financial action.
+      // Keep the exact quote and an ambiguous-outcome marker durable before the SDK opens hosted checkout.
       const pending = { ...record, confirmPayment: false, outcomeUnknown: true };
       this._saveRecord(pending);
-      this._say('A wallet confirmation will open. Approve the USDC transfer only if the wallet details match this quote.');
+      this._say(`Opening hosted wallet checkout in the ${this.display === 'embed' ? 'embedded dialog' : 'popup window'}. No transfer is submitted until the hosted wallet asks for explicit approval.`);
       const intent = await this.client.actions.transfer({
-        target: { kind: 'wallet', chainId: quote.chainId, address: quote.treasuryAddress },
-        transfer: { currency: 'USDC', amount: quote.packPriceAtomic },
+        chainId: quote.chainId,
+        to: quote.treasuryAddress,
+        currency: 'USDC',
+        amount: quote.packPriceAtomic,
+        beforeOpen: () => this._saveRecord(pending),
       });
       const withIntent = { ...pending, intentId: intent.intentId, outcomeUnknown: false };
       this._saveRecord(withIntent);
@@ -291,20 +327,26 @@ export class Credits {
     this._renderActions();
     try {
       await this._reconcilePurchase();
-      if (this.record?.transactionHash) {
-        await this._claim(this.record.transactionHash);
-      } else if (this.record?.intentId) {
+      if (this.record?.intentId) {
         const intent = await this.client.actions.getStatus({ intentId: this.record.intentId });
         const hash = intent.result?.transactionHash ?? intent.result?.approvalTxHash;
-        if (hash) {
-          this._saveRecord({ ...this.record, transactionHash: hash, outcomeUnknown: false });
+        this._saveRecord({
+          ...this.record,
+          ...(hash ? { transactionHash: hash } : {}),
+          intentStatus: intent.status,
+          outcomeUnknown: false,
+        });
+        if (intent.status === 'completed' && hash) {
           await this._claim(hash);
         } else if (['failed', 'cancelled', 'expired'].includes(intent.status)) {
-          this._saveRecord({ ...this.record, intentStatus: intent.status, outcomeUnknown: false });
-          this._say(`Payment ${intent.status}; no transaction hash was reported. Check the wallet before creating a new quote.`);
+          this._say(`Payment ${intent.status}; no completed transfer was confirmed. Check the wallet and retain this purchase before requesting anything new.`);
+        } else if (intent.status === 'completed') {
+          this._say('Connect completed the action but returned no transaction hash. The purchase remains saved; do not start another transfer.');
         } else {
           this._say(`Payment is ${intent.status}. Keep this purchase and continue later; do not request another transfer.`);
         }
+      } else if (this.record?.transactionHash) {
+        await this._claim(this.record.transactionHash);
       } else {
         this._say('The payment outcome is unknown and no intent ID was saved. Do not create another transfer. Enter the transaction hash if your wallet completed the payment.');
       }
@@ -353,13 +395,40 @@ export class Credits {
 
   async _claimOnce(transactionHash) {
     const record = this.record;
-    if (!record) return;
-    const sameHash = record.transactionHash || transactionHash;
-    this._saveRecord({ ...record, transactionHash: sameHash, outcomeUnknown: false });
+    let claimHash = record.transactionHash || transactionHash;
+    let intentStatus = record.intentStatus;
     try {
-      const result = await this.game.credits.claimPurchase({ purchaseId: record.purchase.id, transactionHash: sameHash });
+      if (record.intentId) {
+        const intent = await this.client.actions.getStatus({ intentId: record.intentId });
+        const completedHash = intent.result?.transactionHash ?? intent.result?.approvalTxHash;
+        if (intent.status !== 'completed') {
+          this._saveRecord({
+            ...record,
+            transactionHash: claimHash,
+            intentStatus: intent.status,
+          });
+          this._say(`Transaction hash saved. The hosted transfer is ${intent.status}, not completed; continue this purchase to reconcile its status before claiming credits.`);
+          return;
+        }
+        if (!completedHash || !/^0x[0-9a-fA-F]{64}$/.test(completedHash)) {
+          throw new Error('Connect reported completion without a valid transaction hash.');
+        }
+        if (record.transactionHash
+          && record.transactionHash.toLowerCase() !== completedHash.toLowerCase()) {
+          throw new Error('Connect reported a different transaction hash; the saved purchase hash was not replaced.');
+        }
+        claimHash = completedHash;
+        intentStatus = intent.status;
+      }
+      this._saveRecord({
+        ...record,
+        transactionHash: claimHash,
+        ...(intentStatus ? { intentStatus } : {}),
+        outcomeUnknown: false,
+      });
+      const result = await this.game.credits.claimPurchase({ purchaseId: record.purchase.id, transactionHash: claimHash });
       const latest = this._loadRecord(this.accountAddress) ?? this.record;
-      this._saveRecord({ ...latest, purchase: result.purchase, credited: Boolean(result.purchase.creditedAt), transactionHash: sameHash });
+      this._saveRecord({ ...latest, purchase: result.purchase, credited: Boolean(result.purchase.creditedAt), transactionHash: claimHash });
       this.balance = result.balance;
       text(this.balanceLabel, `Credits: ${result.balance.available} available`);
       this._say(result.purchase.creditedAt ? 'Credits received. You can continue playing.' : 'Transaction recorded; credit confirmation is pending. Continue purchase later to check again.');
@@ -375,18 +444,27 @@ export class Credits {
     if (!record?.intentId || intent?.intentId !== record.intentId
       || this._authorization()?.address !== this.accountAddress) return;
     const transactionHash = intent.result?.transactionHash ?? intent.result?.approvalTxHash;
-    if (transactionHash && /^0x[0-9a-fA-F]{64}$/.test(transactionHash)) {
-      const saved = { ...record, transactionHash, outcomeUnknown: false, intentStatus: intent.status };
-      this._saveRecord(saved);
-      void this._claim(transactionHash);
-    } else {
-      const definitivelyFailed = ['failed', 'cancelled', 'expired'].includes(intent.status);
-      this._saveRecord({ ...record, intentStatus: intent.status, outcomeUnknown: definitivelyFailed ? false : record.outcomeUnknown });
-      this._say(definitivelyFailed
-        ? `Payment ${intent.status}; no transaction hash was reported. Check your wallet before requesting a new quote.`
-        : `Payment status is ${intent.status}. Continue purchase to verify or enter its transaction hash.`);
-      this._renderActions();
+    const validHash = transactionHash && /^0x[0-9a-fA-F]{64}$/.test(transactionHash)
+      ? transactionHash
+      : undefined;
+    const definitivelyFailed = ['failed', 'cancelled', 'expired'].includes(intent.status);
+    const saved = {
+      ...record,
+      ...(validHash ? { transactionHash: validHash } : {}),
+      intentStatus: intent.status,
+      outcomeUnknown: definitivelyFailed ? false : record.outcomeUnknown,
+    };
+    this._saveRecord(saved);
+    if (intent.status === 'completed' && validHash) {
+      void this._claim(validHash);
+      return;
     }
+    this._say(definitivelyFailed
+      ? `Payment ${intent.status}; no completed transfer was confirmed. Check your wallet and keep this purchase before requesting anything new.`
+      : intent.status === 'completed'
+        ? 'Connect completed the action but returned no valid transaction hash. The purchase remains saved; do not start another transfer.'
+        : `Payment status is ${intent.status}. Continue this same purchase later; do not request another transfer.`);
+    this._renderActions();
   }
 
   async _enterTransaction() {
