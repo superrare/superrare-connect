@@ -81,13 +81,13 @@ describe('target game authorization result handling', () => {
     const detail = describeSdkFailure({
       code: 'authorization_required',
       status: 403,
-      path: '/api/v1/game/authorize',
+      path: '/api/v1/credit-groups/group/apps/app/authorizations',
       message: 'authorizationToken=secret-value',
     });
 
     expect(detail).toContain('authorization_required');
     expect(detail).toContain('HTTP 403');
-    expect(detail).toContain('/api/v1/game/authorize');
+    expect(detail).toContain('/api/v1/credit-groups/group/apps/app/authorizations');
     expect(detail).not.toContain('secret-value');
   });
 });
