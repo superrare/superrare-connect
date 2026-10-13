@@ -7,6 +7,8 @@ export {
   createSuperRareClient,
   type SuperRareConnectActionsNamespace,
   type ConnectAuthLoginParams,
+  type ConnectEmbedOptions,
+  type ConnectEmbedWindow,
   type ConnectPopupMessageEvent,
   type ConnectPopupMessageEvents,
   type ConnectPopupVisibilityEvents,
@@ -23,6 +25,7 @@ export {
   type SuperRareConnectOffersNamespace,
   type SuperRareConnectUserNamespace,
 } from './client.js';
+export { ConnectEmbedUnavailableError } from './embed-core.js';
 export {
   type ClientAssertedScoreResult,
   type GameCreditBalance,
