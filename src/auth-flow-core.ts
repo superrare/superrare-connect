@@ -75,20 +75,6 @@ export type ConnectCancelOfferTerms = {
   currency: string;
 };
 
-export type ConnectTransferCurrency = 'ETH' | 'USDC';
-
-export type ConnectTransferTerms = {
-  currency: ConnectTransferCurrency;
-  /** Positive integer amount in the currency's smallest units. */
-  amount: string;
-};
-
-export type ConnectWalletTarget = {
-  kind: 'wallet';
-  chainId: ConnectChainId;
-  address: ConnectEthereumAddress;
-};
-
 export type ConnectErc721DirectListingTarget = {
   kind: 'erc721-direct-listing';
   chainId: ConnectChainId;
@@ -227,6 +213,21 @@ export type ConnectLiquidEditionReceiveTerms = {
   currency: ConnectLiquidEditionCurrency;
 };
 
+export type ConnectTransferChainId = 1 | 8453 | 11155111 | 84532;
+
+export type ConnectTransferCurrency = 'ETH' | 'USDC';
+
+export type ConnectWalletTarget = {
+  kind: 'wallet';
+  chainId: ConnectTransferChainId;
+  address: ConnectEthereumAddress;
+};
+
+export type ConnectTransferTerms = {
+  currency: ConnectTransferCurrency;
+  amount: string;
+};
+
 export type ConnectBuyTarget =
   | ConnectErc721DirectListingTarget
   | ConnectErc721BatchListingTarget
@@ -320,13 +321,13 @@ export type ConnectActionInput =
     target: ConnectErc721BatchOfferTarget;
   }
   | {
+    type: 'checkout';
+    target: ConnectErc1155CheckoutTarget;
+  }
+  | {
     type: 'transfer';
     target: ConnectWalletTarget;
     transfer: ConnectTransferTerms;
-  }
-  | {
-    type: 'checkout';
-    target: ConnectErc1155CheckoutTarget;
   };
 
 export type BuildConnectLoginIntentRequestInput = {

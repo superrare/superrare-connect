@@ -53,6 +53,7 @@ export type ConnectResolvedActionSnapshot = {
     amount?: string;
     available: boolean;
     buyer?: string;
+    chainId?: number;
     currency?: string;
     estimatedAmountOut?: string;
     expiry?: string;
@@ -64,8 +65,8 @@ export type ConnectResolvedActionSnapshot = {
     price?: string;
     quantity?: string;
     quantityAvailable?: string;
-    seller?: string;
     recipient?: string;
+    seller?: string;
     unitPrice?: string;
   };
 };
