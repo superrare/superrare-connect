@@ -93,6 +93,7 @@ import {
   gameIdempotencyKeySchema,
   gameConsentRequestSchema,
   gamePendingAttemptSchema,
+  gameAuthorizationSchema,
   gameTermsResponseSchema,
   inlineConsentResponseSchema,
   GameConnectionError,
@@ -244,6 +245,8 @@ export type SuperRareGameClient = {
   start: (params?: SuperRareGameStartParams) => Promise<GameSessionStart>;
   /** Explicit connection or renewal only; never authorizes a play. */
   connect: () => Promise<GameAuthorization>;
+  /** Reads valid game-scoped authorization without opening or renewing a popup. */
+  getAuthorization: () => GameAuthorization | undefined;
   getTerms: () => Promise<GameCreditTerms>;
   /** Call only after the game displays and receives one-play confirmation. */
   requestConsent: (params: SuperRareGameStartParams & {
@@ -1055,7 +1058,11 @@ export function createSuperRareClient(
     return await inFlightPopupLogin;
   };
 
-  const gameAuthorizations = new Map<string, { authorization: GameAuthorization; generation: number }>();
+  const gameAuthorizations = new Map<string, {
+    authorization: GameAuthorization;
+    persistence: 'persistent' | 'memory';
+  }>();
+  const rejectedGameAuthorizations = new Set<string>();
   const gameConnections = new Map<string, {
     generation: number;
     promise: Promise<GameAuthorization>;
@@ -1083,6 +1090,8 @@ export function createSuperRareClient(
         return origin;
       };
       const scopeKey = (): string => JSON.stringify([requireStudioUrl(), appId, groupId, options.initiatingOrigin ?? readBrowserOrigin()]);
+      const authorizationStorageKey = (): string =>
+        `superrare.connect.game-authorization:${encodeURIComponent(scopeKey())}`;
       const pendingConsentKey = (idempotencyKey: string): string =>
         `superrare.connect.game-attempt:${encodeURIComponent(scopeKey())}:${idempotencyKey}`;
       const paidPath = (): string => {
@@ -1111,14 +1120,54 @@ export function createSuperRareClient(
           return 'persistent';
         } catch { return 'memory'; }
       };
-      const currentAuthorization = (): GameAuthorization | undefined => {
-        const saved = gameAuthorizations.get(scopeKey());
-        if (saved === undefined) return undefined;
-        if (saved.generation !== sessionLifecycle.getReplacementGeneration() || Date.parse(saved.authorization.expiresAt) <= Date.now()) {
-          gameAuthorizations.delete(scopeKey());
-          return undefined;
+      const rejectedAuthorizationKey = (authorization: GameAuthorization): string =>
+        `${authorizationStorageKey()}:rejected:${encodeURIComponent(authorization.authorizationToken)}`;
+      const clearAuthorization = (authorization: GameAuthorization): void => {
+        const key = scopeKey();
+        if (gameAuthorizations.get(key)?.authorization.authorizationToken === authorization.authorizationToken) {
+          gameAuthorizations.delete(key);
         }
-        return saved.authorization;
+        // A token-scoped rejection cannot remove a concurrent renewal. Storage
+        // has no atomic compare-and-delete operation across browser tabs.
+        const rejectedKey = rejectedAuthorizationKey(authorization);
+        rejectedGameAuthorizations.add(rejectedKey);
+        try { storage?.setItem(rejectedKey, 'rejected'); } catch { /* This client still rejects the token in memory. */ }
+      };
+      const currentAuthorization = (): GameAuthorization | undefined => {
+        const key = scopeKey();
+        const cached = gameAuthorizations.get(key);
+        const validCached = cached !== undefined && Date.parse(cached.authorization.expiresAt) > Date.now()
+          ? cached : undefined;
+        gameAuthorizations.delete(key);
+        let authorization = validCached?.persistence === 'memory' ? validCached.authorization : undefined;
+        let persistence: 'persistent' | 'memory' = validCached?.persistence ?? 'persistent';
+        if (authorization === undefined) {
+          let serialized: string | null | undefined;
+          try { serialized = storage?.getItem(authorizationStorageKey()); } catch {
+            // Previously validated credentials remain usable if storage becomes unavailable.
+            authorization = validCached?.authorization;
+          }
+          if (serialized !== null && serialized !== undefined) {
+            let value: unknown;
+            try { value = JSON.parse(serialized); } catch { return undefined; }
+            const parsed = gameAuthorizationSchema.safeParse(value);
+            if (!parsed.success
+              || parsed.data.appId !== appId
+              || parsed.data.groupId !== groupId
+              || parsed.data.appOrigin !== requireAppOrigin()
+              || Date.parse(parsed.data.expiresAt) <= Date.now()) return undefined;
+            authorization = parsed.data;
+            persistence = 'persistent';
+          }
+        }
+        if (authorization === undefined) return undefined;
+        const rejectedKey = rejectedAuthorizationKey(authorization);
+        if (rejectedGameAuthorizations.has(rejectedKey)) return undefined;
+        try {
+          if (storage?.getItem(rejectedKey) === 'rejected') return undefined;
+        } catch { /* Rejection checks fall back to this client's memory. */ }
+        gameAuthorizations.set(key, { authorization, persistence });
+        return authorization;
       };
       const validatePaidStart = (
         params: SuperRareGameStartParams & { idempotencyKey: string },
@@ -1211,8 +1260,16 @@ export function createSuperRareClient(
               finish(() => reject(new GameConnectionError('authorization_required')));
               return;
             }
-            gameAuthorizations.set(connectionKey, { authorization: { ...parsed.authorization }, generation });
-            finish(() => resolve(parsed.authorization));
+            const authorized = parsed.authorization;
+            let persistence: 'persistent' | 'memory' = 'memory';
+            try {
+              if (storage !== undefined) {
+                storage.setItem(authorizationStorageKey(), JSON.stringify(authorized));
+                persistence = 'persistent';
+              }
+            } catch { /* Connection remains usable in memory. */ }
+            gameAuthorizations.set(connectionKey, { authorization: { ...authorized }, persistence });
+            finish(() => resolve({ ...authorized }));
           });
           if (settled) {
             try { unsubscribe(); } catch { /* Synchronous emitters may settle during subscription. */ }
@@ -1267,7 +1324,9 @@ export function createSuperRareClient(
             body: { idempotencyKey: confirmed.idempotencyKey, fingerprint: confirmed.fingerprint, expectedCredits: confirmed.expectedCredits },
           });
         } catch (error) {
-          if (error instanceof SuperRareConnectApiError && error.status === 401) gameAuthorizations.delete(scopeKey());
+          if (error instanceof SuperRareConnectApiError && error.status === 401) {
+            clearAuthorization(authorization);
+          }
           throw error;
         }
         const parsed = inlineConsentResponseSchema.parse(value).consent;
@@ -1281,12 +1340,30 @@ export function createSuperRareClient(
         const recovery = saveAttempt({ request: confirmed, consent });
         return { consent: { ...consent }, recovery };
       };
-      const connectAuthorization = async (): Promise<string> => {
-        const session = await sessionLifecycle.getCurrentSession();
-        if (session === undefined) throw new ConnectSessionRequiredError();
-        return `ConnectSession ${session.sessionId}`;
+      const requestCreditJson = async (input: {
+        path: string; method?: 'GET' | 'POST'; body?: unknown;
+      }): Promise<unknown> => {
+        const path = `${paidPath()}${input.path}`;
+        const authorization = currentAuthorization();
+        if (authorization === undefined) throw new GameConnectionError('authorization_required');
+        if (authorization.appOrigin !== requireAppOrigin()) throw new GameConnectionError('invalid_origin');
+        try {
+          return await requestStudioJson({
+            ...input, studioUrl: requireStudioUrl(), fetch: options.fetch, path,
+            authorization: `GameAuthorization ${authorization.authorizationToken}`,
+          });
+        } catch (error) {
+          if (error instanceof SuperRareConnectApiError && error.status === 401) {
+            clearAuthorization(authorization);
+          }
+          throw error;
+        }
       };
       return {
+        getAuthorization: () => {
+          const authorization = currentAuthorization();
+          return authorization === undefined ? undefined : { ...authorization };
+        },
         async start(params = {}): Promise<GameSessionStart> {
           if (groupId !== undefined) throw new Error('Credit-gated games require inline consent and startWithConsent.');
           if (params.idempotencyKey !== undefined && !gameIdempotencyKeySchema.safeParse(params.idempotencyKey).success) {
@@ -1362,25 +1439,21 @@ export function createSuperRareClient(
         },
         credits: {
           async getBalance(): Promise<GameCreditBalance> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            return parseCreditBalance(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/me`, authorization: await connectAuthorization(), }));
+            return parseCreditBalance(await requestCreditJson({ path: '/me' }));
           },
           async createPurchase(): Promise<GameCreditPurchase> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            return parsePurchase(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/purchases`, method: 'POST', authorization: await connectAuthorization(), }));
+            return parsePurchase(await requestCreditJson({ path: '/purchases', method: 'POST' }));
           },
           async getPurchase(purchaseId): Promise<GameCreditPurchase> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            return parsePurchase(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/purchases/${encodeURIComponent(purchaseId)}`, authorization: await connectAuthorization(), }));
+            return parsePurchase(await requestCreditJson({
+              path: `/purchases/${encodeURIComponent(purchaseId)}`,
+            }));
           },
           async claimPurchase(params): Promise<{ purchase: GameCreditPurchase; balance: GameCreditBalance }> {
-            if (groupPath === undefined) throw new Error('Credit operations require groupId.');
-            const value = await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-              path: `${groupPath}/purchases/${encodeURIComponent(params.purchaseId)}/claim`, method: 'POST',
-              authorization: await connectAuthorization(), body: { transactionHash: params.transactionHash }, });
+            const value = await requestCreditJson({
+              path: `/purchases/${encodeURIComponent(params.purchaseId)}/claim`, method: 'POST',
+              body: { transactionHash: params.transactionHash },
+            });
             return { purchase: parsePurchase(value), balance: parseCreditBalance(value) };
           },
         },
