@@ -9,6 +9,7 @@ const groupId = '40000000-0000-0000-0000-000000000001';
 const appOrigin = 'https://game.test';
 const studioUrl = 'https://studio.test';
 const appPath = `${studioUrl}/api/v1/credit-groups/${groupId}/apps/${appId}`;
+const issuedAt = '2026-01-01T00:00:00.000Z';
 const authorization = {
   appId, groupId, appOrigin, authorizationToken: 'scoped-authorization',
   expiresAt: '2026-01-01T00:10:00.000Z', address: '0xabc',
@@ -88,7 +89,7 @@ function harness(options: {
   const open = vi.fn((url: string) => { urls.push(url); return null; });
   let nextAuthorization: unknown = authorization;
   const authorizationFetch = vi.fn(options.authorizationFetch ?? (async () =>
-    Response.json({ version: '1', authorization: nextAuthorization }, { status: 201 })));
+    Response.json({ version: '1', issuedAt, authorization: nextAuthorization }, { status: 201 })));
   const fetchImplementation = vi.fn(options.fetch ?? (async () => sessionResponse(true)));
   const client = createSuperRareClient({
     studioUrl, initiatingOrigin: appOrigin, sessionStorage: storage, sessionStorageKey: sessionKey,
@@ -159,7 +160,7 @@ describe('game connection', () => {
         if (request.headers.get('authorization') !== 'ConnectSession fixture-renewed-access') {
           return Response.json({ error: { code: 'CONNECT_UNAUTHORIZED', message: 'Current access required.' } }, { status: 401 });
         }
-        return Response.json({ version: '1', authorization }, { status: 201 });
+        return Response.json({ version: '1', issuedAt, authorization }, { status: 201 });
       },
     });
     h.credentials.setItem('fixture-connect-session', JSON.stringify({
@@ -193,10 +194,36 @@ describe('game connection', () => {
   });
 
   it.each([undefined, 1, '2'])('rejects unsupported response versions: %j', async (version) => {
-    const h = harness({ authorizationFetch: async () => Response.json({ version, authorization }) });
+    const h = harness({ authorizationFetch: async () => Response.json({ version, issuedAt, authorization }) });
     await connectionError(h.game.connect(), 'invalid_authorization');
     expect(h.game.getAuthorization()).toBeUndefined();
   });
+
+  it.each([88, 30_000, -30_000])('accepts a server-bounded authorization with browser clock skew of %sms', async (skew) => {
+    vi.setSystemTime(Date.parse(issuedAt) - skew);
+    const h = harness();
+    h.setAuthorization({ expiresAt: '2026-01-01T00:15:00.000Z' });
+    await expect(h.game.connect()).resolves.toMatchObject({ expiresAt: '2026-01-01T00:15:00.000Z' });
+    expect(h.game.getAuthorization()?.expiresAt).toBe('2026-01-01T00:15:00.000Z');
+  });
+
+  it('rejects a lifetime exceeding the server cap even when a fast browser clock would allow it', async () => {
+    vi.setSystemTime(Date.parse(issuedAt) + 30_000);
+    const h = harness();
+    h.setAuthorization({ expiresAt: '2026-01-01T00:15:00.001Z' });
+    await connectionError(h.game.connect(), 'invalid_authorization');
+    expect(h.game.getAuthorization()).toBeUndefined();
+  });
+
+  it.each([undefined, '', 'not-a-date', '2026-01-01T00:10:00.000Z', '2026-01-01T00:10:00.001Z'])(
+    'rejects missing, malformed, or nonpositive server issuance intervals: %j', async (responseIssuedAt) => {
+      const h = harness({ authorizationFetch: async () => Response.json({
+        version: '1', issuedAt: responseIssuedAt, authorization,
+      }) });
+      await connectionError(h.game.connect(), 'invalid_authorization');
+      expect(h.game.getAuthorization()).toBeUndefined();
+    },
+  );
 
   it('rejects already-expired authorization and authorization beyond Connect access expiry', async () => {
     const h = harness();
@@ -235,7 +262,7 @@ describe('game connection', () => {
     await Promise.all([firstFailure, secondFailure]);
     const renewed = h.game.connect();
     await vi.advanceTimersByTimeAsync(0);
-    resolveResponse(Response.json({ version: '1', authorization }));
+    resolveResponse(Response.json({ version: '1', issuedAt, authorization }));
     await expect(renewed).resolves.toEqual(authorization);
   });
 
@@ -369,7 +396,7 @@ describe('game connection', () => {
     await vi.advanceTimersByTimeAsync(0);
     if (replacement === 'clearSession') h.client.auth.clearSession();
     else await h.client.auth.logout();
-    resolveResponse(Response.json({ version: '1', authorization }));
+    resolveResponse(Response.json({ version: '1', issuedAt, authorization }));
     await connectionError(pending, 'authorization_required');
     expect(h.game.getAuthorization()).toBeUndefined();
     await expect(h.game.connect()).rejects.toBeInstanceOf(ConnectSessionRequiredError);

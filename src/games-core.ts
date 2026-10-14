@@ -50,6 +50,7 @@ export function normalizeStudioUrl(studioUrl: string): string {
 
 const gameAuthorizationResponseSchema = z.object({
   version: z.literal('1'),
+  issuedAt: z.iso.datetime({ offset: true }),
   authorization: gameAuthorizationSchema,
 });
 
@@ -62,11 +63,13 @@ export function validateGameAuthorizationResponse(input: {
   if (!parsed.success) return { ok: false, error: 'invalid_authorization' };
   const authorization = parsed.data.authorization;
   const expiresAt = Date.parse(authorization.expiresAt);
+  const issuedAt = Date.parse(parsed.data.issuedAt);
   if (expiresAt <= input.now) return { ok: false, error: 'expired' };
   if (authorization.appId !== input.appId || authorization.groupId !== input.groupId
     || authorization.appOrigin !== input.appOrigin
     || authorization.address.toLowerCase() !== input.address.toLowerCase()
-    || expiresAt > Math.min(Date.parse(input.sessionExpiresAt), input.now + 15 * 60_000)) {
+    || expiresAt <= issuedAt
+    || expiresAt > Math.min(Date.parse(input.sessionExpiresAt), issuedAt + 15 * 60_000)) {
     return { ok: false, error: 'invalid_authorization' };
   }
   return { ok: true, authorization };

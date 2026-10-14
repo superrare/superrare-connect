@@ -56,7 +56,7 @@ function harness(input: { onNavigate?: () => void; onSubscribe?: () => void; int
       }
       if (path === '/v1/connect/users/me') return Response.json({ error: 'Profile unavailable.' }, { status: 503 });
       if (path === '/v1/connect/auth/claim') return Response.json({ error: 'Not completed.' }, { status: 409 });
-      if (path.endsWith('/authorizations')) return Response.json({ version: '1', authorization: {
+      if (path.endsWith('/authorizations')) return Response.json({ version: '1', issuedAt: new Date(Date.now()).toISOString(), authorization: {
         appId: '20000000-0000-0000-0000-000000000001', groupId: '40000000-0000-0000-0000-000000000001',
         appOrigin: 'https://game.test', authorizationToken: 'game-only-token',
         expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(), address: '0xabc',
