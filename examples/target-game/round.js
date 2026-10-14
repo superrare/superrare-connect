@@ -15,12 +15,38 @@ function newKey() {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+async function unusedReplacementKey(previousKey, credits) {
+  const input = new TextEncoder().encode(`target-game-unused-renewal:v1:${previousKey}:${credits}`);
+  const bytes = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', input));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
 function isKnownUnusedConsent(error) {
   return error?.code === 'CREDIT_GROUP_CONSENT_EXPIRED';
+}
+
+function recoveryMessage(error) {
+  const code = error?.code;
+  if (error?.name === 'ConnectSessionRequiredError' || code === 'CONNECT_UNAUTHORIZED') {
+    return 'Sign in to SuperRare, then continue. Your play is saved.';
+  }
+  if (code === 'authorization_required' || error?.status === 401) {
+    return 'Your game connection needs renewing. Continue will reconnect and retry your saved play.';
+  }
+  if (code === 'CREDIT_GROUP_INSUFFICIENT_CREDITS') {
+    return 'Buy credits, then continue your saved play.';
+  }
+  if (code === 'CREDIT_GROUP_NEW_USES_PAUSED' || code === 'CREDIT_GROUP_NOT_ACTIVE') {
+    return 'This game is temporarily paused. Your saved play is kept.';
+  }
+  if (code === 'CREDIT_GROUP_APP_NOT_APPROVED' || code === 'FORBIDDEN') {
+    return 'This game is not currently approved to start a play. Your saved play is kept.';
+  }
+  return 'Could not start the game. Continue safely retries your saved play.';
 }
 
 export class PaidRound {
@@ -130,6 +156,13 @@ export class PaidRound {
       this.announce(errorMessage(error));
       return;
     }
+    if (this.state?.phase === 'terminal' && this.state.unused === true) {
+      this.scoreNode.textContent = 'Score: 0';
+      this.arenaMessage.textContent = 'Start a round to play.';
+      this.announce(`Continue starts your ${this.state.request.expectedCredits}-credit play.`);
+      this.button('Continue', () => void this.recover());
+      return;
+    }
     if (!this.state || this.state.phase === 'terminal' || this.state.phase === 'completed') {
       this.state = this.state?.phase === 'terminal' || this.state?.phase === 'completed' ? this.state : null;
       this.scoreNode.textContent = `Score: ${Number(this.state?.score) || 0}`;
@@ -166,7 +199,7 @@ export class PaidRound {
       this.button('Continue', () => this.resumePlay());
       return;
     }
-    this.announce('A previous paid round needs recovery. Continue retries that same round; it will not create a new charge.');
+    this.announce(`Continue starts or recovers your ${this.state.request.expectedCredits}-credit play.`);
     this.button('Continue', () => void this.recover());
   }
 
@@ -202,10 +235,10 @@ export class PaidRound {
     }
   }
 
-  async confirmRound(terms) {
+  async confirmRound(terms, replacementKey) {
     if (!this.storageKey) return;
     this.clearActions();
-    const key = newKey();
+    const key = replacementKey ?? newKey();
     this.state = {
       version: 1,
       key,
@@ -220,6 +253,8 @@ export class PaidRound {
       },
       terms: { title: terms.title, credits: terms.credits },
     };
+    const accountKey = this.storageKey;
+    const attempt = this.state;
     try {
       this.save();
     } catch (error) {
@@ -230,11 +265,22 @@ export class PaidRound {
     }
     this.announce(`Starting ${terms.title}…`);
     try {
-      const { consent } = await this.game.requestConsent(this.state.request);
-      const session = await this.game.startWithConsent({ ...this.state.request, consent });
+      if (!this.game.getAuthorization()) await this.game.connect();
+      if (this.storageKey !== accountKey || this.state !== attempt) return;
+      if (this.accountStorageKey() !== accountKey) {
+        this.showRecoveryError(new Error('The current wallet does not own this saved play.'),
+          'Switch back to the wallet that owns this saved play, then continue.');
+        return;
+      }
+      const { consent } = await this.game.requestConsent(attempt.request);
+      if (this.storageKey !== accountKey || this.state !== attempt) return;
+      const session = await this.game.startWithConsent({ ...attempt.request, consent });
+      if (this.storageKey !== accountKey || this.state !== attempt) return;
       this.acceptSession(session);
+      this.beginPlay();
     } catch (error) {
-      this.handleAttemptError(error, 'The start result is not known. Continue will recover this same paid play.');
+      if (this.storageKey !== accountKey || this.state !== attempt) return;
+      await this.handleAttemptError(error);
     }
   }
 
@@ -249,9 +295,9 @@ export class PaidRound {
     this.button('Continue', () => this.beginPlay());
   }
 
-  handleAttemptError(error, unknownMessage) {
+  async handleAttemptError(error) {
     if (isKnownUnusedConsent(error)) {
-      const diagnostic = `Studio confirmed the consent expired unused: ${errorMessage(error)}`;
+      const diagnostic = 'Studio confirmed this attempt expired without using credits.';
       const previousPhase = this.state.phase;
       try {
         localStorage.setItem(`${this.storageKey}:diagnostic:${this.state.key}`, JSON.stringify({
@@ -259,38 +305,77 @@ export class PaidRound {
         }));
         this.state.phase = 'terminal';
         this.state.diagnostic = diagnostic;
+        this.state.unused = true;
         this.save();
       } catch (storageError) {
         this.state.phase = previousPhase;
         delete this.state.diagnostic;
-        this.announce(`Studio reports an unused expired consent, but its terminal record could not be saved: ${errorMessage(storageError)} Continue retains the same start key.`);
-        this.clearActions();
-        this.button('Continue', () => void this.recover());
+        delete this.state.unused;
+        this.showRecoveryError(storageError, 'Allow this page to save its round before continuing.');
         return;
       }
-      this.announce(`${diagnostic}. No credits were used. You may explicitly start a new round.`);
-      this.clearActions();
-      this.button('Play', () => void this.prepareRound());
+      await this.restartUnusedRound();
       return;
     }
-    this.announce(`${unknownMessage} ${errorMessage(error)}`);
+    this.showRecoveryError(error);
+  }
+
+  showRecoveryError(error, message = recoveryMessage(error)) {
+    this.announce(message);
     this.clearActions();
     this.button('Continue', () => void this.recover());
+    const details = element('details');
+    details.append(element('summary', 'Error details'), element('p', errorMessage(error)));
+    this.actionNode.append(details);
+  }
+
+  async restartUnusedRound() {
+    const previous = this.state;
+    const accountKey = this.storageKey;
+    this.clearActions();
+    this.announce('Starting your game…');
+    try {
+      const terms = await this.game.getTerms();
+      if (this.storageKey !== accountKey || this.state !== previous) return;
+      if (terms.credits !== previous.request.expectedCredits) {
+        this.announce(`The price changed to ${terms.credits} credits. Confirm the new price to play.`);
+        this.button(`Confirm and play (${terms.credits} credits)`, () => void this.confirmRound(terms));
+        this.button('Cancel', () => void this.refresh());
+        return;
+      }
+      const key = await unusedReplacementKey(previous.key, terms.credits);
+      if (this.storageKey !== accountKey || this.state !== previous) return;
+      await this.confirmRound(terms, key);
+    } catch (error) {
+      if (this.storageKey === accountKey && this.state === previous) this.showRecoveryError(error);
+    }
   }
 
   async recover() {
     if (!this.state || !this.storageKey) return;
+    const accountKey = this.storageKey;
+    const previous = this.state;
     this.clearActions();
-    this.announce('Recovering the same paid play…');
+    this.announce('Starting your game…');
     try {
-      const session = await this.game.recoverStart({ idempotencyKey: this.state.key });
+      if (!this.game.getAuthorization()) await this.game.connect();
+      if (this.storageKey !== accountKey || this.state !== previous) return;
+      if (this.accountStorageKey() !== accountKey) {
+        this.showRecoveryError(new Error('The current wallet does not own this saved play.'),
+          'Switch back to the wallet that owns this saved play, then continue.');
+        return;
+      }
+      const session = await this.game.recoverStart({ idempotencyKey: previous.key });
+      if (this.storageKey !== accountKey || this.state !== previous) return;
       this.acceptSession(session);
+      this.beginPlay();
     } catch (error) {
+      if (this.storageKey !== accountKey || this.state !== previous) return;
       if (error?.status === 410) {
         this.markExpired(errorMessage(error));
         return;
       }
-      this.handleAttemptError(error, 'Recovery did not settle. Continue retries with the same start key.');
+      await this.handleAttemptError(error);
     }
   }
 

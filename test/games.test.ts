@@ -658,16 +658,27 @@ describe('inline paid confirmation', () => {
     }
   });
 
-  it('asks Studio to reject expired unused consent instead of returning a cached credential', async () => {
+  it.each(['expired', 'server-rejected'] as const)('checks saved %s consent with Studio before declaring the original attempt unused', async (mode) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     let issuanceCount = 0;
-    const h = harness({ fetch: async () => {
-      issuanceCount += 1;
-      if (issuanceCount === 1) return consentResponse();
-      return Response.json({ error: { code: 'CREDIT_GROUP_CONSENT_EXPIRED', message: 'Unused consent expired' } }, { status: 409 });
+    const h = harness({ fetch: async (input, init) => {
+      if (new Request(input, init).url.endsWith('/consents')) {
+        issuanceCount += 1;
+        if (issuanceCount === 1) {
+          const { consentId, ...fields } = consent;
+          return Response.json({ version: '1', consent: {
+            ...fields, id: consentId, expiresAt: '2026-01-01T00:02:00.000Z',
+          } });
+        }
+        return Response.json({ error: { code: 'CREDIT_GROUP_CONSENT_EXPIRED', message: 'Unused consent expired' } }, { status: 409 });
+      }
+      return Response.json({ error: { code: 'CREDIT_GROUP_PAID_CONSENT_REQUIRED', message: 'Paid consent required' } }, { status: 401 });
     } });
     await h.connect();
     await h.game.requestConsent(attempt);
-    await expect(h.game.requestConsent(attempt)).rejects.toMatchObject({
+    if (mode === 'expired') vi.setSystemTime(new Date('2026-01-01T00:03:00.000Z'));
+    await expect(h.game.recoverStart({ idempotencyKey: attempt.idempotencyKey })).rejects.toMatchObject({
       status: 409, code: 'CREDIT_GROUP_CONSENT_EXPIRED',
     });
     expect(h.open).not.toHaveBeenCalled();

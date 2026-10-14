@@ -1519,8 +1519,23 @@ export function createSuperRareClient(
           if (Object.keys(suppliedBody).length > 0 && JSON.stringify(suppliedBody) !== JSON.stringify(sessionBody(attempt.request))) {
             throw new GameConnectionError('attempt_mismatch');
           }
-          const consent = attempt.consent ?? (await requestConsent(attempt.request)).consent;
-          return await startWithConsent({ ...attempt.request, consent });
+          const needsConsentCheck = attempt.consent === undefined
+            || (Date.parse(attempt.consent.expiresAt) <= Date.now() && currentAuthorization() !== undefined);
+          const consent = needsConsentCheck
+            ? (await requestConsent(attempt.request)).consent
+            : attempt.consent;
+          if (consent === undefined) throw new Error('No recoverable paid game consent was found.');
+          try {
+            return await startWithConsent({ ...attempt.request, consent });
+          } catch (error) {
+            if (!(error instanceof SuperRareConnectApiError)
+              || error.status !== 401 || error.code !== 'CREDIT_GROUP_PAID_CONSENT_REQUIRED'
+              || currentAuthorization() === undefined) throw error;
+            // Ask Studio about the original attempt; client expiry is not proof
+            // that it was unused. A consumed consent retains its original key.
+            const checked = await requestConsent(attempt.request);
+            return await startWithConsent({ ...attempt.request, consent: checked.consent });
+          }
         },
         async complete(params): Promise<{ completed: true; idempotentReplay: boolean }> {
           const value = await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
