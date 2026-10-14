@@ -83,7 +83,7 @@ async function main(): Promise<void> {
     throw new Error('appOrigin must be the exact HTTPS origin approved for this Studio app.');
   }
   if (configuration.connectUrl === productionConnectUrl && configuration.display !== 'popup') {
-    throw new Error('Production Connect currently denies iframe embedding; select display="popup" explicitly.');
+    throw new Error('This exporter requires display="popup" for production Connect; embedded production mode is not enabled by this example.');
   }
 
   const gitResult = await executeFile('git', ['rev-parse', 'HEAD'], { cwd: repositoryRoot });

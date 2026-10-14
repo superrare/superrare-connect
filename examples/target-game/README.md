@@ -31,7 +31,7 @@ The server prints `http://localhost:5174/examples/target-game/`. Open it with yo
 http://localhost:5174/examples/target-game/?appId=YOUR_STUDIO_APP_UUID&groupId=YOUR_CREDIT_GROUP_UUID&studioUrl=https%3A%2F%2Fstudio.example&apiUrl=https%3A%2F%2Fapi.example&connectUrl=https%3A%2F%2Fconnect.example&display=popup
 ```
 
-`display=embed` explicitly selects the embedded hosted-flow adapter. For compatibility with Charles's tested setup, only the known dev-mainnet Connect origin defaults to embed when `display` is omitted; portable links should still set the choice explicitly. Other hosts require `display=embed` or `display=popup`. The production Connect host currently denies iframe embedding, so use `display=popup` for production. The example does not silently switch transports when an embed is unavailable. Embedded flows require the selected Connect host's frame policy to allow the game origin.
+`display=embed` explicitly selects the embedded hosted-flow adapter. For compatibility with Charles's tested setup, only the known dev-mainnet Connect origin defaults to embed when `display` is omitted; portable links should still set the choice explicitly. Other hosts require `display=embed` or `display=popup`. This reference example uses explicit `display=popup` for production as a conservative policy; it does not claim that the live Connect host denies framing. A fresh valid-intent login page rendered in an iframe from the approved production profile origin, but the authenticated callback was not completed. The example therefore still rejects production embed mode until that flow is explicitly adopted and validated end-to-end. There is no automatic transport fallback. Embedded flows require the selected Connect host's frame policy to allow the game origin.
 
 Charles's existing local integration URL is retained for his approved development setup only:
 
@@ -59,7 +59,7 @@ Create a private local JSON file for your own approved app, credit group, servic
 }
 ```
 
-The placeholder IDs and origin above must be replaced with values you own; do not upload the template unchanged. Production Connect currently denies iframe embedding, so production config must explicitly select `display: "popup"`. Embedded dev-mainnet testing remains available with `display: "embed"` when that host permits the approved game origin; there is no automatic transport fallback.
+The placeholder IDs and origin above must be replaced with values you own; do not upload the template unchanged. Production config must explicitly select `display: "popup"` because this example has not validated the full embedded authentication callback. A fresh valid-intent login screen did render in an iframe from the approved production profile origin, but this does not prove authentication or callback completion. Embedded dev-mainnet testing remains available with `display: "embed"` when that host permits the approved game origin; there is no automatic transport fallback.
 
 From the repository root, rebuild the SDK from the checked-out source and create the archive:
 

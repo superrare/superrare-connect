@@ -72,7 +72,7 @@ if (!configuration) {
   const messages = {
     invalid_connect_url: 'Set a valid Connect base URL before choosing a hosted-flow display.',
     invalid_display: 'Set display=embed or display=popup.',
-    production_embed_blocked: 'Production Connect currently denies iframe embedding. Set display=popup explicitly; this example never falls back automatically.',
+    production_embed_blocked: 'This example does not enable embedded Connect for its production profile. Set display=popup explicitly; it never falls back automatically.',
     display_required: 'This Connect host requires an explicit display=embed or display=popup choice.',
   };
   signInButton.disabled = true;
