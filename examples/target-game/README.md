@@ -31,7 +31,7 @@ The server prints `http://localhost:5174/examples/target-game/`. Open it with yo
 http://localhost:5174/examples/target-game/?appId=YOUR_STUDIO_APP_UUID&groupId=YOUR_CREDIT_GROUP_UUID&studioUrl=https%3A%2F%2Fstudio.example&apiUrl=https%3A%2F%2Fapi.example&connectUrl=https%3A%2F%2Fconnect.example&display=popup
 ```
 
-`display=embed` explicitly selects the embedded hosted-flow adapter. For compatibility with Charles's tested setup, only the known dev-mainnet Connect origin defaults to embed when `display` is omitted; portable links should still set the choice explicitly. Other hosts require `display=embed` or `display=popup`. This reference example uses explicit `display=popup` for production as a conservative policy; it does not claim that the live Connect host denies framing. A fresh valid-intent login page rendered in an iframe from the approved production profile origin, but the authenticated callback was not completed. The example therefore still rejects production embed mode until that flow is explicitly adopted and validated end-to-end. There is no automatic transport fallback. Embedded flows require the selected Connect host's frame policy to allow the game origin.
+`display=embed` explicitly selects the embedded hosted-flow adapter. For compatibility with Charles's tested setup, only the known dev-mainnet Connect origin defaults to embed when `display` is omitted; portable links should still set the choice explicitly. Production and other hosts require `display=embed` or `display=popup`. The production profile uses `display=embed`: a fresh valid-intent login page rendered inside an iframe from the approved production profile origin. This confirms the current intent/login surface can render; it does not confirm authentication or callback completion. No automatic popup fallback occurs if embedding is unavailable or the flow fails.
 
 Charles's existing local integration URL is retained for his approved development setup only:
 
@@ -55,11 +55,11 @@ Create a private local JSON file for your own approved app, credit group, servic
   "apiUrl": "https://api.superrare.com",
   "connectUrl": "https://connect.superrare.com",
   "appOrigin": "https://your-game.srstudio.dev",
-  "display": "popup"
+  "display": "embed"
 }
 ```
 
-The placeholder IDs and origin above must be replaced with values you own; do not upload the template unchanged. Production config must explicitly select `display: "popup"` because this example has not validated the full embedded authentication callback. A fresh valid-intent login screen did render in an iframe from the approved production profile origin, but this does not prove authentication or callback completion. Embedded dev-mainnet testing remains available with `display: "embed"` when that host permits the approved game origin; there is no automatic transport fallback.
+The placeholder IDs and origin above must be replaced with values you own; do not upload the template unchanged. Production config must explicitly select `display: "embed"` or `display: "popup"`. This example's production profile selects embed because a fresh valid-intent login page rendered in an iframe from the approved profile origin, but authentication and callback completion were not tested. Embedded dev-mainnet testing remains available with `display: "embed"` when that host permits the approved game origin; there is no automatic transport fallback.
 
 From the repository root, rebuild the SDK from the checked-out source and create the archive:
 
@@ -69,7 +69,7 @@ pnpm build
 pnpm example:target-game:export -- --config /path/to/your-game-config.json --output /path/to/target-game.zip
 ```
 
-The default SDK input is the checked-out `dist/superrare-connect.global.js`. To package another reviewed SDK artifact, add `--sdk-bundle /path/to/superrare-connect.global.js`. The exporter writes `sdkCommit` from the current Git head, requires origin-only HTTPS service URLs and the exact HTTPS `appOrigin`, rejects production embed mode, and enforces the hosting limits of 50 MB and 500 files. Existing output is not overwritten unless `--force` is supplied.
+The default SDK input is the checked-out `dist/superrare-connect.global.js`. To package another reviewed SDK artifact, add `--sdk-bundle /path/to/superrare-connect.global.js`. The exporter writes `sdkCommit` from the current Git head, requires origin-only HTTPS service URLs, an exact HTTPS `appOrigin`, and an explicit `display` selection; it enforces the hosting limits of 50 MB and 500 files. Existing output is not overwritten unless `--force` is supplied.
 
 Upload the resulting ZIP with the platform's normal creator publishing flow. After any source or SDK change, rebuild the SDK and regenerate/re-upload the archive; the hosted origin must remain the same origin approved for the app. Confirm the selected credit group is on the intended chain and displays its real price before enabling purchases. This reference uses real Ethereum-mainnet USDC quotes and transfers; it never auto-spends, grants credits, or starts paid play.
 

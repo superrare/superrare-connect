@@ -15,14 +15,18 @@ describe('hosted Connect transport selection', () => {
     });
   });
 
-  it('requires an explicit popup on production Connect', () => {
+  it('requires explicit display selection for production Connect', () => {
     expect(resolveHostedDisplay(null, 'https://connect.superrare.com')).toMatchObject({
       ok: false,
-      reason: 'production_embed_blocked',
+      reason: 'display_required',
     });
     expect(resolveHostedDisplay('popup', 'https://connect.superrare.com')).toEqual({
       ok: true,
       display: 'popup',
+    });
+    expect(resolveHostedDisplay('embed', 'https://connect.superrare.com')).toEqual({
+      ok: true,
+      display: 'embed',
     });
   });
 

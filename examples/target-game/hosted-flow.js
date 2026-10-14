@@ -125,11 +125,6 @@ export function resolveHostedDisplay(display, connectUrl) {
   } catch {
     return { ok: false, reason: 'invalid_connect_url' };
   }
-  if (connectOrigin === 'https://connect.superrare.com') {
-    return display === 'popup'
-      ? { ok: true, display: 'popup' }
-      : { ok: false, reason: 'production_embed_blocked' };
-  }
   if (display === 'embed' || display === 'popup') return { ok: true, display };
   if (connectOrigin === 'https://connect-dev-mainnet.superrare.co') {
     return { ok: true, display: 'embed' };

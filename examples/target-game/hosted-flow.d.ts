@@ -8,7 +8,7 @@ export type ConnectSessionView = {
 
 export type HostedDisplayResult =
   | { ok: true; display: 'embed' | 'popup' }
-  | { ok: false; reason: 'invalid_display' | 'invalid_connect_url' | 'production_embed_blocked' | 'display_required' };
+  | { ok: false; reason: 'invalid_display' | 'invalid_connect_url' | 'display_required' };
 
 export type GameAuthorizationView = {
   state: 'authorization_not_confirmed' | 'authorization_confirmed_refresh_failed' | 'authorization_confirmed';
