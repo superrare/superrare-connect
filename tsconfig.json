@@ -10,6 +10,6 @@
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"]
   },
-  "include": ["src/**/*", "test/**/*", "examples/vanilla/**/*", "tsup.config.ts", "vitest.config.ts"],
+  "include": ["src/**/*", "test/**/*", "examples/vanilla/**/*", "examples/target-game/export.ts", "tsup.config.ts", "vitest.config.ts"],
   "exclude": ["examples/react"]
 }

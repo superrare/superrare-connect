@@ -4,17 +4,36 @@ import {
   describeSdkFailure,
   deriveConnectSessionView,
   deriveGameAuthorizationView,
+  resolveExampleConfiguration,
   resolveHostedDisplay,
 } from './hosted-flow.js';
 import { PaidRound } from './round.js';
 const params = new URLSearchParams(location.search);
-const appId = params.get('appId');
-const groupId = params.get('groupId');
-const studioUrl = params.get('studioUrl') ?? 'https://studio.superrare.com';
-const apiUrl = params.get('apiUrl') ?? 'https://api.superrare.com';
-const connectUrl = params.get('connectUrl') ?? 'https://connect.superrare.com';
-const displayConfiguration = resolveHostedDisplay(params.get('display'), connectUrl);
-const display = displayConfiguration.ok ? displayConfiguration.display : undefined;
+let hostedMetadata;
+let hostedConfigError;
+const isLoopbackOrigin = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+const hasCompleteQueryConfiguration = ['appId', 'groupId', 'studioUrl', 'apiUrl', 'connectUrl', 'display']
+  .every((key) => params.has(key));
+if (!isLoopbackOrigin || !hasCompleteQueryConfiguration) {
+  try {
+    const response = await fetch('/config.json', { cache: 'no-store' });
+    if (!response.ok) hostedConfigError = `HTTP ${response.status}`;
+    else hostedMetadata = await response.json();
+  } catch (error) {
+    hostedConfigError = describeSdkFailure(error);
+  }
+}
+const configurationResult = resolveExampleConfiguration(params, hostedMetadata, location.origin);
+const configuration = configurationResult.ok ? configurationResult.configuration : undefined;
+const appId = configuration?.appId;
+const groupId = configuration?.groupId;
+const studioUrl = configuration?.studioUrl;
+const apiUrl = configuration?.apiUrl;
+const connectUrl = configuration?.connectUrl;
+const displayConfiguration = configuration
+  ? resolveHostedDisplay(configuration.display, connectUrl)
+  : undefined;
+const display = displayConfiguration?.ok ? displayConfiguration.display : undefined;
 const mainnetUsdc = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 const embeddedConnectAvailable = typeof window.SuperRareConnect.ConnectEmbedUnavailableError === 'function';
 const configText = document.querySelector('#configuration');
@@ -35,10 +54,20 @@ let credits;
 let round;
 let busy = false;
 
-if (!appId || !groupId) {
-  connectionStatus.textContent = 'Add your Studio appId and credit groupId to the URL. See the example README.';
+if (!configuration) {
+  const messages = {
+    missing_app_or_group: 'Supply your Studio appId and credit groupId in the URL or publish a root /config.json.',
+    invalid_app_or_group: 'The configured Studio appId and credit groupId must be valid UUIDs.',
+    invalid_service_url: 'The Studio, Rare API, and Connect service settings must be valid HTTPS origins (or localhost HTTP origins for local development).',
+    invalid_app_origin: 'The configured game origin must be an HTTPS origin.',
+    app_origin_mismatch: 'This game is not running at its configured approved app origin.',
+    invalid_metadata: 'The root /config.json must contain string values for its app, group, service, origin, and display settings.',
+    invalid_display: 'Set display=embed or display=popup in the URL or root /config.json.',
+  };
   signInButton.disabled = true;
   connectButton.disabled = true;
+  signInStatus.textContent = 'Game configuration is required before signing in or authorizing.';
+  connectionStatus.textContent = `${messages[configurationResult.reason] ?? 'Game configuration could not be resolved.'}${hostedConfigError ? ` (/config.json: ${hostedConfigError})` : ''}`;
 } else if (!displayConfiguration.ok) {
   const messages = {
     invalid_connect_url: 'Set a valid Connect base URL before choosing a hosted-flow display.',

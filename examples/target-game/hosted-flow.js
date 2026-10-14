@@ -47,6 +47,74 @@ export function deriveConnectSessionView(state, session, now = Date.now()) {
   };
 }
 
+const GAME_CONFIGURATION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isConfigurationRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isServiceOrigin(value) {
+  try {
+    const url = new URL(value);
+    const isLocalHttp = url.protocol === 'http:'
+      && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+    return (url.protocol === 'https:' || isLocalHttp)
+      && url.origin === value
+      && !url.username
+      && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveExampleConfiguration(query, rawMetadata, currentOrigin) {
+  if (rawMetadata !== undefined && !isConfigurationRecord(rawMetadata)) {
+    return { ok: false, reason: 'invalid_metadata' };
+  }
+
+  const metadata = isConfigurationRecord(rawMetadata) ? rawMetadata : {};
+  for (const key of ['appId', 'groupId', 'studioUrl', 'apiUrl', 'connectUrl', 'appOrigin', 'display']) {
+    if (Object.hasOwn(metadata, key) && typeof metadata[key] !== 'string') {
+      return { ok: false, reason: 'invalid_metadata' };
+    }
+  }
+
+  const valueFor = (key, fallback = null) => {
+    if (query.has(key)) return query.get(key);
+    return Object.hasOwn(metadata, key) ? metadata[key] : fallback;
+  };
+
+  const appId = valueFor('appId');
+  const groupId = valueFor('groupId');
+  if (!appId || !groupId) return { ok: false, reason: 'missing_app_or_group' };
+  if (!GAME_CONFIGURATION_UUID.test(appId) || !GAME_CONFIGURATION_UUID.test(groupId)) {
+    return { ok: false, reason: 'invalid_app_or_group' };
+  }
+
+  const studioUrl = valueFor('studioUrl', 'https://studio.superrare.com');
+  const apiUrl = valueFor('apiUrl', 'https://api.superrare.com');
+  const connectUrl = valueFor('connectUrl', 'https://connect.superrare.com');
+  const appOrigin = valueFor('appOrigin');
+  const display = valueFor('display');
+  if (![studioUrl, apiUrl, connectUrl].every(isServiceOrigin)) {
+    return { ok: false, reason: 'invalid_service_url' };
+  }
+  if (display !== null && display !== 'embed' && display !== 'popup') {
+    return { ok: false, reason: 'invalid_display' };
+  }
+  if (appOrigin !== null) {
+    if (!isServiceOrigin(appOrigin) || !appOrigin.startsWith('https://')) {
+      return { ok: false, reason: 'invalid_app_origin' };
+    }
+    if (appOrigin !== currentOrigin) return { ok: false, reason: 'app_origin_mismatch' };
+  }
+
+  return {
+    ok: true,
+    configuration: { appId, groupId, studioUrl, apiUrl, connectUrl, appOrigin, display },
+  };
+}
+
 export function resolveHostedDisplay(display, connectUrl) {
   if (display !== null && display !== 'embed' && display !== 'popup') {
     return { ok: false, reason: 'invalid_display' };

@@ -16,6 +16,36 @@ export type GameAuthorizationView = {
   status: string;
 };
 
+export type ExampleConfiguration = {
+  appId: string;
+  groupId: string;
+  studioUrl: string;
+  apiUrl: string;
+  connectUrl: string;
+  appOrigin: string | null;
+  display: string | null;
+};
+
+export type ExampleConfigurationResult =
+  | { ok: true; configuration: ExampleConfiguration }
+  | {
+    ok: false;
+    reason:
+      | 'invalid_metadata'
+      | 'missing_app_or_group'
+      | 'invalid_app_or_group'
+      | 'invalid_service_url'
+      | 'invalid_display'
+      | 'invalid_app_origin'
+      | 'app_origin_mismatch';
+  };
+
+export function resolveExampleConfiguration(
+  query: URLSearchParams,
+  rawMetadata: unknown,
+  currentOrigin: string,
+): ExampleConfigurationResult;
+
 export function deriveConnectSessionView(
   state: ConnectSessionView['state'],
   session: { expiresAt?: string } | undefined,

@@ -1,6 +1,6 @@
 ## Target game reference
 
-This plain-JavaScript example uses the built SDK browser bundle from this repository and serves only its allowlisted files on loopback. It demonstrates explicitly selected embedded or popup hosted Connect sign-in/checkout, headless scoped Studio game authorization, account-bound credit state, explicit purchase confirmation, and paid-round recovery.
+This plain-JavaScript example uses the built SDK browser bundle from this repository and serves only its allowlisted files on loopback. It can also produce a portable static archive with root `index.html`, `config.json`, the complete SDK bundle, and versioned JS/CSS assets. It demonstrates explicitly selected embedded or popup hosted Connect sign-in/checkout, headless scoped Studio game authorization, account-bound credit state, explicit purchase confirmation, and paid-round recovery.
 
 ### Requirements
 
@@ -9,8 +9,9 @@ This plain-JavaScript example uses the built SDK browser bundle from this reposi
 - Your own approved Studio app and credit group, with the exact browser origin approved for both. The game uses `location.origin`; changing hostname or port requires the new origin to be approved in Studio.
 - Environment-specific Studio, Rare API, and Connect base URLs. `studioUrl` is the Studio API origin; it is not the Rare API or Connect host.
 - Beta access for Studio game/credit APIs, where required by your environment.
+- For static archive export: the system `zip` and `unzip` commands.
 
-App ID, credit-group ID, service URLs, and hosted-flow display are supplied in the page query string. The example has no seeded app/group defaults and does not provide an identity, balance, quote, or payment fallback.
+For local development, app ID, credit-group ID, service URLs, and hosted-flow display can be supplied in the page query string. On a published/non-loopback origin, the page loads the root `config.json` with `cache: "no-store"`; on loopback it loads that file only if the query configuration is incomplete. Explicit query values override the file, and any packaged `appOrigin` must match the current page origin. The example has no seeded app/group defaults and does not provide an identity, balance, quote, or payment fallback.
 
 ### Build and run
 
@@ -39,6 +40,38 @@ http://localhost:5174/examples/target-game/?appId=53a9574d-6890-4dbd-a690-41540d
 ```
 
 Those IDs and origins are not defaults for other developers; replace them with your own approved Studio app, credit group, and origin.
+
+### Export a static profile
+
+The export command creates a ZIP with `index.html` at the archive root, `config.json`, `connect-sdk.js`, and every required JavaScript/CSS module. Script and stylesheet URLs include SHA-256 cache-busting hashes. The archive contains no repository-relative SDK path, absolute workstation path, credentials, or example app/group IDs; the IDs and approved origin come only from your configuration file.
+
+Create a private local JSON file for your own approved app, credit group, service origins, and published origin:
+
+```json
+{
+  "appId": "YOUR_STUDIO_APP_UUID",
+  "groupId": "YOUR_CREDIT_GROUP_UUID",
+  "studioUrl": "https://studio.superrare.com",
+  "apiUrl": "https://api.superrare.com",
+  "connectUrl": "https://connect.superrare.com",
+  "appOrigin": "https://your-game.srstudio.dev",
+  "display": "popup"
+}
+```
+
+The placeholder IDs and origin above must be replaced with values you own; do not upload the template unchanged. Production Connect currently denies iframe embedding, so production config must explicitly select `display: "popup"`. Embedded dev-mainnet testing remains available with `display: "embed"` when that host permits the approved game origin; there is no automatic transport fallback.
+
+From the repository root, rebuild the SDK from the checked-out source and create the archive:
+
+```sh
+pnpm install
+pnpm build
+pnpm example:target-game:export -- --config /path/to/your-game-config.json --output /path/to/target-game.zip
+```
+
+The default SDK input is the checked-out `dist/superrare-connect.global.js`. To package another reviewed SDK artifact, add `--sdk-bundle /path/to/superrare-connect.global.js`. The exporter writes `sdkCommit` from the current Git head, requires origin-only HTTPS service URLs and the exact HTTPS `appOrigin`, rejects production embed mode, and enforces the hosting limits of 50 MB and 500 files. Existing output is not overwritten unless `--force` is supplied.
+
+Upload the resulting ZIP with the platform's normal creator publishing flow. After any source or SDK change, rebuild the SDK and regenerate/re-upload the archive; the hosted origin must remain the same origin approved for the app. Confirm the selected credit group is on the intended chain and displays its real price before enabling purchases. This reference uses real Ethereum-mainnet USDC quotes and transfers; it never auto-spends, grants credits, or starts paid play.
 
 ### Flow and safety
 

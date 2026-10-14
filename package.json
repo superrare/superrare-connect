@@ -32,6 +32,7 @@
     "build": "pnpm typecheck && tsup",
     "test": "pnpm build && pnpm --dir examples/react typecheck && vitest run",
     "example:target-game": "node --experimental-strip-types examples/target-game/serve.ts --port 5174",
+    "example:target-game:export": "node --experimental-strip-types examples/target-game/export.ts",
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {

@@ -4,6 +4,7 @@ import {
   deriveConnectSessionView,
   deriveGameAuthorizationView,
   resolveHostedDisplay,
+  resolveExampleConfiguration,
 } from '../examples/target-game/hosted-flow.js';
 
 describe('hosted Connect transport selection', () => {
@@ -33,6 +34,73 @@ describe('hosted Connect transport selection', () => {
     expect(resolveHostedDisplay('embed', 'https://connect.example')).toEqual({
       ok: true,
       display: 'embed',
+    });
+  });
+});
+
+describe('target game hosted configuration', () => {
+  const profileOrigin = 'https://target.example';
+  const profileMetadata = {
+    appId: '11111111-1111-4111-8111-111111111111',
+    groupId: '22222222-2222-4222-8222-222222222222',
+    studioUrl: 'https://studio.superrare.com',
+    apiUrl: 'https://api.superrare.com',
+    connectUrl: 'https://connect.superrare.com',
+    appOrigin: profileOrigin,
+    display: 'popup',
+  };
+
+  it('resolves the packaged profile and requires its approved origin to match the page', () => {
+    expect(resolveExampleConfiguration(new URLSearchParams(), profileMetadata, profileOrigin)).toEqual({
+      ok: true,
+      configuration: {
+        appId: profileMetadata.appId,
+        groupId: profileMetadata.groupId,
+        studioUrl: profileMetadata.studioUrl,
+        apiUrl: profileMetadata.apiUrl,
+        connectUrl: profileMetadata.connectUrl,
+        appOrigin: profileOrigin,
+        display: 'popup',
+      },
+    });
+    expect(resolveExampleConfiguration(new URLSearchParams(), profileMetadata, 'https://other.example')).toEqual({
+      ok: false,
+      reason: 'app_origin_mismatch',
+    });
+  });
+
+  it('lets explicit query configuration override hosted metadata', () => {
+    const query = new URLSearchParams([
+      ['appId', 'a4a9f0b1-9702-47f4-bfb7-762621b85c82'],
+      ['groupId', '319f547c-19b6-490e-8dc5-2a7ea6e29576'],
+      ['appOrigin', profileOrigin],
+      ['display', 'popup'],
+    ]);
+
+    const differentMetadata = {
+      ...profileMetadata,
+      connectUrl: 'https://connect-dev-mainnet.superrare.co',
+      display: 'embed',
+    };
+
+    expect(resolveExampleConfiguration(query, differentMetadata, profileOrigin)).toMatchObject({
+      ok: true,
+      configuration: {
+        appId: 'a4a9f0b1-9702-47f4-bfb7-762621b85c82',
+        groupId: '319f547c-19b6-490e-8dc5-2a7ea6e29576',
+        appOrigin: profileOrigin,
+        display: 'popup',
+      },
+    });
+  });
+
+  it('rejects service URLs with paths before they can define a game client', () => {
+    expect(resolveExampleConfiguration(new URLSearchParams(), {
+      ...profileMetadata,
+      apiUrl: 'https://api.superrare.com/v1',
+    }, profileOrigin)).toEqual({
+      ok: false,
+      reason: 'invalid_service_url',
     });
   });
 });
