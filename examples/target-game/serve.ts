@@ -22,6 +22,8 @@ const sdkBundle = configuration['sdk-bundle'] === undefined
   : resolve(configuration['sdk-bundle']);
 // Fail before listening if the repository default or explicitly selected SDK artifact is absent.
 await readFile(sdkBundle);
+const targetEngine = resolve(directory, '../../dist/target-game/target-engine.js');
+await readFile(targetEngine);
 
 const files: Record<string, { path: string; contentType: string }> = {
   '/examples/target-game/': { path: resolve(directory, 'index.html'), contentType: 'text/html; charset=utf-8' },
@@ -29,6 +31,7 @@ const files: Record<string, { path: string; contentType: string }> = {
   '/examples/target-game/main.js': { path: resolve(directory, 'main.js'), contentType: 'text/javascript; charset=utf-8' },
   '/examples/target-game/credits.js': { path: resolve(directory, 'credits.js'), contentType: 'text/javascript; charset=utf-8' },
   '/examples/target-game/round.js': { path: resolve(directory, 'round.js'), contentType: 'text/javascript; charset=utf-8' },
+  '/examples/target-game/target-engine.js': { path: targetEngine, contentType: 'text/javascript; charset=utf-8' },
   '/examples/target-game/hosted-flow.js': { path: resolve(directory, 'hosted-flow.js'), contentType: 'text/javascript; charset=utf-8' },
   '/examples/target-game/styles.css': { path: resolve(directory, 'styles.css'), contentType: 'text/css; charset=utf-8' },
   '/dist/superrare-connect.global.js': { path: sdkBundle, contentType: 'text/javascript; charset=utf-8' },

@@ -87,11 +87,18 @@ async function main(): Promise<void> {
   if (!/^[0-9a-f]{40}$/.test(sdkCommit)) throw new Error('Could not resolve the checked-out source commit.');
 
   const sdkBundle = await readFile(sdkBundlePath);
+  const targetEngine = await readFile(join(repositoryRoot, 'dist/target-game/target-engine.js'), 'utf8');
+  const serverVerifier = await readFile(join(repositoryRoot, 'dist/target-game/server-verifier.js'));
+  if (serverVerifier.byteLength > 256_000) throw new Error('The server verifier exceeds the Studio 256 KB module limit.');
+  const scoringConfiguration = await readFile(join(repositoryRoot, 'examples/target-game/scoring-config.json'));
   const sourcePaths = ['main.js', 'credits.js', 'hosted-flow.js', 'round.js', 'styles.css'] as const;
-  const sourceFiles = await Promise.all(sourcePaths.map(async (name) => ({
-    name,
-    content: await readFile(join(repositoryRoot, 'examples/target-game', name), 'utf8'),
-  })));
+  const sourceFiles: Array<{ name: string; content: string }> = [
+    ...await Promise.all(sourcePaths.map(async (name) => ({
+      name,
+      content: await readFile(join(repositoryRoot, 'examples/target-game', name), 'utf8'),
+    }))),
+    { name: 'target-engine.js', content: targetEngine },
+  ];
   const sourceContent = new Map(sourceFiles.map(({ name, content }) => [name, content]));
   const stylesSource = sourceContent.get('styles.css');
   if (stylesSource === undefined) throw new Error('The target-game stylesheet is missing.');
@@ -100,7 +107,7 @@ async function main(): Promise<void> {
     ['styles.css', contentHash(stylesSource)],
   ]);
   const packagedModuleContent = new Map<string, string>();
-  const moduleOrder = ['hosted-flow.js', 'round.js', 'credits.js', 'main.js'] as const;
+  const moduleOrder = ['target-engine.js', 'hosted-flow.js', 'round.js', 'credits.js', 'main.js'];
   for (const name of moduleOrder) {
     let moduleSource = sourceContent.get(name);
     if (moduleSource === undefined) throw new Error(`The target-game module ${name} is missing.`);
@@ -149,11 +156,13 @@ async function main(): Promise<void> {
     await writeFile(join(stageDirectory, 'index.html'), index);
     await writeFile(join(stageDirectory, 'config.json'), `${JSON.stringify(packagedConfiguration, null, 2)}\n`);
     await writeFile(join(stageDirectory, 'connect-sdk.js'), sdkBundle);
+    await writeFile(join(stageDirectory, 'server-verifier.js'), serverVerifier);
+    await writeFile(join(stageDirectory, 'scoring-config.json'), scoringConfiguration);
     for (const { name, content } of packagedSources) {
       await writeFile(join(stageDirectory, name), content);
     }
 
-    const entries = ['index.html', 'config.json', 'connect-sdk.js', ...sourcePaths];
+    const entries = ['index.html', 'config.json', 'connect-sdk.js', 'server-verifier.js', 'scoring-config.json', ...sourceFiles.map(({ name }) => name)];
     if (entries.length > 500) throw new Error('The static archive exceeds the Studio 500-file limit.');
     await executeFile('zip', ['-X', '-q', temporaryArchive, ...entries], { cwd: stageDirectory });
     const archiveEntries = (await executeFile('unzip', ['-Z1', temporaryArchive])).stdout.trim().split('\n');

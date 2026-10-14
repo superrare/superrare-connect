@@ -124,6 +124,60 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
+describe('authoritative scoring reads', () => {
+  it.each([
+    { version: '1' },
+    { version: '1', eventId: null },
+    { version: '1', eventId: 'not-an-event-uuid' },
+    { version: '2', eventId: appId },
+    { version: '1', eventId: appId, unexpected: true },
+  ])('rejects malformed active-event discovery: %j', async (body) => {
+    const h = harness({ fetch: async () => Response.json(body) });
+    await expect(h.game.getActiveScoringEvent()).rejects.toThrow();
+  });
+
+  it('preserves absence of an active event as a platform error', async () => {
+    const h = harness({ fetch: async () => Response.json({
+      error: { code: 'GAME_NOT_FOUND', message: 'No active scoring event for this deployment' },
+    }, { status: 404 }) });
+    await expect(h.game.getActiveScoringEvent()).rejects.toMatchObject({
+      status: 404, code: 'GAME_NOT_FOUND',
+    });
+  });
+
+  it('does not turn unavailable scoring into a zero score', async () => {
+    const h = harness({ fetch: async () => Response.json({
+      error: { code: 'UNAVAILABLE', message: 'Scoring unavailable' },
+    }, { status: 503 }) });
+    await expect(h.game.getServerTopScore()).rejects.toBeInstanceOf(SuperRareConnectApiError);
+  });
+
+  it('keeps no completed score distinct from a completed zero score', async () => {
+    const missing = harness({ fetch: async () => Response.json({ version: '1', topScore: null }) });
+    const zero = harness({ fetch: async () => Response.json({ version: '1', topScore: 0 }) });
+    await expect(missing.game.getServerTopScore()).resolves.toBeNull();
+    await expect(zero.game.getServerTopScore()).resolves.toBe(0);
+  });
+
+  it('normalizes PostgreSQL decimal digit scores without losing precision', async () => {
+    const h = harness({ fetch: async () => Response.json({ version: '1', topScore: '9007199254740991' }) });
+    await expect(h.game.getServerTopScore()).resolves.toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it.each([
+    -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '9007199254740992',
+    '', ' 42', '42 ', '-1', '1.5', '1e3', '0x10', true, {},
+  ])('rejects unsafe or malformed server scores: %j', async (topScore) => {
+    const h = harness({ fetch: async () => Response.json({ version: '1', topScore }) });
+    await expect(h.game.getServerTopScore()).rejects.toThrow();
+  });
+
+  it.each([{ version: '1' }, { version: '2', topScore: 0 }])('rejects incomplete score responses: %j', async (body) => {
+    const h = harness({ fetch: async () => Response.json(body) });
+    await expect(h.game.getServerTopScore()).rejects.toThrow();
+  });
+});
+
 describe('game connection', () => {
   it('exchanges signed-in access without opening UI, consenting, starting, or modifying pending attempts', async () => {
     const storage = memoryStorage();

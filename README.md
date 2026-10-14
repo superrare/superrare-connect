@@ -35,7 +35,7 @@ const superrare = createSuperRareClient({
 
 Configure your approved Studio app, credit group, exact browser origin, and environment service URLs. The game signs in through hosted Connect using an explicit embedded or popup transport, then authorizes the scoped game session directly through the Studio API with current Connect access. `game.connect()` never opens a hosted authorization surface, falls back between transports, or starts a paid play.
 
-Credit purchases require an explicit wallet approval and retry the same quote/transaction hash until Studio reconciliation completes. Each paid round has separate explicit confirmation and retains its original idempotency key for recovery. Displayed scores are client-asserted, not server-verified. Production Connect requires the example's explicit popup choice; the known dev-mainnet host may use the documented embedded flow.
+Credit purchases require an explicit wallet approval and retry the same quote/transaction hash until Studio reconciliation completes. Each paid round has separate explicit confirmation and retains its original idempotency key for recovery. Target Rush uses a server-validated run: the platform advances the uploaded verifier and owns the authoritative score. Hosted Connect supports explicit embedded or popup login; embedded availability depends on the browser and hosted environment, not a blanket production popup requirement.
 
 Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
 
@@ -126,15 +126,30 @@ await game.submitClientAssertedScore({
   score: 12500,
   idempotencyKey: crypto.randomUUID(),
 });
-
-const run = await game.startServerValidatedRun({
-  sessionToken: started.session.token,
-  eventId: 'studio-scoring-event-uuid',
-  idempotencyKey: crypto.randomUUID(),
-});
-// Send supported run inputs to run.run.webSocketUrl. Studio's verifier owns
-// authoritative calculation and records the verified result.
 ```
+
+For server-validated games, keep the credit/auth client configured with its approved Studio service URL. Create a separate scoring client on the hosted game's origin so the platform's same-origin scoring routes issue a WebSocket URL whose origin matches the game:
+
+```ts
+const scoringGame = createSuperRareClient({
+  studioUrl: window.location.origin,
+}).games.forGame({ appId: 'your-studio-app-id' });
+
+const { eventId } = await scoringGame.getActiveScoringEvent();
+const topScore = await scoringGame.getServerTopScore(); // number | null; null means no completed score
+const runKey = crypto.randomUUID(); // Retain with the original event and paid session for recovery.
+const run = await scoringGame.startServerValidatedRun({
+  sessionToken: started.session.token,
+  eventId,
+  idempotencyKey: runKey,
+});
+// Connect to run.run.webSocketUrl and send supported sequenced inputs.
+// Render authoritative snapshots and the terminal result, never submit a browser-calculated final score.
+```
+
+Studio provisions and pins the uploaded root `server-verifier.js` to the published deployment and scoring event; this verifier is excluded from public assets. The Workers for Platforms coordinator advances it, applies sequenced inputs, and records its authoritative result. Hosted game origins pass `/api/v1/games/:appId` through to the platform; a local static preview alone does not provide those scoring routes. Active-event absence and unavailable reads reject rather than fabricating an event or score. Top-score reads accept only nonnegative safe integers (including PostgreSQL decimal digit strings) or `null`.
+
+After a lost run-start response or socket disconnect, re-post the **original event, run key, and paid PlaySession token** using `startServerValidatedRun`; the platform returns the existing run with a fresh one-use socket ticket. Do not start another paid play to recover that run.
 
 Leaderboard reads use the same game client:
 

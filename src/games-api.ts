@@ -66,6 +66,19 @@ const serverRunResponseSchema = z.object({
 });
 export type ServerValidatedGameRun = z.infer<typeof serverRunResponseSchema>;
 
+const activeScoringEventSchema = z.object({
+  version: z.literal('1'), eventId: z.string().uuid(),
+}).strict();
+
+const serverScoreSchema = z.union([
+  z.number(),
+  z.string().regex(/^[0-9]+$/).transform(Number),
+]).pipe(z.number().int().nonnegative().refine(Number.isSafeInteger, 'Score must be a safe integer'));
+
+const serverTopScoreSchema = z.object({
+  version: z.literal('1'), topScore: serverScoreSchema.nullable(),
+}).strict();
+
 export async function requestStudioJson(input: StudioApiOptions & {
   path: string; method?: 'GET' | 'POST'; body?: unknown; authorization?: string; idempotencyKey?: string;
 }): Promise<unknown> {
@@ -100,3 +113,8 @@ export const parseLeaderboard = (value: unknown): GameLeaderboard => leaderboard
 export const parseMyBest = (value: unknown): GameLeaderboardEntry | null => z.object({ entry: leaderboardEntrySchema.nullable() }).parse(value).entry;
 export const parseClientScore = (value: unknown): ClientAssertedScoreResult => clientScoreResponseSchema.parse(value);
 export const parseServerRun = (value: unknown): ServerValidatedGameRun => serverRunResponseSchema.parse(value);
+export const parseActiveScoringEvent = (value: unknown): { eventId: string } => {
+  const response = activeScoringEventSchema.parse(value);
+  return { eventId: response.eventId };
+};
+export const parseServerTopScore = (value: unknown): number | null => serverTopScoreSchema.parse(value).topScore;

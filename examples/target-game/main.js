@@ -91,6 +91,15 @@ if (!configuration) {
     },
   });
   const game = client.games.forGame({ appId, groupId });
+  // Hosted game/scoring paths pass through the platform on the app origin.
+  // Its one-time run sockets deliberately reject cross-origin connections.
+  const scoringGame = window.SuperRareConnect.createSuperRareClient({
+    studioUrl: location.origin,
+    apiUrl,
+    connectUrl,
+    storage: false,
+    navigation: false,
+  }).games.forGame({ appId });
   const baseKey = `superrare-target-game:${encodeURIComponent(studioUrl)}:${appId}:${groupId}`;
   let connectState = 'signed_out';
   let connectSession;
@@ -234,6 +243,7 @@ if (!configuration) {
   });
   round = new PaidRound({
     game,
+    scoringGame,
     root: document.querySelector('#game'),
     storageKey: `${baseKey}:round`,
     getBalance: () => credits.balance,

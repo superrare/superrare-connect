@@ -27,4 +27,20 @@ export default defineConfig([
     sourcemap: true,
     noExternal: ['zod'],
   },
+  {
+    entry: {
+      'target-engine': 'examples/target-game/target-engine.ts',
+      'server-verifier': 'examples/target-game/server-verifier.ts',
+    },
+    outDir: 'dist/target-game',
+    format: ['esm'],
+    target: 'es2022',
+    platform: 'browser',
+    clean: false,
+    dts: false,
+    sourcemap: false,
+    splitting: false,
+    minify: true,
+    noExternal: ['zod', 'zod/mini'],
+  },
 ]);

@@ -1,6 +1,6 @@
 ## Target game reference
 
-This plain-JavaScript example uses the built SDK browser bundle from this repository and serves only its allowlisted files on loopback. It can also produce a portable static archive with root `index.html`, `config.json`, the complete SDK bundle, and versioned JS/CSS assets. It demonstrates explicitly selected embedded or popup hosted Connect sign-in/checkout, headless scoped Studio game authorization, account-bound credit state, explicit purchase confirmation, and paid-round recovery.
+This plain-JavaScript example uses the built SDK browser bundle from this repository. Its portable ZIP contains the browser assets and a root `server-verifier.js`: Studio provisions that module into Workers for Platforms and pins it to the published game deployment. It demonstrates explicitly selected embedded or popup hosted Connect sign-in/checkout, headless scoped Studio game authorization, account-bound credit state, explicit purchase confirmation, recoverable paid plays, and server-validated Target Rush runs.
 
 ### Requirements
 
@@ -9,6 +9,7 @@ This plain-JavaScript example uses the built SDK browser bundle from this reposi
 - Your own approved Studio app and credit group, with the exact browser origin approved for both. The game uses `location.origin`; changing hostname or port requires the new origin to be approved in Studio.
 - Environment-specific Studio, Rare API, and Connect base URLs. `studioUrl` is the Studio API origin; it is not the Rare API or Connect host.
 - Beta access for Studio game/credit APIs, where required by your environment.
+- The Studio hosted-game WebSocket coordinator and Workers for Platforms verifier provisioning must be enabled. The published deployment needs an active scoring event pinned to its own verifier/config.
 - For static archive export: the system `zip` and `unzip` commands.
 
 For local development, app ID, credit-group ID, service URLs, and hosted-flow display can be supplied in the page query string. On a published/non-loopback origin, the page loads the root `config.json` with `cache: "no-store"`; on loopback it loads that file only if the query configuration is incomplete. Explicit query values override the file, and any packaged `appOrigin` must match the current page origin. The example has no seeded app/group defaults and does not provide an identity, balance, quote, or payment fallback.
@@ -43,7 +44,7 @@ Those IDs and origins are not defaults for other developers; replace them with y
 
 ### Export a static profile
 
-The export command creates a ZIP with `index.html` at the archive root, `config.json`, `connect-sdk.js`, and every required JavaScript/CSS module. Script and stylesheet URLs include SHA-256 cache-busting hashes. The archive contains no repository-relative SDK path, absolute workstation path, credentials, or example app/group IDs; the IDs and approved origin come only from your configuration file.
+The export command creates a ZIP with root `index.html`, `config.json`, `connect-sdk.js`, every required JavaScript/CSS module, `scoring-config.json`, and a self-contained `server-verifier.js`. Script and stylesheet URLs include SHA-256 cache-busting hashes. Studio removes the verifier from public static files and provisions it as an immutable game/deployment-scoped worker. The archive contains no absolute workstation path or credentials; app/group/origin bindings come from your configuration.
 
 Create a private local JSON file for your own approved app, credit group, service origins, and published origin:
 
@@ -73,13 +74,38 @@ The default SDK input is the checked-out `dist/superrare-connect.global.js`. To 
 
 Upload the resulting ZIP with the platform's normal creator publishing flow. After any source or SDK change, rebuild the SDK and regenerate/re-upload the archive; the hosted origin must remain the same origin approved for the app. Confirm the selected credit group is on the intended chain and displays its real price before enabling purchases. This reference uses real Ethereum-mainnet USDC quotes and transfers; it never auto-spends, grants credits, or starts paid play.
 
+### Register the platform verifier and scoring event
+
+This ports the real server-run protocol from [Superlinks PR #169](https://github.com/superrare/superlinks/pull/169), including ordered input/recovery behavior from [#171](https://github.com/superrare/superlinks/pull/171); it does not port the older example’s wallet-signing login. Connect sign-in and the paid PlaySession remain this example’s identity/credit flow.
+
+After each ZIP publication, use the normal authenticated creator API to register the **new current deployment** and create its scoring event:
+
+```text
+POST /api/v1/games/:appId/scoring/versions
+{"deploymentId":"CURRENT_PUBLISHED_DEPLOYMENT_UUID","config":{"maxTicks":240,"roundTicks":200}}
+
+POST /api/v1/games/:appId/scoring/events
+{"verifierVersionId":"RETURNED_VERIFIER_VERSION_UUID","maxAttempts":10000,"authPolicy":"authenticated"}
+```
+
+These are creator-authorized configuration calls, not player financial actions. The root `scoring-config.json` supplies the exact rule configuration. Each coordinator tick is 50 ms: 200 ticks is ten seconds of play, with a 240-tick absolute run bound. The browser reads the deployment’s active event before asking the player to spend a credit; absent/misconfigured events therefore block a new paid start.
+
+Gameplay uses a separate SDK game client with `studioUrl: location.origin`. Hosted `/api/v1/games/…` and `/api/v1/server-game-runs/…` paths pass through to the platform; its WebSockets require the same hosted origin. Auth, authorization, purchases, and paid consent keep the configured Studio URL. A standalone static preview can inspect/render the package, but it does not emulate the platform’s authenticated APIs or verifier runtime.
+
+The browser calls `getActiveScoringEvent()` and `startServerValidatedRun()` using the already-paid PlaySession. It sends only ordered `start` and target-ID `hit` inputs. The worker issues seeded targets, checks their current IDs, advances authoritative ticks, and calculates the final score. Local prediction makes targets responsive; it is presentation only. Only the platform’s `snapshot.result` is a recorded server-verified score. The shared top score comes from `getServerTopScore()`, not the community/client-asserted leaderboard.
+
+The paid-start key and deterministic server-run key are saved before their respective requests. A dropped connection or reload recovers the same event/run/key/PlaySession and obtains a fresh one-time socket ticket; it never buys another play or resets the server clock. A completed result retries only paid-session completion. Server expiry preserves the record and requires an explicit newly priced play; no refund is invented. Older already-playing/client-scored rounds are retained as historical, unverified records, never relabeled or resubmitted as verified.
+
+Server validation prevents a player from choosing a final numeric score. It is not proof of a human player, bot resistance, creator fairness, prize eligibility, or a payout system.
+
+
 ### Flow and safety
 
 The page restores and verifies the saved Connect session. **Sign in to SuperRare** opens hosted Connect using the selected transport. **Authorize game** calls `game.connect()` directly against the Studio API with the current Connect session and the browser origin; it does not open a Studio authorization popup. When signed out, authorization shows a sign-in-required state without a request; HTTP 401 exposes a retryable Connect session check or sign-in action without deleting credentials or pending game/purchase records.
 
 Studio's authorization response must include the top-level ISO `issuedAt` timestamp. The SDK measures the maximum 15-minute authorization lifetime from that server-issued timestamp, not the browser's clock; local expiry, session-expiry, wallet, app/group, and origin checks still apply. Deploy the Studio producer change before rebuilding/uploading this SDK example. Existing saved game authorization and pending purchase/round records need no migration or clearing.
 
-Successful game authorization is distinct from balance and round recovery. A balance refresh failure does not undo authorization. Each new round has a separate visible credit-cost confirmation. The confirmation or **Continue** action starts the game immediately after Studio returns its session; there is no second ready-to-play confirmation. Scores are client-asserted and are not server-verified.
+Successful game authorization is distinct from balance and round recovery. A balance refresh failure does not undo authorization. Each new round has a separate visible credit-cost confirmation. The confirmation or **Continue** action starts the server run after Studio returns the paid session; there is no second ready-to-play confirmation and no browser-asserted score submission.
 
 Consent issuance and the initial paid start use the same saved request, including its session metadata. Omitting or changing that metadata causes the SDK to reject the start as `attempt_mismatch`. **Continue** first recovers the original SDK-persisted attempt with its existing idempotency key. If scoped game authorization has expired, this explicit action reconnects and checks that the wallet still owns the saved play.
 

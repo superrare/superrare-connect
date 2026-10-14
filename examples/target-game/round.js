@@ -1,4 +1,7 @@
-const ROUND_SECONDS = 10;
+import { applyInput, parseSavedRound, targetSnapshotSchema, targetStateSchema } from './target-engine.js';
+
+const TICK_MILLISECONDS = 50;
+const MAX_PENDING_INPUTS = 32;
 const STORAGE_PREFIX = 'superrare-target-game-round:';
 
 function element(tag, text, className) {
@@ -17,6 +20,12 @@ function newKey() {
 
 async function unusedReplacementKey(previousKey, credits) {
   const input = new TextEncoder().encode(`target-game-unused-renewal:v1:${previousKey}:${credits}`);
+  const bytes = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', input));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function serverRunKey(paidKey) {
+  const input = new TextEncoder().encode(`target-game-server-run:v1:${paidKey}`);
   const bytes = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', input));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
@@ -50,8 +59,9 @@ function recoveryMessage(error) {
 }
 
 export class PaidRound {
-  constructor({ game, root, getBalance, storageKey = 'target-game' }) {
+  constructor({ game, scoringGame, root, getBalance, storageKey = 'target-game' }) {
     this.game = game;
+    this.scoringGame = scoringGame;
     this.root = root;
     this.getBalance = getBalance;
     this.baseStorageKey = storageKey;
@@ -64,6 +74,15 @@ export class PaidRound {
     this.arenaMessage = null;
     this.target = null;
     this.scoreNode = null;
+    this.topScoreNode = null;
+    this.socket = null;
+    this.runConnecting = false;
+    this.completing = false;
+    this.connectTimer = null;
+    this.predictedView = null;
+    this.lastPacketAt = 0;
+    this.lastSentTick = -1;
+    this.receivedSnapshot = false;
   }
 
   render() {
@@ -73,7 +92,9 @@ export class PaidRound {
     this.statusNode.setAttribute('role', 'status');
     this.root.append(this.statusNode);
     this.scoreNode = element('p', 'Score: 0', 'game-score');
-    this.root.append(element('p', 'This demo records client-asserted scores; results are not independently verified.'));
+    this.root.append(element('p', 'The platform runs this game’s bundled server verifier. Inputs are sent to the server; only its recorded result is a verified score.'));
+    this.topScoreNode = element('p', 'Server-verified top score: loading…');
+    this.root.append(this.topScoreNode);
     this.arena = element('div', undefined, 'arena');
     this.arena.setAttribute('aria-label', 'Target game arena');
     this.arenaMessage = element('p', 'Start a round to play.', 'arena-message');
@@ -89,6 +110,7 @@ export class PaidRound {
     this.actionNode = element('div', undefined, 'game-actions');
     this.root.append(this.actionNode);
     void this.refresh();
+    void this.refreshTopScore();
     return this;
   }
 
@@ -114,9 +136,7 @@ export class PaidRound {
     try {
       const raw = localStorage.getItem(this.storageKey);
       if (!raw) return null;
-      const value = JSON.parse(raw);
-      if (!value || value.version !== 1 || typeof value.key !== 'string' || typeof value.phase !== 'string') return null;
-      return value;
+      return parseSavedRound(JSON.parse(raw));
     } catch (error) {
       throw new Error(`Could not read this account's saved round: ${errorMessage(error)}`);
     }
@@ -136,12 +156,12 @@ export class PaidRound {
 
   async refresh() {
     if (!this.actionNode) return;
-    if (this.timer !== null) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    this.clearActions();
     const key = this.accountStorageKey();
+    if (key === this.storageKey && (this.socket || this.runConnecting || this.completing)) return;
+    this.disconnectRun();
+    this.clearActions();
+    this.target.hidden = true;
+    this.arenaMessage.hidden = false;
     if (!key) {
       this.storageKey = null;
       this.state = null;
@@ -163,42 +183,24 @@ export class PaidRound {
       this.button('Continue', () => void this.recover());
       return;
     }
-    if (!this.state || this.state.phase === 'terminal' || this.state.phase === 'completed') {
-      this.state = this.state?.phase === 'terminal' || this.state?.phase === 'completed' ? this.state : null;
-      this.scoreNode.textContent = `Score: ${Number(this.state?.score) || 0}`;
-      this.arenaMessage.textContent = this.state?.phase === 'completed'
-        ? 'Round complete. Start another round when ready.'
-        : this.state?.phase === 'terminal'
-          ? `${this.state.diagnostic ?? 'This round is terminal.'} No replay or automatic refund.`
-          : 'Start a round to play.';
-      this.announce(this.state?.phase === 'completed'
-        ? 'Round complete. Start another round when ready.'
-        : this.state?.phase === 'terminal'
-          ? `${this.state.diagnostic ?? 'A previous round is terminal.'} Any credits already used remain charged; no refund is assumed. You may explicitly start a new round.`
-          : 'Ready for a paid round.');
+    if (this.state?.version === 1 && ['playing', 'submitting'].includes(this.state.phase)) {
+      this.markExpired('This older round used client scoring and cannot become server-verified. Its records are preserved.');
+      return;
+    }
+    if (!this.state || ['terminal', 'completed'].includes(this.state.phase)) {
+      this.scoreNode.textContent = this.state?.result
+        ? `Verified score: ${this.state.result.score}`
+        : this.state?.phase === 'completed' ? `Previous client-asserted score: ${this.state.score ?? 0}` : 'Score: 0';
+      this.arenaMessage.textContent = this.state?.phase === 'terminal'
+        ? this.state.diagnostic : 'Start a server-validated round to play.';
+      this.announce(this.state?.phase === 'terminal'
+        ? `${this.state.diagnostic} Any credits already used remain charged.`
+        : 'Ready for a server-validated paid round.');
       this.button('Play', () => void this.prepareRound());
       return;
     }
-    this.scoreNode.textContent = `Score: ${Number(this.state.score) || 0}`;
-    if (this.state.phase === 'ready' && this.state.session) {
-      if (Date.parse(this.state.session.expiresAt) <= Date.now()) {
-        this.markExpired();
-        return;
-      }
-      this.announce('Your paid round is ready. Continue to play this same round.');
-      this.button('Continue', () => this.beginPlay());
-      return;
-    }
-    if (this.state.phase === 'playing') {
-      if (Date.now() >= this.state.deadline || Date.parse(this.state.session?.expiresAt ?? '') <= Date.now()) {
-        if (Date.parse(this.state.session?.expiresAt ?? '') <= Date.now()) this.markExpired();
-        else void this.finishRound();
-        return;
-      }
-      this.announce('Round in progress. Continue the same paid round.');
-      this.button('Continue', () => this.resumePlay());
-      return;
-    }
+    this.scoreNode.textContent = `Score: ${this.state.run?.view?.score ?? 0}`;
+    this.arenaMessage.textContent = 'Continue reconnects this same paid round; its server clock does not restart.';
     this.announce(`Continue starts or recovers your ${this.state.request.expectedCredits}-credit play.`);
     this.button('Continue', () => void this.recover());
   }
@@ -207,7 +209,9 @@ export class PaidRound {
     this.clearActions();
     this.announce('Checking game terms and available credits…');
     try {
-      const [terms, balance] = await Promise.all([this.game.getTerms(), this.getBalance()]);
+      const [terms, balance, event] = await Promise.all([
+        this.game.getTerms(), this.getBalance(), this.scoringGame.getActiveScoringEvent(),
+      ]);
       if (!terms || !balance) throw new Error('Could not read the game terms or credit balance.');
       if (balance.available < terms.credits) {
         this.announce(`Not enough credits for ${terms.title}. Buy credits in the Connect panel, then try again.`);
@@ -219,7 +223,7 @@ export class PaidRound {
       description.className = 'game-confirmation';
       const confirm = element('button', `Confirm and play (${terms.credits} credit${terms.credits === 1 ? '' : 's'})`);
       confirm.type = 'button';
-      confirm.addEventListener('click', () => void this.confirmRound(terms));
+      confirm.addEventListener('click', () => void this.confirmRound(terms, undefined, event.eventId));
       const cancel = element('button', 'Cancel');
       cancel.type = 'button';
       cancel.addEventListener('click', () => {
@@ -235,16 +239,31 @@ export class PaidRound {
     }
   }
 
-  async confirmRound(terms, replacementKey) {
+  async confirmRound(terms, replacementKey, eventId) {
     if (!this.storageKey) return;
     this.clearActions();
+    const accountKey = this.storageKey;
     const key = replacementKey ?? newKey();
+    let run;
+    try {
+      const activeEvent = eventId ?? (await this.scoringGame.getActiveScoringEvent()).eventId;
+      run = {
+        eventId: activeEvent, key: await serverRunKey(key),
+        serverTick: -1, inputSeq: 0, inputTick: -1, pendingInputs: [],
+      };
+    } catch (error) {
+      this.announce(`Could not prepare the server-validated game: ${errorMessage(error)} No credits were used.`);
+      this.button('Play', () => void this.prepareRound());
+      return;
+    }
+    if (this.storageKey !== accountKey || this.accountStorageKey() !== accountKey) return;
     this.state = {
-      version: 1,
+      version: 2,
       key,
       phase: 'pending',
       score: 0,
       createdAt: Date.now(),
+      run,
       request: {
         idempotencyKey: key,
         fingerprint: `target-game:${key}`,
@@ -253,7 +272,7 @@ export class PaidRound {
       },
       terms: { title: terms.title, credits: terms.credits },
     };
-    const accountKey = this.storageKey;
+    // Both the paid-start key and server-run key are durable before either POST.
     const attempt = this.state;
     try {
       this.save();
@@ -277,7 +296,7 @@ export class PaidRound {
       const session = await this.game.startWithConsent({ ...attempt.request, consent });
       if (this.storageKey !== accountKey || this.state !== attempt) return;
       this.acceptSession(session);
-      this.beginPlay();
+      await this.beginPlay();
     } catch (error) {
       if (this.storageKey !== accountKey || this.state !== attempt) return;
       await this.handleAttemptError(error);
@@ -287,12 +306,8 @@ export class PaidRound {
   acceptSession(session) {
     this.state.session = session.session;
     this.state.game = session.game;
-    this.state.leaderboard = session.defaultLeaderboard;
     this.state.phase = 'ready';
     this.save();
-    this.announce('Paid round ready. Continue starts your 10-second target game.');
-    this.clearActions();
-    this.button('Continue', () => this.beginPlay());
   }
 
   async handleAttemptError(error) {
@@ -365,10 +380,15 @@ export class PaidRound {
           'Switch back to the wallet that owns this saved play, then continue.');
         return;
       }
+      if (previous.session) {
+        if (previous.result) await this.submitAndComplete();
+        else await this.beginPlay();
+        return;
+      }
       const session = await this.game.recoverStart({ idempotencyKey: previous.key });
       if (this.storageKey !== accountKey || this.state !== previous) return;
       this.acceptSession(session);
-      this.beginPlay();
+      await this.beginPlay();
     } catch (error) {
       if (this.storageKey !== accountKey || this.state !== previous) return;
       if (error?.status === 410) {
@@ -380,8 +400,7 @@ export class PaidRound {
   }
 
   markExpired(diagnostic = 'The saved PlaySession has expired.') {
-    if (this.timer !== null) clearInterval(this.timer);
-    this.timer = null;
+    this.disconnectRun();
     try {
       localStorage.setItem(`${this.storageKey}:diagnostic:${this.state.key}`, JSON.stringify({
         key: this.state.key,
@@ -402,119 +421,274 @@ export class PaidRound {
     this.button('Play', () => void this.prepareRound());
   }
 
-  beginPlay() {
-    if (!this.state?.session || !this.storageKey) return;
-    if (Date.parse(this.state.session.expiresAt) <= Date.now()) {
-      this.markExpired();
+  disconnectRun() {
+    if (this.timer !== null) clearInterval(this.timer);
+    if (this.connectTimer !== null) clearTimeout(this.connectTimer);
+    this.timer = null;
+    this.connectTimer = null;
+    this.runConnecting = false;
+    this.receivedSnapshot = false;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) socket.close();
+  }
+
+  async beginPlay() {
+    if (!this.state?.session || !this.storageKey || this.runConnecting || this.socket) return;
+    const attempt = this.state;
+    const accountKey = this.storageKey;
+    this.runConnecting = true;
+    this.clearActions();
+    this.announce('Connecting to the platform’s server-validated game…');
+    try {
+      if (!attempt.run) {
+        const { eventId } = await this.scoringGame.getActiveScoringEvent();
+        const key = await serverRunKey(attempt.key);
+        if (this.state !== attempt || this.storageKey !== accountKey) return;
+        attempt.version = 2;
+        attempt.run = { eventId, key, serverTick: -1, inputSeq: 0, inputTick: -1, pendingInputs: [] };
+      }
+      attempt.phase = 'run_pending';
+      this.save();
+      const response = await this.scoringGame.startServerValidatedRun({
+        sessionToken: attempt.session.token,
+        eventId: attempt.run.eventId,
+        idempotencyKey: attempt.run.key,
+      });
+      if (this.state !== attempt || this.storageKey !== accountKey) return;
+      const run = response.run;
+      if (run.eventId !== attempt.run.eventId || run.engine !== 'custom' || run.engineVersion !== 'custom-v1'
+        || (attempt.run.runId && run.runId !== attempt.run.runId)
+        || (attempt.run.configDigest && run.configDigest !== attempt.run.configDigest)) {
+        throw new Error('The platform returned a different run or verifier for this paid play.');
+      }
+      const initialView = targetStateSchema.parse(run.state);
+      const socketUrl = new URL(run.webSocketUrl);
+      const expectedProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      if (socketUrl.protocol !== expectedProtocol || socketUrl.host !== location.host
+        || socketUrl.pathname !== `/api/v1/server-game-runs/${run.runId}/connect`) {
+        throw new Error('The platform game socket must belong to this hosted game origin.');
+      }
+      attempt.run = {
+        ...attempt.run, runId: run.runId, configDigest: run.configDigest,
+        startedAt: run.startedAt, expiresAt: run.expiresAt, view: initialView,
+        pendingInputs: attempt.run.pendingInputs.map((input) => ({ ...input, sent: false })),
+      };
+      attempt.phase = 'connecting';
+      this.save();
+      this.predictedView = initialView;
+      this.lastSentTick = -1;
+      this.receivedSnapshot = false;
+      const socket = new WebSocket(socketUrl);
+      this.socket = socket;
+      const ownsSocket = () => this.socket === socket && this.state === attempt && this.storageKey === accountKey;
+      this.connectTimer = setTimeout(() => {
+        if (ownsSocket()) this.showRunError(new Error('The platform game socket did not return its initial state.'));
+      }, 12000);
+      socket.addEventListener('message', (event) => {
+        if (!ownsSocket()) return;
+        try {
+          this.acceptSnapshot(targetSnapshotSchema.parse(JSON.parse(event.data)));
+        } catch (error) {
+          this.showRunError(error);
+        }
+      });
+      socket.addEventListener('error', () => {
+        if (ownsSocket()) this.showRunError(new Error('The platform game socket could not connect.'));
+      });
+      socket.addEventListener('close', () => {
+        if (ownsSocket() && !attempt.result) this.showRunError(new Error('The platform game socket was interrupted.'));
+      });
+      this.timer = setInterval(() => {
+        if (ownsSocket() && this.receivedSnapshot && !attempt.result) {
+          this.flushInputs();
+          this.renderRun();
+        }
+      }, 25);
+    } catch (error) {
+      if (this.state !== attempt || this.storageKey !== accountKey) return;
+      this.runConnecting = false;
+      if (error?.status === 410 || error?.code === 'RUN_EXPIRED') this.markExpired('The platform reports this paid run has expired.');
+      else this.showRunError(error);
+    }
+  }
+
+  estimatedServerTick() {
+    return Math.max(0, this.state.run.serverTick) + Math.floor((performance.now() - this.lastPacketAt) / TICK_MILLISECONDS);
+  }
+
+  acceptSnapshot(packet) {
+    if ('error' in packet) {
+      if (['INPUT_RATE_LIMITED', 'RUN_CATCHING_UP', 'INPUT_OUT_OF_ORDER'].includes(packet.error)) {
+        this.state.run.pendingInputs = this.state.run.pendingInputs.map((input) => ({ ...input, sent: false }));
+        this.lastSentTick = Math.max(this.state.run.inputTick, packet.serverTick ?? this.estimatedServerTick());
+        this.save();
+        return;
+      }
+      if (packet.error === 'RUN_FINISHED') {
+        this.target.hidden = true;
+        this.announce('Waiting for the platform’s recorded result…');
+        return;
+      }
+      throw new Error(`Platform game: ${packet.error}`);
+    }
+    const run = this.state.run;
+    if (packet.runId !== run.runId || packet.configDigest !== run.configDigest) {
+      throw new Error('The platform snapshot belongs to a different run or verifier.');
+    }
+    if (packet.serverTick < run.serverTick || packet.inputSeq < run.inputSeq) return;
+    if (packet.result?.runId && packet.result.runId !== run.runId) {
+      throw new Error('The platform result belongs to a different run.');
+    }
+    this.receivedSnapshot = true;
+    this.runConnecting = false;
+    clearTimeout(this.connectTimer);
+    this.connectTimer = null;
+    this.lastPacketAt = performance.now();
+    this.state.run = {
+      ...run, view: packet.state, serverTick: packet.serverTick,
+      inputSeq: packet.inputSeq, inputTick: packet.inputTick,
+      pendingInputs: run.pendingInputs.filter((input) => input.seq > packet.inputSeq),
+    };
+    if (packet.result?.status === 'expired') {
+      this.markExpired('The platform reports this paid run has expired.');
       return;
     }
-    this.state.phase = 'playing';
-    this.state.deadline = Date.now() + ROUND_SECONDS * 1000;
-    this.state.score = 0;
-    try { this.save(); } catch (error) {
-      this.state.phase = 'ready';
-      this.announce(`Cannot safely save this round: ${errorMessage(error)}`);
+    if (packet.result && 'score' in packet.result) {
+      this.state.result = packet.result;
+      this.state.score = packet.result.score;
+      this.state.phase = 'finalizing';
+      this.save();
+      this.disconnectRun();
+      this.target.hidden = true;
+      this.arenaMessage.hidden = false;
+      this.arenaMessage.textContent = `Server-verified score: ${packet.result.score}. Completing this paid round…`;
+      void this.submitAndComplete();
       return;
     }
-    this.resumePlay();
+    this.state.phase = packet.state.gameOver ? 'finalizing' : 'playing';
+    this.save();
+    if (!packet.state.started && !packet.state.gameOver
+      && !this.state.run.pendingInputs.some(({ input }) => input.action === 'start')) {
+      this.queueInput({ action: 'start' });
+    } else {
+      this.reconcilePrediction();
+      this.flushInputs();
+      this.renderRun();
+    }
+  }
+
+  reconcilePrediction() {
+    let predicted = this.state.run.view;
+    for (const pending of this.state.run.pendingInputs) {
+      predicted = applyInput(predicted, pending.input, Math.max(predicted.tick, this.state.run.serverTick));
+    }
+    this.predictedView = predicted;
+  }
+
+  queueInput(input) {
+    if (!this.receivedSnapshot || !this.socket || this.state.run.pendingInputs.length >= MAX_PENDING_INPUTS) return;
+    const run = this.state.run;
+    const last = run.pendingInputs.at(-1);
+    const seq = (last?.seq ?? run.inputSeq) + 1;
+    this.state.run.pendingInputs = [...run.pendingInputs, { seq, input, sent: false }];
+    this.save();
+    this.reconcilePrediction();
+    this.flushInputs();
+    this.renderRun();
+  }
+
+  flushInputs() {
+    if (this.socket?.readyState !== WebSocket.OPEN || !this.receivedSnapshot || this.state.result) return;
+    const tick = this.estimatedServerTick();
+    if (tick <= Math.max(this.lastSentTick, this.state.run.inputTick)) return;
+    const next = this.state.run.pendingInputs.find((input) => !input.sent);
+    if (!next) return;
+    try {
+      this.socket.send(JSON.stringify({ type: 'input', seq: next.seq, input: next.input }));
+      this.state.run.pendingInputs = this.state.run.pendingInputs.map((input) => input.seq === next.seq ? { ...input, sent: true } : input);
+      this.lastSentTick = tick;
+    } catch (error) {
+      this.showRunError(error);
+    }
   }
 
   hitTarget() {
-    if (!this.state || this.state.phase !== 'playing' || Date.now() >= this.state.deadline) return;
-    this.state.score += 1;
-    this.scoreNode.textContent = `Score: ${this.state.score}`;
+    if (this.state?.phase !== 'playing' || !this.predictedView?.started || this.predictedView.gameOver) return;
     try {
-      this.save();
-      const maxX = Math.max(0, this.arena.clientWidth - this.target.offsetWidth);
-      const maxY = Math.max(0, this.arena.clientHeight - this.target.offsetHeight);
-      this.target.style.left = `${Math.random() * maxX}px`;
-      this.target.style.top = `${Math.random() * maxY}px`;
-    } catch (error) { this.announce(`Could not save score: ${errorMessage(error)}`); }
+      this.queueInput({ action: 'hit', targetId: this.predictedView.target.id });
+    } catch (error) {
+      this.showRunError(error);
+    }
   }
 
-  resumePlay() {
-    if (!this.state || this.state.phase !== 'playing') return;
-    this.clearActions();
-    this.arenaMessage.hidden = true;
-    this.target.hidden = false;
+  renderRun() {
+    const view = this.predictedView;
+    if (!view) return;
+    const remainingTicks = view.startTick === null ? view.rules.roundTicks
+      : Math.max(0, view.rules.roundTicks - (this.estimatedServerTick() - view.startTick));
+    this.target.hidden = !view.started || view.gameOver || remainingTicks <= 0;
+    this.target.disabled = this.state.run.pendingInputs.length >= MAX_PENDING_INPUTS;
+    this.arenaMessage.hidden = !this.target.hidden;
+    this.arenaMessage.textContent = view.gameOver || remainingTicks <= 0
+      ? 'Waiting for the platform’s recorded result…' : 'Starting your server-validated round…';
     const maxX = Math.max(0, this.arena.clientWidth - this.target.offsetWidth);
     const maxY = Math.max(0, this.arena.clientHeight - this.target.offsetHeight);
-    this.target.style.left = `${Math.random() * maxX}px`;
-    this.target.style.top = `${Math.random() * maxY}px`;
-    const tick = () => {
-      const remaining = Math.max(0, this.state.deadline - Date.now());
-      this.announce(`Time left: ${(remaining / 1000).toFixed(1)}s`);
-      if (remaining <= 0) void this.finishRound();
-    };
-    tick();
-    if (this.timer === null) this.timer = setInterval(tick, 100);
+    this.target.style.left = `${view.target.x * maxX}px`;
+    this.target.style.top = `${view.target.y * maxY}px`;
+    this.scoreNode.textContent = `Score: ${view.score}${this.state.run.pendingInputs.length ? ' (pending server confirmation)' : ''}`;
+    this.announce(view.gameOver || remainingTicks <= 0
+      ? 'Waiting for the platform’s recorded result…'
+      : `Time left: ${(remainingTicks * TICK_MILLISECONDS / 1000).toFixed(1)}s`);
+    this.clearActions();
   }
 
-  async finishRound() {
-    if (!this.state || !this.state.session || !this.storageKey || ['submitting', 'completed', 'terminal'].includes(this.state.phase)) return;
-    if (this.timer !== null) clearInterval(this.timer);
+  showRunError(error) {
+    this.disconnectRun();
     this.target.hidden = true;
     this.arenaMessage.hidden = false;
-    this.arenaMessage.textContent = 'Round ended. Your score is being recorded.';
-    this.timer = null;
-    this.state.phase = 'submitting';
-    this.state.scoreKey = `${this.state.key}:score`;
-    try { this.save(); } catch (error) {
-      this.announce(`Round ended, but its result could not be saved: ${errorMessage(error)}`);
-      return;
-    }
-    this.clearActions();
-    this.announce('Submitting your client-asserted score and completing this round…');
-    await this.submitAndComplete();
+    this.arenaMessage.textContent = 'Continue reconnects this same paid round; its server clock does not restart.';
+    this.showRecoveryError(error, 'Game connection interrupted. Continue recovers this same paid round without using another credit.');
   }
 
   async submitAndComplete() {
-    const { session } = this.state;
+    if (!this.state?.result || this.completing) return;
+    const attempt = this.state;
+    const accountKey = this.storageKey;
+    this.completing = true;
+    this.clearActions();
+    this.target.hidden = true;
+    this.announce(`The platform recorded verified score ${attempt.result.score}. Completing this round…`);
     try {
-      if (!this.state.scoreSubmitted) {
-        await this.game.submitClientAssertedScore({
-          sessionToken: session.token,
-          leaderboardKey: this.state.leaderboard?.key ?? 'default',
-          score: this.state.score,
-          idempotencyKey: this.state.scoreKey,
-          metadata: { trustLevel: 'client_asserted', example: 'target-game' },
-        });
-        this.state.scoreSubmitted = true;
-        this.save();
+      this.save();
+      if (!attempt.completed) {
+        await this.game.complete({ sessionId: attempt.session.id, sessionToken: attempt.session.token });
+        if (this.state !== attempt || this.storageKey !== accountKey) return;
+        attempt.completed = true;
       }
-      if (!this.state.completed) {
-        await this.game.complete({ sessionId: session.id, sessionToken: session.token });
-        this.state.completed = true;
-        this.state.phase = 'completed';
-        this.save();
-      }
-      this.arenaMessage.textContent = `Round complete. Score ${this.state.score} is client-asserted, not independently verified.`;
-      this.announce(`Round complete. Score ${this.state.score} is client-asserted, not independently verified. Start another round when ready.`);
-      this.clearActions();
+      attempt.phase = 'completed';
+      this.save();
+      this.scoreNode.textContent = `Verified score: ${attempt.result.score}`;
+      this.arenaMessage.hidden = false;
+      this.arenaMessage.textContent = `Round complete. Server-verified score: ${attempt.result.score}.`;
+      this.announce(`Round complete. Server-verified score: ${attempt.result.score}.`);
       this.button('Play', () => void this.prepareRound());
+      void this.refreshTopScore();
     } catch (error) {
-      if (error?.status === 410) {
-        this.markExpired(errorMessage(error));
-        return;
+      if (this.state === attempt && this.storageKey === accountKey) {
+        this.showRecoveryError(error, `The platform already recorded score ${attempt.result.score}. Continue only retries this round’s completion.`);
       }
-      this.announce(`Result not confirmed: ${errorMessage(error)} Continue retries this round's submission safely.`);
-      this.clearActions();
-      this.button('Continue', () => void this.recoverFinishedRound());
+    } finally {
+      this.completing = false;
     }
-
   }
 
-  async recoverFinishedRound() {
-    if (!this.state || !this.storageKey) return;
-    if (Date.parse(this.state.session?.expiresAt ?? '') <= Date.now()) {
-      this.markExpired();
-      return;
+  async refreshTopScore() {
+    try {
+      const score = await this.scoringGame.getServerTopScore();
+      this.topScoreNode.textContent = `Server-verified top score: ${score ?? '—'}`;
+    } catch (error) {
+      this.topScoreNode.textContent = `Server-verified top score unavailable: ${errorMessage(error)}`;
     }
-    this.state.phase = 'submitting';
-    try { this.save(); } catch (error) {
-      this.announce(`Could not save recovery state: ${errorMessage(error)}`);
-      return;
-    }
-    await this.submitAndComplete();
   }
 }

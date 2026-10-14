@@ -34,7 +34,7 @@
         <p id="hosted-connect-status" role="status" aria-live="polite">Hosted Connect flows are displayed here.</p>
         <div id="hosted-connect-frame" class="hosted-connect-frame"></div>
       </dialog>
-      <details class="developer"><summary>Integration details</summary><p id="configuration"></p><p>Scores are client-asserted and are not server-verified. This example demonstrates payment and paid-session integration only.</p></details>
+      <details class="developer"><summary>Integration details</summary><p id="configuration"></p><p>The ZIP includes a server-verifier.js worker. Studio’s Workers for Platforms runtime validates ordered inputs, advances server-owned time, and records the verifier’s final score. The browser never submits a claimed score.</p></details>
     </main>
     <script src="../../dist/superrare-connect.global.js"></script>
     <script type="module" src="./main.js"></script>

@@ -78,6 +78,7 @@ import {
 } from './popup-login-core.js';
 import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
 import {
+  parseActiveScoringEvent,
   parseClientScore,
   parseCreditBalance,
   parseGameSessionStart,
@@ -85,6 +86,7 @@ import {
   parseMyBest,
   parsePurchase,
   parseServerRun,
+  parseServerTopScore,
   requestStudioJson,
   type ClientAssertedScoreResult,
   type GameCreditBalance,
@@ -281,6 +283,10 @@ export type SuperRareGameClient = {
     sessionToken: string; leaderboardKey?: string; seasonKey?: string; score: number;
     idempotencyKey: string; secondaryValue?: number; metadata?: Record<string, unknown>;
   }) => Promise<ClientAssertedScoreResult>;
+  /** Discovers the active event pinned to the game's published deployment. */
+  getActiveScoringEvent: () => Promise<{ eventId: string }>;
+  /** Reads the highest completed authoritative run score, or null when no score exists. */
+  getServerTopScore: () => Promise<number | null>;
   startServerValidatedRun: (params: { sessionToken: string; eventId: string; idempotencyKey: string }) => Promise<ServerValidatedGameRun>;
   getLeaderboard: (params?: { leaderboardKey?: string; seasonKey?: string; limit?: number; cursor?: string }) => Promise<GameLeaderboard>;
   getMyBest: (params: { sessionToken: string; leaderboardKey?: string; seasonKey?: string }) => Promise<GameLeaderboardEntry | null>;
@@ -1550,6 +1556,14 @@ export function createSuperRareClient(
             authorization: `PlaySession ${params.sessionToken}`, idempotencyKey: params.idempotencyKey,
             body: { score: params.score, seasonKey: params.seasonKey, secondaryValue: params.secondaryValue,
               metadata: params.metadata, idempotencyKey: params.idempotencyKey }, }));
+        },
+        async getActiveScoringEvent(): Promise<{ eventId: string }> {
+          return parseActiveScoringEvent(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/scoring/active-event`, }));
+        },
+        async getServerTopScore(): Promise<number | null> {
+          return parseServerTopScore(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/scoring/top-score`, }));
         },
         async startServerValidatedRun(params): Promise<ServerValidatedGameRun> {
           return parseServerRun(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
