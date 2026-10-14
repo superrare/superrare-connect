@@ -231,7 +231,7 @@ export class PaidRound {
     this.announce(`Starting ${terms.title}…`);
     try {
       const { consent } = await this.game.requestConsent(this.state.request);
-      const session = await this.game.startWithConsent({ idempotencyKey: key, consent });
+      const session = await this.game.startWithConsent({ ...this.state.request, consent });
       this.acceptSession(session);
     } catch (error) {
       this.handleAttemptError(error, 'The start result is not known. Continue will recover this same paid play.');

@@ -81,6 +81,8 @@ Studio's authorization response must include the top-level ISO `issuedAt` timest
 
 Successful game authorization is distinct from balance and round recovery. A balance refresh failure does not undo authorization. The example does not start paid play automatically: each round has a separate explicit confirmation, and the saved round/idempotency key is reused for recovery. Scores are client-asserted and are not server-verified.
 
+Consent issuance and the initial paid start use the same saved request, including its session metadata. Omitting or changing that metadata causes the SDK to reject the start as `attempt_mismatch`. **Continue** recovers the original SDK-persisted attempt using its existing idempotency key; do not clear the pending round or replace its key to retry.
+
 Credit purchases use the real Studio quote and Ethereum-mainnet USDC transfer flow. The quote is saved before hosted checkout, but no transfer is submitted until the player explicitly confirms it in the hosted wallet. Cancellation, popup closure, a lost response, or an HTTP error does not prove payment did not occur; keep the same purchase, intent, and transaction hash and reconcile them before requesting another transfer. The example never clears an ambiguous purchase or starts a paid round automatically.
 
 ### Safe local smoke
