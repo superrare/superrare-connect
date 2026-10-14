@@ -83,6 +83,8 @@ export class PaidRound {
     this.lastPacketAt = 0;
     this.lastSentTick = -1;
     this.receivedSnapshot = false;
+    this.startingRound = false;
+    this.playActionGeneration = 0;
   }
 
   render() {
@@ -157,7 +159,7 @@ export class PaidRound {
   async refresh() {
     if (!this.actionNode) return;
     const key = this.accountStorageKey();
-    if (key === this.storageKey && (this.socket || this.runConnecting || this.completing)) return;
+    if (key === this.storageKey && (this.socket || this.runConnecting || this.completing || this.startingRound)) return;
     this.disconnectRun();
     this.clearActions();
     this.target.hidden = true;
@@ -196,7 +198,7 @@ export class PaidRound {
       this.announce(this.state?.phase === 'terminal'
         ? `${this.state.diagnostic} Any credits already used remain charged.`
         : 'Ready for a server-validated paid round.');
-      this.button('Play', () => void this.prepareRound());
+      await this.showPlayAction();
       return;
     }
     this.scoreNode.textContent = `Score: ${this.state.run?.view?.score ?? 0}`;
@@ -205,37 +207,61 @@ export class PaidRound {
     this.button('Continue', () => void this.recover());
   }
 
-  async prepareRound() {
+  async showPlayAction() {
+    const generation = ++this.playActionGeneration;
+    const accountKey = this.storageKey;
+    const previous = this.state;
     this.clearActions();
-    this.announce('Checking game terms and available credits…');
     try {
+      const [terms] = await Promise.all([this.game.getTerms(), this.scoringGame.getActiveScoringEvent()]);
+      if (generation !== this.playActionGeneration || this.storageKey !== accountKey || this.state !== previous) return;
+      this.button(`Play · ${terms.credits} credit${terms.credits === 1 ? '' : 's'}`, () => void this.prepareRound(terms.credits));
+    } catch (error) {
+      if (generation !== this.playActionGeneration || this.storageKey !== accountKey || this.state !== previous) return;
+      this.announce(`Could not load the game price: ${errorMessage(error)} No new play was started.`);
+      this.button('Retry', () => void this.showPlayAction());
+    }
+  }
+
+  async prepareRound(displayedCredits) {
+    if (this.startingRound || !Number.isSafeInteger(displayedCredits) || displayedCredits <= 0) return;
+    if (this.state && !['completed', 'terminal'].includes(this.state.phase)) {
+      await this.recover();
+      return;
+    }
+    this.startingRound = true;
+    this.playActionGeneration += 1;
+    const accountKey = this.storageKey;
+    const previous = this.state;
+    this.clearActions();
+    this.announce('Starting your game…');
+    try {
+      if (!this.game.getAuthorization()) await this.game.connect();
       const [terms, balance, event] = await Promise.all([
         this.game.getTerms(), this.getBalance(), this.scoringGame.getActiveScoringEvent(),
       ]);
+      if (this.storageKey !== accountKey || this.state !== previous || this.accountStorageKey() !== accountKey) return;
       if (!terms || !balance) throw new Error('Could not read the game terms or credit balance.');
-      if (balance.available < terms.credits) {
-        this.announce(`Not enough credits for ${terms.title}. Buy credits in the Connect panel, then try again.`);
-        this.button('Play', () => void this.prepareRound());
+      if (terms.credits !== displayedCredits) {
+        this.announce(`The price changed to ${terms.credits} credits. Click the updated Play button to approve that cost.`);
+        await this.showPlayAction();
         return;
       }
-      this.announce('Confirm one paid play. No credits are used until you confirm.');
-      const description = element('p', `${terms.title} — ${terms.credits} credit${terms.credits === 1 ? '' : 's'} for one round.`);
-      description.className = 'game-confirmation';
-      const confirm = element('button', `Confirm and play (${terms.credits} credit${terms.credits === 1 ? '' : 's'})`);
-      confirm.type = 'button';
-      confirm.addEventListener('click', () => void this.confirmRound(terms, undefined, event.eventId));
-      const cancel = element('button', 'Cancel');
-      cancel.type = 'button';
-      cancel.addEventListener('click', () => {
-        this.announce('No round started.');
-        this.clearActions();
-        this.button('Play', () => void this.prepareRound());
-      });
-      this.actionNode.replaceChildren(description, confirm, cancel);
+      if (balance.available < terms.credits) {
+        this.announce(`Not enough credits for ${terms.title}. Buy credits in the Connect panel, then try again.`);
+        await this.showPlayAction();
+        return;
+      }
+      await this.confirmRound(terms, undefined, event.eventId);
     } catch (error) {
-      this.announce(`Could not prepare a round: ${errorMessage(error)}`);
-      this.clearActions();
-      this.button('Play', () => void this.prepareRound());
+      if (this.storageKey !== accountKey) return;
+      if (this.state !== previous) this.showRecoveryError(error);
+      else {
+        this.announce(`Could not start a round: ${errorMessage(error)}`);
+        await this.showPlayAction();
+      }
+    } finally {
+      this.startingRound = false;
     }
   }
 
@@ -253,7 +279,7 @@ export class PaidRound {
       };
     } catch (error) {
       this.announce(`Could not prepare the server-validated game: ${errorMessage(error)} No credits were used.`);
-      this.button('Play', () => void this.prepareRound());
+      void this.showPlayAction();
       return;
     }
     if (this.storageKey !== accountKey || this.accountStorageKey() !== accountKey) return;
@@ -279,7 +305,7 @@ export class PaidRound {
     } catch (error) {
       this.state = null;
       this.announce(`Cannot safely start: ${errorMessage(error)}`);
-      this.button('Play', () => void this.prepareRound());
+      void this.showPlayAction();
       return;
     }
     this.announce(`Starting ${terms.title}…`);
@@ -353,8 +379,8 @@ export class PaidRound {
       const terms = await this.game.getTerms();
       if (this.storageKey !== accountKey || this.state !== previous) return;
       if (terms.credits !== previous.request.expectedCredits) {
-        this.announce(`The price changed to ${terms.credits} credits. Confirm the new price to play.`);
-        this.button(`Confirm and play (${terms.credits} credits)`, () => void this.confirmRound(terms));
+        this.announce(`The price changed to ${terms.credits} credits. Click Play to approve the new cost.`);
+        this.button(`Play · ${terms.credits} credit${terms.credits === 1 ? '' : 's'}`, () => void this.prepareRound(terms.credits));
         this.button('Cancel', () => void this.refresh());
         return;
       }
@@ -418,7 +444,7 @@ export class PaidRound {
     try { this.save(); } catch { /* Do not imply a refund or create another start automatically. */ }
     this.announce(`${diagnostic} Any credits already used remain charged; no refund is initiated, and this old round cannot be replayed. You may explicitly start a new round.`);
     this.clearActions();
-    this.button('Play', () => void this.prepareRound());
+    void this.showPlayAction();
   }
 
   disconnectRun() {
@@ -672,7 +698,7 @@ export class PaidRound {
       this.arenaMessage.hidden = false;
       this.arenaMessage.textContent = `Round complete. Server-verified score: ${attempt.result.score}.`;
       this.announce(`Round complete. Server-verified score: ${attempt.result.score}.`);
-      this.button('Play', () => void this.prepareRound());
+      await this.showPlayAction();
       void this.refreshTopScore();
     } catch (error) {
       if (this.state === attempt && this.storageKey === accountKey) {

@@ -26,7 +26,7 @@ export function deriveConnectSessionView(state, session, now = Date.now()) {
         action: 'none',
         disabled: true,
         buttonLabel: 'Signed in to SuperRare',
-        status: 'Signed in to SuperRare. Authorize this Studio game separately to load credits.',
+        status: 'Signed in to SuperRare.',
       };
     }
     return {
@@ -43,7 +43,7 @@ export function deriveConnectSessionView(state, session, now = Date.now()) {
     action: 'login',
     disabled: false,
     buttonLabel: 'Sign in to SuperRare',
-    status: 'Sign in to SuperRare, then authorize this game separately to load credits.',
+    status: 'Sign in to SuperRare to connect this game and load your credits.',
   };
 }
 

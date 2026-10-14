@@ -101,11 +101,11 @@ Server validation prevents a player from choosing a final numeric score. It is n
 
 ### Flow and safety
 
-The page restores and verifies the saved Connect session. **Sign in to SuperRare** opens hosted Connect using the selected transport. **Authorize game** calls `game.connect()` directly against the Studio API with the current Connect session and the browser origin; it does not open a Studio authorization popup. When signed out, authorization shows a sign-in-required state without a request; HTTP 401 exposes a retryable Connect session check or sign-in action without deleting credentials or pending game/purchase records.
+The page restores and verifies the saved Connect session. **Sign in to SuperRare** opens hosted Connect using the selected transport; successful sign-in then calls `game.connect()` automatically and loads credits and saved round state. A successfully verified restored session also connects the game. Authorization remains an API exchange with current Connect access and the actual browser origin, never a Studio popup. The authorization button is hidden on the normal signed-out/connected path and offered only as a retry when needed. Failed authorization does not pretend success or discard the successful Connect session, credentials, or pending records.
 
 Studio's authorization response must include the top-level ISO `issuedAt` timestamp. The SDK measures the maximum 15-minute authorization lifetime from that server-issued timestamp, not the browser's clock; local expiry, session-expiry, wallet, app/group, and origin checks still apply. Deploy the Studio producer change before rebuilding/uploading this SDK example. Existing saved game authorization and pending purchase/round records need no migration or clearing.
 
-Successful game authorization is distinct from balance and round recovery. A balance refresh failure does not undo authorization. Each new round has a separate visible credit-cost confirmation. The confirmation or **Continue** action starts the server run after Studio returns the paid session; there is no second ready-to-play confirmation and no browser-asserted score submission.
+Successful game authorization is distinct from balance and round recovery. A balance refresh failure does not undo authorization. **Play · N credits** shows the authoritative cost before any financial request. Its single click approves and starts one paid server-validated round—there is no second confirmation screen. Terms and the active event are rechecked before starting; if the price changed, no credits are used until the player clicks the newly priced button. Rapid repeated clicks are blocked while that start is in flight. **Continue** still recovers the same pending paid round and never resets the server clock.
 
 Consent issuance and the initial paid start use the same saved request, including its session metadata. Omitting or changing that metadata causes the SDK to reject the start as `attempt_mismatch`. **Continue** first recovers the original SDK-persisted attempt with its existing idempotency key. If scoped game authorization has expired, this explicit action reconnects and checks that the wallet still owns the saved play.
 
@@ -118,9 +118,9 @@ Credit purchases use the real Studio quote and Ethereum-mainnet USDC transfer fl
 ### Safe local smoke
 
 1. Open the page with your own approved app, group, service URLs, origin, and explicit transport.
-2. In a signed-out session, click **Authorize game** once. It should stay on the page, report that Connect sign-in is required, and open no Studio authorization window.
-3. Sign in only through the hosted Connect control when authorized to do so. Do not use another person's browser/session or perform identity-provider, OTP, or wallet approval on their behalf.
-4. After legitimate sign-in, use **Authorize game** to request the real scoped authorization. Stop before purchase confirmation or paid play unless the owner explicitly authorizes that boundary.
+2. In a signed-out session, only the Connect sign-in action should be offered; no game authorization or paid start is issued.
+3. Sign in only through hosted Connect when authorized to do so. Do not use another person's browser/session or perform identity-provider, OTP, or wallet approval on their behalf.
+4. Successful sign-in should connect the game and load credits automatically. Stop before **Play · N credits** or purchase approval unless the owner authorizes that financial boundary. A connection failure offers a retry without another sign-in or a paid start.
 5. If the result is ambiguous, keep the same saved purchase and round records; do not clear storage or create a duplicate transfer/play attempt.
 
 The server binds only to `127.0.0.1`, serves an explicit file allowlist, and does not expose the repository filesystem. Stop only the server you started. Do not deploy, merge, publish, release, grant credits, submit a payment, or start a paid round as part of this local smoke.

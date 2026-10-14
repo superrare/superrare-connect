@@ -114,6 +114,8 @@ if (!configuration) {
     signInButton.textContent = view.buttonLabel;
     signInButton.disabled = busy || view.disabled;
     signInStatus.textContent = connectMessage ?? view.status;
+    connectButton.hidden = connectState === 'signed_out' || connectState === 'checking'
+      || Boolean(game.getAuthorization());
   };
 
   const setConnectState = (state, session, message) => {
@@ -168,6 +170,7 @@ if (!configuration) {
         return;
       }
       setConnectState('authenticated', verifiedSession);
+      if (!busy) await authorizeGame();
     } catch (error) {
       if (generation !== connectCheckGeneration) return;
       setConnectState(
@@ -182,6 +185,7 @@ if (!configuration) {
     connectCheckGeneration += 1;
     if (session) {
       setConnectState('authenticated', session);
+      if (!busy) void authorizeGame();
     } else {
       setConnectState('signed_out', undefined);
     }
@@ -194,7 +198,8 @@ if (!configuration) {
 
   const updateGameAuthorizationButton = () => {
     const authorization = game.getAuthorization();
-    connectButton.textContent = authorization ? 'Game authorized' : 'Authorize game';
+    connectButton.textContent = authorization ? 'Game authorized' : 'Retry game authorization';
+    connectButton.hidden = Boolean(authorization) || connectState === 'signed_out' || connectState === 'checking';
     connectButton.disabled = busy || Boolean(authorization);
     return authorization;
   };
@@ -213,7 +218,7 @@ if (!configuration) {
     } else if (authorization) {
       connectionStatus.textContent = 'A valid authorization is saved for this Studio app, credit group, and game origin.';
     } else {
-      connectionStatus.textContent = 'Studio game authorization is separate from Connect sign-in. Authorize this game to load credits.';
+      connectionStatus.textContent = 'Sign in to SuperRare to connect this game and load credits.';
     }
     if (authorization) {
       const expiresAt = Date.parse(authorization.expiresAt);
@@ -284,6 +289,7 @@ if (!configuration) {
       hostedSurface.close();
       if (result.status === 'authenticated') {
         setConnectState('authenticated', result.session);
+        await authorizeGame();
       } else if (result.status === 'expired') {
         setConnectState(
           'signed_out',
@@ -315,60 +321,59 @@ if (!configuration) {
     hostedSurface.close();
     hostedStatus.textContent = 'Embedded flow closed. If checkout may have reached a wallet, continue the same saved purchase to reconcile it before trying again.';
   });
-  connectButton.addEventListener('click', async () => {
-    if (busy || game.getAuthorization()) return;
+  const authorizeGame = async () => {
+    const previousBusy = busy;
     busy = true;
     updateGameAuthorizationButton();
     renderConnectState();
-    connectionStatus.textContent = 'Requesting scoped game authorization from Studio…';
+    connectionStatus.textContent = 'Connecting this game and loading your credits…';
     try {
-      await game.connect();
-    } catch (error) {
-      const failure = describeSdkFailure(error);
-      const session = client.auth.getSession();
-      const isUnauthorized = typeof error === 'object'
-        && error !== null
-        && 'status' in error
-        && error.status === 401;
-      const message = failure === 'ConnectSessionRequiredError'
-        ? session
-          ? 'The SDK reports no usable Connect session. Retry the Connect session check; stored credentials and pending game state were preserved.'
-          : 'Connect sign-in is required. Sign in before authorizing this game; pending game state was preserved.'
-        : isUnauthorized
+      try {
+        await game.connect();
+      } catch (error) {
+        const failure = describeSdkFailure(error);
+        const session = client.auth.getSession();
+        const isUnauthorized = typeof error === 'object'
+          && error !== null
+          && 'status' in error
+          && error.status === 401;
+        const message = failure === 'ConnectSessionRequiredError'
           ? session
-            ? 'Studio rejected the saved Connect session (HTTP 401). Retry the Connect session check; stored credentials and pending game state were preserved.'
-            : 'Studio requires a Connect session (HTTP 401). Sign in before authorizing this game; pending game state was preserved.'
-          : failure === 'cancelled'
-            ? 'Studio game authorization was cancelled. Retry when ready; no play or payment was started.'
-            : `Studio did not issue game authorization (${failure}). Retry explicitly; no play or payment was started.`;
-      if (failure === 'ConnectSessionRequiredError' || isUnauthorized) {
-        if (session) {
-          setConnectState('verification_failed', session, message);
-        } else {
-          setConnectState('signed_out', undefined, message);
+            ? 'The SDK reports no usable Connect session. Retry the Connect session check; stored credentials and pending game state were preserved.'
+            : 'Connect sign-in is required. Sign in to connect this game; pending game state was preserved.'
+          : isUnauthorized
+            ? session
+              ? 'Studio rejected the saved Connect session (HTTP 401). Retry the Connect session check; stored credentials and pending game state were preserved.'
+              : 'Studio requires a Connect session (HTTP 401). Sign in to connect this game; pending game state was preserved.'
+            : failure === 'cancelled'
+              ? 'Game connection was cancelled. Retry when ready; no play or payment was started.'
+              : `Game connection did not complete (${failure}). Retry the game connection; no play or payment was started.`;
+        if (failure === 'ConnectSessionRequiredError' || isUnauthorized) {
+          setConnectState(session ? 'verification_failed' : 'signed_out', session, message);
         }
+        changed(message);
+        return;
       }
-      changed(message);
-      busy = false;
+      const creditResults = await Promise.allSettled([credits.refresh()]);
+      changed('Game connected. Loading your saved round…');
+      const roundResults = await Promise.allSettled([round.refresh()]);
+      const refreshFailure = [...creditResults, ...roundResults].find((result) => result.status === 'rejected');
+      const outcome = deriveGameAuthorizationView(
+        game.getAuthorization(),
+        refreshFailure?.status === 'rejected',
+      );
+      connectionStatus.textContent = outcome.state === 'authorization_confirmed_refresh_failed'
+        && refreshFailure?.status === 'rejected'
+        ? `${outcome.status} (${describeSdkFailure(refreshFailure.reason)}). Retry the affected panel; no play or payment was started.`
+        : outcome.status;
+    } finally {
+      busy = previousBusy;
       updateGameAuthorizationButton();
       renderConnectState();
-      return;
     }
-
-    changed('Studio authorized this game. Loading the credit balance and saved round state…');
-    const refreshResults = await Promise.allSettled([credits.refresh(), round.refresh()]);
-    const refreshFailure = refreshResults.find((result) => result.status === 'rejected');
-    const outcome = deriveGameAuthorizationView(
-      game.getAuthorization(),
-      refreshFailure?.status === 'rejected',
-    );
-    connectButton.textContent = outcome.buttonLabel;
-    connectionStatus.textContent = outcome.state === 'authorization_confirmed_refresh_failed'
-      && refreshFailure?.status === 'rejected'
-      ? `${outcome.status} (${describeSdkFailure(refreshFailure.reason)}). Retry the affected panel; no play or payment was started.`
-      : outcome.status;
-    busy = false;
-    updateGameAuthorizationButton();
-    renderConnectState();
+  };
+  connectButton.addEventListener('click', async () => {
+    if (busy || game.getAuthorization()) return;
+    await authorizeGame();
   });
 }

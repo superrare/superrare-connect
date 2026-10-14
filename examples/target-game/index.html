@@ -20,10 +20,10 @@
           <div class="connection">
             <button id="sign-in" class="secondary" type="button" disabled>Checking Connect sign-in…</button>
             <p id="connect-status" role="status" aria-live="polite">Checking the saved SuperRare Connect session…</p>
-            <button id="connect" class="secondary" type="button">Authorize game</button>
-            <p id="connection-status" role="status" aria-live="polite">Studio game authorization is separate from Connect sign-in.</p>
+            <button id="connect" class="secondary" type="button" hidden>Retry game authorization</button>
+            <p id="connection-status" role="status" aria-live="polite">Sign in to SuperRare to connect this game and load credits.</p>
           </div>
-          <p class="fine-print">Payments are real USDC on Ethereum. Every purchase needs wallet approval. Each round needs a separate explicit play confirmation.</p>
+          <p class="fine-print">Payments are real USDC on Ethereum. Purchases need wallet approval. Clicking Play uses the credit cost shown on the button.</p>
         </aside>
       </section>
       <dialog id="hosted-connect-dialog" aria-labelledby="hosted-connect-title">

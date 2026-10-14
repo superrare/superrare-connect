@@ -31,11 +31,11 @@ const superrare = createSuperRareClient({
 
 ### Copyable target game (plain JavaScript)
 
-`examples/target-game/` is the standalone plain-JavaScript credit-gated game reference, excluded from the SDK TypeScript project and package build. Follow [`examples/target-game/README.md`](examples/target-game/README.md) to build and run its allowlisted loopback server with the repository's `dist/superrare-connect.global.js` bundle.
+`examples/target-game/` is the standalone plain-JavaScript credit-gated game reference. Its TypeScript engine and server verifier compile alongside the SDK; the browser UI stays plain JavaScript. Follow [`examples/target-game/README.md`](examples/target-game/README.md) to build and export the portable hosted-game ZIP.
 
-Configure your approved Studio app, credit group, exact browser origin, and environment service URLs. The game signs in through hosted Connect using an explicit embedded or popup transport, then authorizes the scoped game session directly through the Studio API with current Connect access. `game.connect()` never opens a hosted authorization surface, falls back between transports, or starts a paid play.
+Configure your approved Studio app, credit group, exact browser origin, and environment service URLs. Successful hosted Connect sign-in automatically authorizes the scoped game session through the Studio API and loads credits. A verified restored Connect session does the same; **Retry game authorization** appears only when connection needs attention. `game.connect()` never opens a hosted authorization surface, falls back between transports, or starts a paid play.
 
-Credit purchases require an explicit wallet approval and retry the same quote/transaction hash until Studio reconciliation completes. Each paid round has separate explicit confirmation and retains its original idempotency key for recovery. Target Rush uses a server-validated run: the platform advances the uploaded verifier and owns the authoritative score. Hosted Connect supports explicit embedded or popup login; embedded availability depends on the browser and hosted environment, not a blanket production popup requirement.
+Credit purchases still require explicit wallet approval and retain the same quote/transaction hash for recovery. **Play · N credits** displays the authoritative price; its single click approves and starts one round, without another confirmation screen. A changed price requires a click on the newly priced button. Target Rush retains paid/run idempotency keys and uses the platform’s bundled verifier and server-owned final score. Embedded availability depends on the browser and hosted environment; there is no silent popup fallback.
 
 Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
 
@@ -58,7 +58,7 @@ The SDK posts to `studioUrl/api/v1/credit-groups/:groupId/apps/:appId/authorizat
 
 The vanilla example ignores superseded terms responses and prevents delayed page-load restoration from replacing a newer connection or recovery error. Keep the same latest-request ownership rule in your integration when refreshing terms concurrently.
 
-Your game—not the SDK—owns the one-play confirmation UI. Fetch authoritative terms with `getTerms()`, display the title and credit cost, and offer a separate **Play — spend N credits** action. Only that confirmation action may call `requestConsent`. There is no SDK confirmation popup per play:
+Your game—not the SDK—owns one-play consent. Fetch authoritative terms with `getTerms()`, display the title and credit cost, and offer **Play — spend N credits**. That priced click is the approval and may call `requestConsent` directly; no extra confirmation screen or SDK confirmation popup is needed:
 
 ```ts
 const paidGame = superrare.games.forGame({
