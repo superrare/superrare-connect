@@ -20,7 +20,10 @@ const configurationSchema = z.object({
   display: z.enum(['embed', 'popup']),
 });
 
+const scriptArguments = process.argv.slice(2);
+const forwardedArguments = scriptArguments[0] === '--' ? scriptArguments.slice(1) : scriptArguments;
 const options = parseArgs({
+  args: forwardedArguments,
   options: {
     config: { type: 'string' },
     output: { type: 'string' },
