@@ -31,14 +31,6 @@ For a cloneable, multi-game organizer setup, use [Studio Games Example](https://
 
 **Studio permissions:** An authenticated organizer can create and manage their own credit groups with an `apps`-scoped CLI token; only an app's creator can publish its verifier and scoring events. The organizer workflow does not require a separate organizer-approval step, beta API key, or database/service-role credentials. Follow the standalone runbook for the deployed integration and current release requirements.
 
-### Copyable target game (plain JavaScript)
-
-`examples/target-game/` is the standalone plain-JavaScript credit-gated game reference. Its TypeScript engine and server verifier compile alongside the SDK; the browser UI stays plain JavaScript. Follow [`examples/target-game/README.md`](examples/target-game/README.md) to build and export the portable hosted-game ZIP.
-
-Configure your approved Studio app, credit group, exact browser origin, and environment service URLs. Successful hosted Connect sign-in automatically authorizes the scoped game session through the Studio API and loads credits. A verified restored Connect session does the same; **Retry game authorization** appears only when connection needs attention. `game.connect()` never opens a hosted authorization surface, falls back between transports, or starts a paid play.
-
-Credit purchases still require explicit wallet approval and retain the same quote/transaction hash for recovery. **Play · N credits** displays the authoritative price; its single click approves and starts one round, without another confirmation screen. A changed price requires a click on the newly priced button. Target Rush retains paid/run idempotency keys and uses the platform’s bundled verifier and server-owned final score. Embedded availability depends on the browser and hosted environment; there is no silent popup fallback.
-
 Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
 
 ```ts
