@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A vanilla JavaScript example game using Studio credits and SuperRare Connect.">
+    <title>Target Rush · Studio credits</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">SuperRare Connect · Studio game example</p>
+      <h1>Target Rush</h1>
+      <p class="lede">Hit as many targets as you can in ten seconds. Each new round costs one Studio credit.</p>
+      <section class="layout" aria-label="Game and account">
+        <section class="card game-card" id="game" aria-label="Paid target game"></section>
+        <aside class="card account-card">
+          <h2>Your credits</h2>
+          <section id="credits" aria-label="Credit balance and purchases"></section>
+          <div class="connection">
+            <button id="sign-in" class="secondary" type="button" disabled>Checking Connect sign-in…</button>
+            <p id="connect-status" role="status" aria-live="polite">Checking the saved SuperRare Connect session…</p>
+            <button id="connect" class="secondary" type="button" hidden>Retry game authorization</button>
+            <p id="connection-status" role="status" aria-live="polite">Sign in to SuperRare to connect this game and load credits.</p>
+          </div>
+          <p class="fine-print">Payments are real USDC on Ethereum. Purchases need wallet approval. Clicking Play uses the credit cost shown on the button.</p>
+        </aside>
+      </section>
+      <dialog id="hosted-connect-dialog" aria-labelledby="hosted-connect-title">
+        <div class="hosted-connect-header">
+          <h2 id="hosted-connect-title">SuperRare Connect</h2>
+          <button id="close-hosted-connect" class="secondary" type="button">Close</button>
+        </div>
+        <p id="hosted-connect-status" role="status" aria-live="polite">Hosted Connect flows are displayed here.</p>
+        <div id="hosted-connect-frame" class="hosted-connect-frame"></div>
+      </dialog>
+      <details class="developer"><summary>Integration details</summary><p id="configuration"></p><p>The ZIP includes a server-verifier.js worker. Studio’s Workers for Platforms runtime validates ordered inputs, advances server-owned time, and records the verifier’s final score. The browser never submits a claimed score.</p></details>
+      <section class="card high-scores" aria-labelledby="high-scores-title">
+        <div class="high-scores-header">
+          <h2 id="high-scores-title">Top 10 scorers</h2>
+          <button id="refresh-leaderboard" class="secondary" type="button">Refresh scores</button>
+        </div>
+        <p class="fine-print">Each scorer’s best server-verified score · All time</p>
+        <p id="leaderboard-status" role="status" aria-live="polite">Loading scores…</p>
+        <table id="leaderboard-table" aria-labelledby="high-scores-title" hidden>
+          <thead><tr><th scope="col">Rank</th><th scope="col">Scorer</th><th scope="col">Score</th></tr></thead>
+          <tbody id="leaderboard-entries"></tbody>
+        </table>
+      </section>
+    </main>
+    <script src="../../dist/superrare-connect.global.js"></script>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
