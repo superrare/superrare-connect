@@ -125,6 +125,71 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('authoritative scoring reads', () => {
+  const leaderboardEntry = {
+    rank: 1, scoreId: '50000000-0000-4000-8000-000000000001', score: '9007199254740993',
+    secondaryValue: null, trustLevel: 'server_verified', achievedAt: '2026-01-01T00:00:00.000Z',
+    player: { kind: 'profile', id: 'profile-1', handle: 'champion', displayName: 'Champion', avatarUrl: null },
+    isCurrentPlayer: false,
+  };
+
+  it('reads public verified rankings without login and preserves ties, identities, and large integer precision', async () => {
+    const entries = [
+      leaderboardEntry,
+      { ...leaderboardEntry, scoreId: '50000000-0000-4000-8000-000000000002',
+        player: { kind: 'wallet', id: '0xabc', handle: null, displayName: 'Wallet', avatarUrl: null, chainId: 1 } },
+      { ...leaderboardEntry, rank: 3, scoreId: '50000000-0000-4000-8000-000000000003', score: '0',
+        player: { kind: 'guest', id: null, handle: null, displayName: 'Guest', avatarUrl: null } },
+    ];
+    const h = harness({ signedIn: false, fetch: async (input, init) => {
+      expect(new Request(input, init).headers.has('authorization')).toBe(false);
+      return Response.json({ version: '1', entries });
+    } });
+    await expect(h.game.getServerLeaderboard()).resolves.toEqual(entries);
+    expect(h.authorizationFetch).not.toHaveBeenCalled();
+    expect(h.open).not.toHaveBeenCalled();
+  });
+
+  it('returns an empty public ranking when no scorer has completed a run', async () => {
+    const h = harness({ signedIn: false, fetch: async () => Response.json({ version: '1', entries: [] }) });
+    await expect(h.game.getServerLeaderboard()).resolves.toEqual([]);
+  });
+
+  it.each([
+    { trustLevel: 'legacy_unverified' }, { trustLevel: 'client_asserted' }, { trustLevel: 'replay_verified' },
+    { score: '-1' }, { score: '1e3' }, { score: ' 42' }, { score: '' }, { score: 42 },
+    { score: '1.5' }, { score: '1.0' }, { score: '00' }, { score: '042' },
+    { rank: 0 }, { rank: 1.5 }, { rank: 11 },
+    { scoreId: 'not-a-run-uuid' }, { achievedAt: 'not-a-date' },
+    { secondaryValue: '1' }, { isCurrentPlayer: true },
+    { player: { ...leaderboardEntry.player, kind: 'unknown' } },
+    { player: { ...leaderboardEntry.player, id: 1 } },
+    { player: { ...leaderboardEntry.player, handle: undefined } },
+    { player: { ...leaderboardEntry.player, displayName: null } },
+    { player: { ...leaderboardEntry.player, avatarUrl: 42 } },
+    { player: { ...leaderboardEntry.player, chainId: 1.5 } },
+  ])('rejects malformed or non-authoritative leaderboard entries: %j', async (fields) => {
+    const h = harness({ fetch: async () => Response.json({
+      version: '1', entries: [{ ...leaderboardEntry, ...fields }],
+    }) });
+    await expect(h.game.getServerLeaderboard()).rejects.toThrow();
+  });
+
+  it.each([
+    { version: '1', entries: Array.from({ length: 11 }, () => leaderboardEntry) },
+    { version: '2', entries: [] },
+    { version: '1' },
+  ])('rejects oversized or malformed leaderboard responses: %j', async (body) => {
+    const h = harness({ fetch: async () => Response.json(body) });
+    await expect(h.game.getServerLeaderboard()).rejects.toThrow();
+  });
+
+  it('preserves unavailable public rankings as errors instead of an empty ranking', async () => {
+    const h = harness({ fetch: async () => Response.json({
+      error: { code: 'UNAVAILABLE', message: 'Scoring unavailable' },
+    }, { status: 503 }) });
+    await expect(h.game.getServerLeaderboard()).rejects.toMatchObject({ status: 503, code: 'UNAVAILABLE' });
+  });
+
   it.each([
     { version: '1' },
     { version: '1', eventId: null },

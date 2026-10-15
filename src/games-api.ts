@@ -79,6 +79,19 @@ const serverTopScoreSchema = z.object({
   version: z.literal('1'), topScore: serverScoreSchema.nullable(),
 }).strict();
 
+const serverLeaderboardResponseSchema = z.object({
+  version: z.literal('1'),
+  entries: z.array(leaderboardEntrySchema.extend({
+    rank: z.number().int().min(1).max(10),
+    scoreId: z.string().uuid(),
+    score: z.string().regex(/^(0|[1-9][0-9]*)$/),
+    secondaryValue: z.null(),
+    trustLevel: z.literal('server_verified'),
+    achievedAt: z.string().datetime({ offset: true }),
+    isCurrentPlayer: z.literal(false),
+  })).max(10),
+}).strict();
+
 export async function requestStudioJson(input: StudioApiOptions & {
   path: string; method?: 'GET' | 'POST'; body?: unknown; authorization?: string; idempotencyKey?: string;
 }): Promise<unknown> {
@@ -118,3 +131,4 @@ export const parseActiveScoringEvent = (value: unknown): { eventId: string } => 
   return { eventId: response.eventId };
 };
 export const parseServerTopScore = (value: unknown): number | null => serverTopScoreSchema.parse(value).topScore;
+export const parseServerLeaderboard = (value: unknown): GameLeaderboardEntry[] => serverLeaderboardResponseSchema.parse(value).entries;

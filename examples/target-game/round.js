@@ -74,7 +74,11 @@ export class PaidRound {
     this.arenaMessage = null;
     this.target = null;
     this.scoreNode = null;
-    this.topScoreNode = null;
+    this.leaderboardStatus = null;
+    this.leaderboardTable = null;
+    this.leaderboardEntries = null;
+    this.leaderboardRefreshButton = null;
+    this.leaderboardGeneration = 0;
     this.socket = null;
     this.runConnecting = false;
     this.completing = false;
@@ -95,8 +99,11 @@ export class PaidRound {
     this.root.append(this.statusNode);
     this.scoreNode = element('p', 'Score: 0', 'game-score');
     this.root.append(element('p', 'The platform runs this game’s bundled server verifier. Inputs are sent to the server; only its recorded result is a verified score.'));
-    this.topScoreNode = element('p', 'Server-verified top score: loading…');
-    this.root.append(this.topScoreNode);
+    this.leaderboardStatus = document.querySelector('#leaderboard-status');
+    this.leaderboardTable = document.querySelector('#leaderboard-table');
+    this.leaderboardEntries = document.querySelector('#leaderboard-entries');
+    this.leaderboardRefreshButton = document.querySelector('#refresh-leaderboard');
+    this.leaderboardRefreshButton.addEventListener('click', () => { void this.refreshLeaderboard(); });
     this.arena = element('div', undefined, 'arena');
     this.arena.setAttribute('aria-label', 'Target game arena');
     this.arenaMessage = element('p', 'Start a round to play.', 'arena-message');
@@ -112,7 +119,7 @@ export class PaidRound {
     this.actionNode = element('div', undefined, 'game-actions');
     this.root.append(this.actionNode);
     void this.refresh();
-    void this.refreshTopScore();
+    void this.refreshLeaderboard();
     return this;
   }
 
@@ -699,7 +706,7 @@ export class PaidRound {
       this.arenaMessage.textContent = `Round complete. Server-verified score: ${attempt.result.score}.`;
       this.announce(`Round complete. Server-verified score: ${attempt.result.score}.`);
       await this.showPlayAction();
-      void this.refreshTopScore();
+      void this.refreshLeaderboard();
     } catch (error) {
       if (this.state === attempt && this.storageKey === accountKey) {
         this.showRecoveryError(error, `The platform already recorded score ${attempt.result.score}. Continue only retries this round’s completion.`);
@@ -709,12 +716,38 @@ export class PaidRound {
     }
   }
 
-  async refreshTopScore() {
+  async refreshLeaderboard() {
+    const generation = ++this.leaderboardGeneration;
+    this.leaderboardRefreshButton.disabled = true;
+    this.leaderboardTable.setAttribute('aria-busy', 'true');
+    this.leaderboardStatus.textContent = 'Loading scores…';
     try {
-      const score = await this.scoringGame.getServerTopScore();
-      this.topScoreNode.textContent = `Server-verified top score: ${score ?? '—'}`;
+      const entries = await this.scoringGame.getServerLeaderboard();
+      if (generation !== this.leaderboardGeneration) return;
+      const rows = entries.map((entry) => {
+        const row = element('tr');
+        const playerName = entry.player.displayName;
+        const label = entry.player.kind === 'wallet' && /^0x[0-9a-f]{40}$/i.test(playerName)
+          ? `${playerName.slice(0, 6)}…${playerName.slice(-4)}`
+          : playerName;
+        const player = element('td', label);
+        player.title = playerName;
+        row.append(element('td', String(entry.rank)), player, element('td', entry.score));
+        return row;
+      });
+      this.leaderboardEntries.replaceChildren(...rows);
+      this.leaderboardTable.hidden = entries.length === 0;
+      this.leaderboardStatus.textContent = entries.length === 0
+        ? 'No server-verified scores yet.'
+        : `${entries.length} scorer${entries.length === 1 ? '' : 's'} ranked by best verified score.`;
     } catch (error) {
-      this.topScoreNode.textContent = `Server-verified top score unavailable: ${errorMessage(error)}`;
+      if (generation !== this.leaderboardGeneration) return;
+      this.leaderboardStatus.textContent = `Could not refresh scores: ${errorMessage(error)}.${this.leaderboardEntries.children.length ? ' Showing previously loaded scores.' : ''} Try Refresh scores.`;
+    } finally {
+      if (generation === this.leaderboardGeneration) {
+        this.leaderboardRefreshButton.disabled = false;
+        this.leaderboardTable.setAttribute('aria-busy', 'false');
+      }
     }
   }
 }

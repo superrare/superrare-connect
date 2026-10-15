@@ -137,6 +137,7 @@ const scoringGame = createSuperRareClient({
 
 const { eventId } = await scoringGame.getActiveScoringEvent();
 const topScore = await scoringGame.getServerTopScore(); // number | null; null means no completed score
+const serverLeaders = await scoringGame.getServerLeaderboard(); // GameLeaderboardEntry[], at most ten scorers
 const runKey = crypto.randomUUID(); // Retain with the original event and paid session for recovery.
 const run = await scoringGame.startServerValidatedRun({
   sessionToken: started.session.token,
@@ -149,9 +150,11 @@ const run = await scoringGame.startServerValidatedRun({
 
 Studio provisions and pins the uploaded root `server-verifier.js` to the published deployment and scoring event; this verifier is excluded from public assets. The Workers for Platforms coordinator advances it, applies sequenced inputs, and records its authoritative result. Hosted game origins pass `/api/v1/games/:appId` through to the platform; a local static preview alone does not provide those scoring routes. Active-event absence and unavailable reads reject rather than fabricating an event or score. Top-score reads accept only nonnegative safe integers (including PostgreSQL decimal digit strings) or `null`.
 
+`getServerLeaderboard()` is a public read: no player login or PlaySession token is required. It returns each scorer's best completed authoritative run across all events and deployments of this app, ordered by descending score with stable tied ordering and competition ranks (`1, 1, 3`). Entries reuse `GameLeaderboardEntry`: `scoreId` identifies the winning run, `score` remains a nonnegative decimal string without numeric precision loss, `trustLevel` is always `server_verified`, `secondaryValue` is `null`, and `isCurrentPlayer` is `false`. An empty array means no completed scorers; malformed or unavailable responses reject.
+
 After a lost run-start response or socket disconnect, re-post the **original event, run key, and paid PlaySession token** using `startServerValidatedRun`; the platform returns the existing run with a fresh one-use socket ticket. Do not start another paid play to recover that run.
 
-Leaderboard reads use the same game client:
+Community/default leaderboard reads use the same game client but can include historical unverified or client-asserted scores. They are not a substitute for the authoritative server leaderboard:
 
 ```ts
 const leaders = await game.getLeaderboard({ leaderboardKey: 'default', limit: 25 });

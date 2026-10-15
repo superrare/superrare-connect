@@ -35,6 +35,18 @@
         <div id="hosted-connect-frame" class="hosted-connect-frame"></div>
       </dialog>
       <details class="developer"><summary>Integration details</summary><p id="configuration"></p><p>The ZIP includes a server-verifier.js worker. Studio’s Workers for Platforms runtime validates ordered inputs, advances server-owned time, and records the verifier’s final score. The browser never submits a claimed score.</p></details>
+      <section class="card high-scores" aria-labelledby="high-scores-title">
+        <div class="high-scores-header">
+          <h2 id="high-scores-title">Top 10 scorers</h2>
+          <button id="refresh-leaderboard" class="secondary" type="button">Refresh scores</button>
+        </div>
+        <p class="fine-print">Each scorer’s best server-verified score · All time</p>
+        <p id="leaderboard-status" role="status" aria-live="polite">Loading scores…</p>
+        <table id="leaderboard-table" aria-labelledby="high-scores-title" hidden>
+          <thead><tr><th scope="col">Rank</th><th scope="col">Scorer</th><th scope="col">Score</th></tr></thead>
+          <tbody id="leaderboard-entries"></tbody>
+        </table>
+      </section>
     </main>
     <script src="../../dist/superrare-connect.global.js"></script>
     <script type="module" src="./main.js"></script>

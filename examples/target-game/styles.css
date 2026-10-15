@@ -55,4 +55,12 @@ button:focus-visible, summary:focus-visible, #target:focus-visible { outline: 3p
 .fine-print, .developer { color: var(--muted); font-size: .84rem; }
 .developer { margin-top: 22px; }
 .developer summary { width: fit-content; cursor: pointer; }
+.high-scores { margin-top: 22px; }
+.high-scores-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.high-scores-header h2 { margin: 0; }
+.high-scores table { width: 100%; border-collapse: collapse; margin-top: 16px; font-variant-numeric: tabular-nums; }
+.high-scores th, .high-scores td { padding: 12px 8px; border-bottom: 1px solid var(--line); text-align: left; }
+.high-scores th { color: var(--muted); font-size: .84rem; font-weight: 600; }
+.high-scores th:last-child, .high-scores td:last-child { text-align: right; }
+.high-scores td:nth-child(2) { overflow-wrap: anywhere; }
 @media (max-width: 720px) { body { padding: 22px 14px; } .layout { grid-template-columns: 1fr; } .arena { height: 280px; } }

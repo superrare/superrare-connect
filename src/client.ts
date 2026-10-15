@@ -87,6 +87,7 @@ import {
   parsePurchase,
   parseServerRun,
   parseServerTopScore,
+  parseServerLeaderboard,
   requestStudioJson,
   type ClientAssertedScoreResult,
   type GameCreditBalance,
@@ -287,6 +288,8 @@ export type SuperRareGameClient = {
   getActiveScoringEvent: () => Promise<{ eventId: string }>;
   /** Reads the highest completed authoritative run score, or null when no score exists. */
   getServerTopScore: () => Promise<number | null>;
+  /** Public top ten scorers' best completed authoritative runs across this game's events and deployments. */
+  getServerLeaderboard: () => Promise<GameLeaderboardEntry[]>;
   startServerValidatedRun: (params: { sessionToken: string; eventId: string; idempotencyKey: string }) => Promise<ServerValidatedGameRun>;
   getLeaderboard: (params?: { leaderboardKey?: string; seasonKey?: string; limit?: number; cursor?: string }) => Promise<GameLeaderboard>;
   getMyBest: (params: { sessionToken: string; leaderboardKey?: string; seasonKey?: string }) => Promise<GameLeaderboardEntry | null>;
@@ -1564,6 +1567,10 @@ export function createSuperRareClient(
         async getServerTopScore(): Promise<number | null> {
           return parseServerTopScore(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
             path: `${gamePath}/scoring/top-score`, }));
+        },
+        async getServerLeaderboard(): Promise<GameLeaderboardEntry[]> {
+          return parseServerLeaderboard(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
+            path: `${gamePath}/scoring/leaderboard`, }));
         },
         async startServerValidatedRun(params): Promise<ServerValidatedGameRun> {
           return parseServerRun(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
