@@ -1,8 +1,7 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createSuperRareClient, type ConnectPopupMessageEvent, type SuperRareGameClient } from '../src/client.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createSuperRareClient, ConnectSessionRequiredError, type SuperRareGameClient } from '../src/client.js';
 import { GameConnectionError } from '../src/games-core.js';
 import { SuperRareConnectApiError } from '../src/errors.js';
-import type { ConnectPopupWindow } from '../src/popup-core.js';
 import type { ConnectSessionStorage } from '../src/session-storage-core.js';
 
 const appId = '20000000-0000-0000-0000-000000000001';
@@ -10,9 +9,10 @@ const groupId = '40000000-0000-0000-0000-000000000001';
 const appOrigin = 'https://game.test';
 const studioUrl = 'https://studio.test';
 const appPath = `${studioUrl}/api/v1/credit-groups/${groupId}/apps/${appId}`;
+const issuedAt = '2026-01-01T00:00:00.000Z';
 const authorization = {
   appId, groupId, appOrigin, authorizationToken: 'scoped-authorization',
-  expiresAt: '2030-01-01T00:00:00.000Z', address: '0xabc',
+  expiresAt: '2026-01-01T00:10:00.000Z', address: '0xabc',
 };
 const consent = {
   appId, groupId, consentId: 'consent-1', consentToken: 'narrow-token', credits: 3,
@@ -55,54 +55,62 @@ function memoryStorage(): ConnectSessionStorage & { values: Map<string, string> 
 
 function harness(options: {
   fetch?: typeof fetch;
+  authorizationFetch?: typeof fetch;
   storage?: ConnectSessionStorage | false;
-  throwOnUnsubscribe?: boolean;
+  signedIn?: boolean;
 } = {}) {
-  const listeners = new Set<(event: ConnectPopupMessageEvent) => void>();
-  const windows: ConnectPopupWindow[] = [];
+  const sessionKey = 'fixture-connect-session';
+  const credentials = memoryStorage();
+  if (options.signedIn !== false) credentials.setItem(sessionKey, JSON.stringify({
+    session: { sessionId: 'fixture-access', userId: 'fixture-user', address: authorization.address,
+      expiresAt: '2030-01-01T00:00:00.000Z' },
+    refreshToken: 'fixture-refresh', refreshExpiresAt: '2030-01-01T00:00:00.000Z',
+  }));
+  const gameStorage = options.storage === undefined ? memoryStorage() : options.storage;
+  // Fixture Connect credentials are isolated from game persistence failures.
+  const storage: ConnectSessionStorage = {
+    getItem(key) {
+      if (key === sessionKey) return credentials.getItem(key);
+      return gameStorage === false ? null : gameStorage.getItem(key);
+    },
+    setItem(key, value) {
+      if (key === sessionKey) credentials.setItem(key, value);
+      else {
+        if (gameStorage === false) throw new Error('Game persistence disabled in fixture.');
+        gameStorage.setItem(key, value);
+      }
+    },
+    removeItem(key) {
+      if (key === sessionKey) credentials.removeItem(key);
+      else if (gameStorage !== false) gameStorage.removeItem(key);
+    },
+  };
   const urls: string[] = [];
-  const unsubscribe = vi.fn();
+  const open = vi.fn((url: string) => { urls.push(url); return null; });
+  let nextAuthorization: unknown = authorization;
+  const authorizationFetch = vi.fn(options.authorizationFetch ?? (async () =>
+    Response.json({ version: '1', issuedAt, authorization: nextAuthorization }, { status: 201 })));
   const fetchImplementation = vi.fn(options.fetch ?? (async () => sessionResponse(true)));
   const client = createSuperRareClient({
-    studioUrl, initiatingOrigin: appOrigin, fetch: fetchImplementation,
-    sessionStorage: options.storage ?? false,
-    popup: {
-      open(url) {
-        urls.push(url);
-        const popup: ConnectPopupWindow = {
-          closed: false,
-          close() { popup.closed = true; },
-          location: { replace() {} },
-        };
-        windows.push(popup);
-        return popup;
-      },
-      messageEvents: { subscribe(next) {
-        listeners.add(next);
-        return () => {
-          listeners.delete(next);
-          unsubscribe();
-          if (options.throwOnUnsubscribe) throw new Error('Cleanup failed.');
-        };
-      } },
+    studioUrl, initiatingOrigin: appOrigin, sessionStorage: storage, sessionStorageKey: sessionKey,
+    popup: { open },
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).pathname === '/v1/connect/auth/logout') {
+        return Response.json({ data: { revoked: true } });
+      }
+      return request.url === `${appPath}/authorizations`
+        ? authorizationFetch(input, init) : fetchImplementation(input, init);
     },
   });
   const game = client.games.forGame({ appId, groupId });
-  const message = (fields: Record<string, unknown> = {}): Record<string, unknown> => ({
-    type: 'superrare-connect:game-authorization',
-    state: new URL(at(urls, urls.length - 1)).searchParams.get('state'),
-    ...authorization, ...fields,
-  });
-  const emit = (data = message(), event: Partial<ConnectPopupMessageEvent> = {}) => {
-    const messageEvent = { origin: studioUrl, source: windows[windows.length - 1], data, ...event };
-    listeners.forEach((listener) => listener(messageEvent));
+  return {
+    client, game, urls, open, authorizationFetch, fetchImplementation, credentials,
+    connect: () => game.connect(),
+    setAuthorization(fields: Record<string, unknown> = {}): void {
+      nextAuthorization = { ...authorization, ...fields };
+    },
   };
-  const connect = async () => {
-    const pending = game.connect();
-    emit();
-    return await pending;
-  };
-  return { client, game, urls, windows, message, emit, connect, unsubscribe, fetchImplementation };
 }
 
 async function connectionError(operation: Promise<unknown>, code: string): Promise<void> {
@@ -110,283 +118,363 @@ async function connectionError(operation: Promise<unknown>, code: string): Promi
   await expect(operation).rejects.toMatchObject({ code });
 }
 
-afterEach(() => { vi.useRealTimers(); });
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+});
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe('authoritative scoring reads', () => {
+  const leaderboardEntry = {
+    rank: 1, scoreId: '50000000-0000-4000-8000-000000000001', score: '9007199254740993',
+    secondaryValue: null, trustLevel: 'server_verified', achievedAt: '2026-01-01T00:00:00.000Z',
+    player: { kind: 'profile', id: 'profile-1', handle: 'champion', displayName: 'Champion', avatarUrl: null },
+    isCurrentPlayer: false,
+  };
+
+  it('reads public verified rankings without login and preserves ties, identities, and large integer precision', async () => {
+    const entries = [
+      leaderboardEntry,
+      { ...leaderboardEntry, scoreId: '50000000-0000-4000-8000-000000000002',
+        player: { kind: 'wallet', id: '0xabc', handle: null, displayName: 'Wallet', avatarUrl: null, chainId: 1 } },
+      { ...leaderboardEntry, rank: 3, scoreId: '50000000-0000-4000-8000-000000000003', score: '0',
+        player: { kind: 'guest', id: null, handle: null, displayName: 'Guest', avatarUrl: null } },
+    ];
+    const h = harness({ signedIn: false, fetch: async (input, init) => {
+      expect(new Request(input, init).headers.has('authorization')).toBe(false);
+      return Response.json({ version: '1', entries });
+    } });
+    await expect(h.game.getServerLeaderboard()).resolves.toEqual(entries);
+    expect(h.authorizationFetch).not.toHaveBeenCalled();
+    expect(h.open).not.toHaveBeenCalled();
+  });
+
+  it('returns an empty public ranking when no scorer has completed a run', async () => {
+    const h = harness({ signedIn: false, fetch: async () => Response.json({ version: '1', entries: [] }) });
+    await expect(h.game.getServerLeaderboard()).resolves.toEqual([]);
+  });
+
+  it.each([
+    { trustLevel: 'legacy_unverified' }, { trustLevel: 'client_asserted' }, { trustLevel: 'replay_verified' },
+    { score: '-1' }, { score: '1e3' }, { score: ' 42' }, { score: '' }, { score: 42 },
+    { score: '1.5' }, { score: '1.0' }, { score: '00' }, { score: '042' },
+    { rank: 0 }, { rank: 1.5 }, { rank: 11 },
+    { scoreId: 'not-a-run-uuid' }, { achievedAt: 'not-a-date' },
+    { secondaryValue: '1' }, { isCurrentPlayer: true },
+    { player: { ...leaderboardEntry.player, kind: 'unknown' } },
+    { player: { ...leaderboardEntry.player, id: 1 } },
+    { player: { ...leaderboardEntry.player, handle: undefined } },
+    { player: { ...leaderboardEntry.player, displayName: null } },
+    { player: { ...leaderboardEntry.player, avatarUrl: 42 } },
+    { player: { ...leaderboardEntry.player, chainId: 1.5 } },
+  ])('rejects malformed or non-authoritative leaderboard entries: %j', async (fields) => {
+    const h = harness({ fetch: async () => Response.json({
+      version: '1', entries: [{ ...leaderboardEntry, ...fields }],
+    }) });
+    await expect(h.game.getServerLeaderboard()).rejects.toThrow();
+  });
+
+  it.each([
+    { version: '1', entries: Array.from({ length: 11 }, () => leaderboardEntry) },
+    { version: '2', entries: [] },
+    { version: '1' },
+  ])('rejects oversized or malformed leaderboard responses: %j', async (body) => {
+    const h = harness({ fetch: async () => Response.json(body) });
+    await expect(h.game.getServerLeaderboard()).rejects.toThrow();
+  });
+
+  it('preserves unavailable public rankings as errors instead of an empty ranking', async () => {
+    const h = harness({ fetch: async () => Response.json({
+      error: { code: 'UNAVAILABLE', message: 'Scoring unavailable' },
+    }, { status: 503 }) });
+    await expect(h.game.getServerLeaderboard()).rejects.toMatchObject({ status: 503, code: 'UNAVAILABLE' });
+  });
+
+  it.each([
+    { version: '1' },
+    { version: '1', eventId: null },
+    { version: '1', eventId: 'not-an-event-uuid' },
+    { version: '2', eventId: appId },
+    { version: '1', eventId: appId, unexpected: true },
+  ])('rejects malformed active-event discovery: %j', async (body) => {
+    const h = harness({ fetch: async () => Response.json(body) });
+    await expect(h.game.getActiveScoringEvent()).rejects.toThrow();
+  });
+
+  it('preserves absence of an active event as a platform error', async () => {
+    const h = harness({ fetch: async () => Response.json({
+      error: { code: 'GAME_NOT_FOUND', message: 'No active scoring event for this deployment' },
+    }, { status: 404 }) });
+    await expect(h.game.getActiveScoringEvent()).rejects.toMatchObject({
+      status: 404, code: 'GAME_NOT_FOUND',
+    });
+  });
+
+  it('does not turn unavailable scoring into a zero score', async () => {
+    const h = harness({ fetch: async () => Response.json({
+      error: { code: 'UNAVAILABLE', message: 'Scoring unavailable' },
+    }, { status: 503 }) });
+    await expect(h.game.getServerTopScore()).rejects.toBeInstanceOf(SuperRareConnectApiError);
+  });
+
+  it('keeps no completed score distinct from a completed zero score', async () => {
+    const missing = harness({ fetch: async () => Response.json({ version: '1', topScore: null }) });
+    const zero = harness({ fetch: async () => Response.json({ version: '1', topScore: 0 }) });
+    await expect(missing.game.getServerTopScore()).resolves.toBeNull();
+    await expect(zero.game.getServerTopScore()).resolves.toBe(0);
+  });
+
+  it('normalizes PostgreSQL decimal digit scores without losing precision', async () => {
+    const h = harness({ fetch: async () => Response.json({ version: '1', topScore: '9007199254740991' }) });
+    await expect(h.game.getServerTopScore()).resolves.toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it.each([
+    -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '9007199254740992',
+    '', ' 42', '42 ', '-1', '1.5', '1e3', '0x10', true, {},
+  ])('rejects unsafe or malformed server scores: %j', async (topScore) => {
+    const h = harness({ fetch: async () => Response.json({ version: '1', topScore }) });
+    await expect(h.game.getServerTopScore()).rejects.toThrow();
+  });
+
+  it.each([{ version: '1' }, { version: '2', topScore: 0 }])('rejects incomplete score responses: %j', async (body) => {
+    const h = harness({ fetch: async () => Response.json(body) });
+    await expect(h.game.getServerTopScore()).rejects.toThrow();
+  });
+});
 
 describe('game connection', () => {
-  it('connects without consenting or starting and does not expose credentials in its URL', async () => {
-    const h = harness();
-    const pending = h.game.connect();
-    const url = new URL(at(h.urls, 0));
-    expect(url.pathname).toBe('/connect/games/authorize');
-    expect(url.searchParams.get('appId')).toBe(appId);
-    expect(url.searchParams.get('groupId')).toBe(groupId);
-    expect(url.searchParams.get('appOrigin')).toBe(appOrigin);
-    expect(url.searchParams.get('state')).toMatch(/^[A-Za-z0-9_-]{16,256}$/);
-    expect(url.search).not.toContain('token');
-    h.emit();
-    await expect(pending).resolves.toEqual(authorization);
+  it('exchanges signed-in access without opening UI, consenting, starting, or modifying pending attempts', async () => {
+    const storage = memoryStorage();
+    storage.setItem('pending-purchase', 'unchanged-purchase');
+    const h = harness({ storage });
+    await expect(h.game.connect()).resolves.toEqual(authorization);
+    expect(h.open).not.toHaveBeenCalled();
     expect(h.fetchImplementation).not.toHaveBeenCalled();
-    expect(at(h.windows, 0).closed).toBe(true);
-    expect(h.unsubscribe).toHaveBeenCalledOnce();
+    expect(storage.getItem('pending-purchase')).toBe('unchanged-purchase');
+    expect(h.game.getAuthorization()).toEqual(authorization);
+  });
+
+  it('requires signed-in access without implicitly opening login or making an authorization request', async () => {
+    const h = harness({ signedIn: false });
+    await expect(h.game.connect()).rejects.toBeInstanceOf(ConnectSessionRequiredError);
+    expect(h.authorizationFetch).not.toHaveBeenCalled();
+    expect(h.fetchImplementation).not.toHaveBeenCalled();
+    expect(h.open).not.toHaveBeenCalled();
+  });
+
+  it('renews near-expiry Connect access before exchanging it without exposing refresh credentials to Studio', async () => {
+    const h = harness({
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        expect(new URL(request.url).pathname).toBe('/v1/connect/auth/refresh');
+        return Response.json({ data: {
+          session: { sessionId: 'fixture-renewed-access', userId: 'fixture-user', address: authorization.address,
+            expiresAt: '2026-01-01T01:00:00.000Z' },
+          refreshToken: 'fixture-rotated-refresh', refreshExpiresAt: '2030-01-01T00:00:00.000Z',
+        } });
+      },
+      authorizationFetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.headers.get('authorization') !== 'ConnectSession fixture-renewed-access') {
+          return Response.json({ error: { code: 'CONNECT_UNAUTHORIZED', message: 'Current access required.' } }, { status: 401 });
+        }
+        return Response.json({ version: '1', issuedAt, authorization }, { status: 201 });
+      },
+    });
+    h.credentials.setItem('fixture-connect-session', JSON.stringify({
+      session: { sessionId: 'fixture-expiring-access', userId: 'fixture-user', address: authorization.address,
+        expiresAt: '2026-01-01T00:00:45.000Z' },
+      refreshToken: 'fixture-original-refresh', refreshExpiresAt: '2030-01-01T00:00:00.000Z',
+    }));
+    await expect(h.game.connect()).resolves.toEqual(authorization);
+  });
+
+  it('rejects a configured origin that differs from the actual browser before exposing access to Studio', async () => {
+    vi.stubGlobal('location', { origin: 'https://other-browser.test' });
+    const h = harness();
+    await connectionError(h.game.connect(), 'invalid_origin');
+    expect(h.authorizationFetch).not.toHaveBeenCalled();
   });
 
   it.each([
-    ['source', { source: {} }],
-    ['origin', { origin: 'https://evil.test' }],
-  ] as const)('ignores unrelated %s messages instead of trusting their token', async (_name, event) => {
-    const h = harness();
-    const pending = h.game.connect();
-    h.emit(h.message({ authorizationToken: 'attacker-token' }), event);
-    h.emit();
-    await expect(pending).resolves.toEqual(authorization);
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ['state', { state: 'unrelated-state' }],
-    ['app', { appId: 'other-app' }],
-    ['group', { groupId: 'other-group' }],
-    ['appOrigin', { appOrigin: 'https://evil.test' }],
-  ] as const)('does not accept authorization for a different %s', async (_name, fields) => {
-    const h = harness();
-    const pending = h.game.connect();
-    h.emit(h.message({ ...fields, authorizationToken: 'attacker-token' }));
-    h.emit();
-    await expect(pending).resolves.toEqual(authorization);
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-  });
-
-  it('rejects a valid-bound message without a source', async () => {
-    const h = harness();
-    const pending = h.game.connect();
-    h.emit(h.message(), { source: undefined });
-    await connectionError(pending, 'invalid_message');
-    expect(at(h.windows, 0).closed).toBe(true);
-  });
-
-  it('rejects explicit cancellation without accounting requests', async () => {
-    const h = harness();
-    const pending = h.game.connect();
-    h.emit({ type: 'superrare-connect:game-authorization-cancelled',
-      state: h.message().state, appId, groupId });
-    await connectionError(pending, 'cancelled');
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-    expect(h.unsubscribe).toHaveBeenCalledOnce();
-    expect(at(h.windows, 0).closed).toBe(true);
-  });
-
-  it('settles when the connection window closes without a message', async () => {
-    vi.useFakeTimers();
-    const h = harness();
-    const pending = h.game.connect();
-    const rejected = connectionError(pending, 'cancelled');
-    at(h.windows, 0).closed = true;
-    await vi.advanceTimersByTimeAsync(2_000);
-    await rejected;
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-    expect(h.unsubscribe).toHaveBeenCalledOnce();
-  });
-
-  it('expires an unanswered connection and cleans up its window', async () => {
-    vi.useFakeTimers();
-    const h = harness();
-    const pending = h.game.connect();
-    const rejected = connectionError(pending, 'expired');
-    await vi.advanceTimersByTimeAsync(5 * 60_000 + 2_000);
-    await rejected;
-    expect(at(h.windows, 0).closed).toBe(true);
-    expect(h.unsubscribe).toHaveBeenCalledOnce();
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-  });
-
-  it('rejects an already-expired authorization', async () => {
-    const h = harness();
-    const pending = h.game.connect();
-    h.emit(h.message({ expiresAt: '2000-01-01T00:00:00.000Z' }));
-    await connectionError(pending, 'expired');
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    { authorizationToken: '' }, { authorizationToken: undefined }, { address: undefined },
+    { appId: 'other-app' }, { groupId: 'other-group' }, { appOrigin: 'https://evil.test' },
+    { address: '0xdef' }, { authorizationToken: '' }, { authorizationToken: undefined },
     { expiresAt: 'not-a-date' }, { expiresAt: undefined },
-  ])('rejects incomplete or malformed authorization without caching it: %j', async (fields) => {
-    const h = harness();
-    const pending = h.game.connect();
-    h.emit(h.message(fields));
-    await connectionError(pending, 'invalid_message');
+    { expiresAt: '2026-01-01T00:15:00.001Z' },
+  ])('rejects invalid authorization bindings before storing or using them: %j', async (fields) => {
+    const storage = memoryStorage();
+    const h = harness({ storage });
+    h.setAuthorization(fields);
+    await connectionError(h.game.connect(), 'invalid_authorization');
+    expect(h.game.getAuthorization()).toBeUndefined();
+    expect([...storage.values.keys()].some((key) => key.startsWith('superrare.connect.game-authorization:'))).toBe(false);
     await connectionError(h.game.requestConsent(attempt), 'authorization_required');
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-    expect(at(h.windows, 0).closed).toBe(true);
   });
 
-  it('reuses valid scoped authorization but requires explicit reconnect after expiry', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+  it.each([undefined, 1, '2'])('rejects unsupported response versions: %j', async (version) => {
+    const h = harness({ authorizationFetch: async () => Response.json({ version, issuedAt, authorization }) });
+    await connectionError(h.game.connect(), 'invalid_authorization');
+    expect(h.game.getAuthorization()).toBeUndefined();
+  });
+
+  it.each([88, 30_000, -30_000])('accepts a server-bounded authorization with browser clock skew of %sms', async (skew) => {
+    vi.setSystemTime(Date.parse(issuedAt) - skew);
     const h = harness();
-    const pending = h.game.connect();
-    const expiresAt = '2026-01-01T00:01:00.000Z';
-    h.emit(h.message({ expiresAt }));
-    await pending;
-    await expect(h.game.connect()).resolves.toMatchObject({ expiresAt });
-    expect(h.urls).toHaveLength(1);
-    vi.setSystemTime(new Date(expiresAt));
-    await connectionError(h.game.requestConsent(attempt), 'authorization_required');
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-    expect(h.urls).toHaveLength(1);
+    h.setAuthorization({ expiresAt: '2026-01-01T00:15:00.000Z' });
+    await expect(h.game.connect()).resolves.toMatchObject({ expiresAt: '2026-01-01T00:15:00.000Z' });
+    expect(h.game.getAuthorization()?.expiresAt).toBe('2026-01-01T00:15:00.000Z');
+  });
+
+  it('rejects a lifetime exceeding the server cap even when a fast browser clock would allow it', async () => {
+    vi.setSystemTime(Date.parse(issuedAt) + 30_000);
+    const h = harness();
+    h.setAuthorization({ expiresAt: '2026-01-01T00:15:00.001Z' });
+    await connectionError(h.game.connect(), 'invalid_authorization');
+    expect(h.game.getAuthorization()).toBeUndefined();
+  });
+
+  it.each([undefined, '', 'not-a-date', '2026-01-01T00:10:00.000Z', '2026-01-01T00:10:00.001Z'])(
+    'rejects missing, malformed, or nonpositive server issuance intervals: %j', async (responseIssuedAt) => {
+      const h = harness({ authorizationFetch: async () => Response.json({
+        version: '1', issuedAt: responseIssuedAt, authorization,
+      }) });
+      await connectionError(h.game.connect(), 'invalid_authorization');
+      expect(h.game.getAuthorization()).toBeUndefined();
+    },
+  );
+
+  it('rejects already-expired authorization and authorization beyond Connect access expiry', async () => {
+    const h = harness();
+    h.setAuthorization({ expiresAt: '2026-01-01T00:00:00.000Z' });
+    await connectionError(h.game.connect(), 'expired');
+    h.credentials.setItem('fixture-connect-session', JSON.stringify({
+      session: { sessionId: 'fixture-short-access', userId: 'fixture-user', address: authorization.address,
+        expiresAt: '2026-01-01T00:05:00.000Z' },
+      refreshToken: 'fixture-short-refresh', refreshExpiresAt: '2030-01-01T00:00:00.000Z',
+    }));
+    h.setAuthorization();
+    await connectionError(h.game.connect(), 'invalid_authorization');
+    expect(h.game.getAuthorization()).toBeUndefined();
+  });
+
+  it.each([[401, 'CONNECT_UNAUTHORIZED'], [403, 'CREDIT_GROUP_APP_NOT_APPROVED'], [503, 'CONNECT_UNAVAILABLE']] as const)(
+    'propagates Studio %s %s without retrying or opening UI', async (status, code) => {
+      const h = harness({ authorizationFetch: async () => Response.json({ error: { code, message: code } }, { status }) });
+      await expect(h.game.connect()).rejects.toMatchObject({ status, code, path: `/api/v1/credit-groups/${groupId}/apps/${appId}/authorizations` });
+      expect(h.authorizationFetch).toHaveBeenCalledOnce();
+      expect(h.game.getAuthorization()).toBeUndefined();
+      expect(h.open).not.toHaveBeenCalled();
+    },
+  );
+
+  it('shares an in-flight exchange and clears failed requests so an explicit retry can succeed', async () => {
+    let resolveResponse: (response: Response) => void = () => { throw new Error('Request not started.'); };
+    const h = harness({ authorizationFetch: () => new Promise<Response>((resolve) => { resolveResponse = resolve; }) });
+    const first = h.game.connect();
+    const second = h.client.games.forGame({ appId, groupId }).connect();
+    const firstFailure = expect(first).rejects.toMatchObject({ status: 503 });
+    const secondFailure = expect(second).rejects.toMatchObject({ status: 503 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.authorizationFetch).toHaveBeenCalledOnce();
+    resolveResponse(Response.json({ error: 'Unavailable.' }, { status: 503 }));
+    await Promise.all([firstFailure, secondFailure]);
     const renewed = h.game.connect();
-    expect(h.urls).toHaveLength(2);
-    h.emit();
+    await vi.advanceTimersByTimeAsync(0);
+    resolveResponse(Response.json({ version: '1', issuedAt, authorization }));
     await expect(renewed).resolves.toEqual(authorization);
   });
 
-  it('restores valid game authorization from storage without opening a popup', async () => {
+  it('restores and reuses scoped authorization while signed out without another exchange', async () => {
     const storage = memoryStorage();
     const initial = harness({ storage });
     await initial.connect();
-
-    const reloaded = harness({ storage });
+    const reloaded = harness({ storage, signedIn: false });
     expect(reloaded.game.getAuthorization()).toEqual(authorization);
     await expect(reloaded.game.connect()).resolves.toEqual(authorization);
-    expect(reloaded.urls).toEqual([]);
-    expect(reloaded.fetchImplementation).not.toHaveBeenCalled();
-    expect(reloaded.client.games.forGame({
-      appId: '20000000-0000-0000-0000-000000000002',
-      groupId,
-    }).getAuthorization()).toBeUndefined();
+    expect(reloaded.authorizationFetch).not.toHaveBeenCalled();
+    expect(reloaded.client.games.forGame({ appId: 'other-app', groupId }).getAuthorization()).toBeUndefined();
+  });
+
+  it.each([true, false])('does not reuse another signed-in wallet’s authorization (persistent=%s)', async (persistent) => {
+    const storage = memoryStorage();
+    const h = harness({ storage: persistent ? storage : false, fetch: async () => consentResponse() });
+    await h.connect();
+    await h.game.requestConsent(attempt);
+    const savedAttempts = new Map(storage.values);
+    h.credentials.setItem('fixture-connect-session', JSON.stringify({
+      session: { sessionId: 'fixture-wallet-b-access', userId: 'fixture-wallet-b-user', address: '0xdef',
+        expiresAt: '2030-01-01T00:00:00.000Z' },
+      refreshToken: 'fixture-wallet-b-refresh', refreshExpiresAt: '2030-01-01T00:00:00.000Z',
+    }));
+    expect(h.game.getAuthorization()).toBeUndefined();
+    await connectionError(h.game.credits.getBalance(), 'authorization_required');
+    expect(h.fetchImplementation).toHaveBeenCalledOnce();
+    if (persistent) expect(storage.values).toEqual(savedAttempts);
+    h.setAuthorization({ address: '0xdef', authorizationToken: 'wallet-b-game-authorization' });
+    await expect(h.game.connect()).resolves.toMatchObject({ address: '0xdef' });
+    expect(h.authorizationFetch).toHaveBeenCalledTimes(2);
+    expect(h.open).not.toHaveBeenCalled();
   });
 
   it('rejects persisted authorization bound to another app origin', () => {
     const storage = memoryStorage();
-    const key = `superrare.connect.game-authorization:${encodeURIComponent(
-      JSON.stringify([studioUrl, appId, groupId, appOrigin]),
-    )}`;
-    storage.values.set(key, JSON.stringify({
-      ...authorization,
-      appOrigin: 'https://other.game.test',
-    }));
-
-    const h = harness({ storage });
-    expect(h.game.getAuthorization()).toBeUndefined();
+    storage.setItem(`superrare.connect.game-authorization:${encodeURIComponent(JSON.stringify([studioUrl, appId, groupId, appOrigin]))}`,
+      JSON.stringify({ ...authorization, appOrigin: 'https://other.game.test' }));
+    expect(harness({ storage }).game.getAuthorization()).toBeUndefined();
   });
 
-  it('drops expired persisted authorization and renews only on explicit connect', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+  it('renews expired authorization only on explicit connect', async () => {
     const storage = memoryStorage();
     const initial = harness({ storage });
-    const expiresAt = '2026-01-01T00:01:00.000Z';
-    const connected = initial.game.connect();
-    initial.emit(initial.message({ expiresAt }));
-    await connected;
-
-    vi.setSystemTime(new Date(expiresAt));
+    initial.setAuthorization({ expiresAt: '2026-01-01T00:01:00.000Z' });
+    await initial.connect();
+    vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
     const reloaded = harness({ storage });
     expect(reloaded.game.getAuthorization()).toBeUndefined();
-    expect(reloaded.urls).toEqual([]);
-    const renewed = reloaded.game.connect();
-    expect(reloaded.urls).toHaveLength(1);
-    reloaded.emit();
-    await expect(renewed).resolves.toEqual(authorization);
+    await connectionError(reloaded.game.requestConsent(attempt), 'authorization_required');
+    expect(reloaded.authorizationFetch).not.toHaveBeenCalled();
+    await expect(reloaded.game.connect()).resolves.toEqual(authorization);
   });
 
-  it('keeps renewed authorization when an older request returns unauthorized', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
-    let resolveConsentResponse: ((response: Response) => void) | undefined;
-    const h = harness({
-      storage: memoryStorage(),
-      fetch: () => new Promise<Response>((resolve) => { resolveConsentResponse = resolve; }),
-    });
-    const initial = h.game.connect();
-    h.emit(h.message({ authorizationToken: 'expired-token', expiresAt: '2026-01-01T00:01:00.000Z' }));
-    await initial;
-
-    const oldConsentRequest = h.game.requestConsent(attempt);
-    vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
-    const renewal = h.game.connect();
-    h.emit(h.message({ authorizationToken: 'renewed-token' }));
-    await renewal;
-    if (resolveConsentResponse === undefined) throw new Error('Consent fetch did not start.');
-    resolveConsentResponse(Response.json({
-      error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Expired authorization.' },
-    }, { status: 401 }));
-    await expect(oldConsentRequest).rejects.toMatchObject({ status: 401 });
-    expect(h.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
-  });
-
-  it('preserves a renewed authorization in shared storage after another client receives a stale 401', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+  it('keeps renewed authorization when an older consent request returns unauthorized', async () => {
+    let resolveResponse: (response: Response) => void = () => { throw new Error('Request not started.'); };
     const storage = memoryStorage();
-    let resolveConsentResponse: ((response: Response) => void) | undefined;
-    const oldClient = harness({
-      storage,
-      fetch: () => new Promise<Response>((resolve) => { resolveConsentResponse = resolve; }),
-    });
-    const initial = oldClient.game.connect();
-    oldClient.emit(oldClient.message({
-      authorizationToken: 'expired-token',
-      expiresAt: '2026-01-01T00:01:00.000Z',
-    }));
-    await initial;
-
-    const oldConsentRequest = oldClient.game.requestConsent(attempt);
+    const oldClient = harness({ storage, fetch: () => new Promise<Response>((resolve) => { resolveResponse = resolve; }) });
+    oldClient.setAuthorization({ authorizationToken: 'expired-token', expiresAt: '2026-01-01T00:01:00.000Z' });
+    await oldClient.connect();
+    const pending = oldClient.game.requestConsent(attempt);
     vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
     const renewingClient = harness({ storage });
-    const renewal = renewingClient.game.connect();
-    renewingClient.emit(renewingClient.message({ authorizationToken: 'renewed-token' }));
-    await renewal;
-
-    if (resolveConsentResponse === undefined) throw new Error('Consent fetch did not start.');
-    resolveConsentResponse(Response.json({
-      error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Expired authorization.' },
-    }, { status: 401 }));
-    await expect(oldConsentRequest).rejects.toMatchObject({ status: 401 });
-
-    const reloaded = harness({ storage });
-    expect(reloaded.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
-    expect(reloaded.urls).toEqual([]);
+    renewingClient.setAuthorization({ authorizationToken: 'renewed-token' });
+    await renewingClient.connect();
+    resolveResponse(Response.json({ error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Rejected.' } }, { status: 401 }));
+    await expect(pending).rejects.toMatchObject({ status: 401 });
+    expect(oldClient.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
+    expect(harness({ storage }).game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
   });
 
-  it.each(['consent', 'credits'] as const)(
-    'requires explicit renewal in a peer client after %s rejects shared authorization',
-    async (operation) => {
-      const storage = memoryStorage();
-      const rejecting = harness({ storage, fetch: async () => Response.json({
-        error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Authorization rejected.' },
-      }, { status: 401 }) });
-      await rejecting.connect();
-      const peer = harness({ storage });
-      expect(peer.game.getAuthorization()).toEqual(authorization);
-
-      await expect(operation === 'consent'
-        ? rejecting.game.requestConsent(attempt)
-        : rejecting.game.credits.getBalance()).rejects.toMatchObject({ status: 401 });
-
-      expect(peer.game.getAuthorization()).toBeUndefined();
-      await connectionError(peer.game.requestConsent(attempt), 'authorization_required');
-      expect(peer.fetchImplementation).not.toHaveBeenCalled();
-      const renewal = peer.game.connect();
-      expect(peer.urls).toHaveLength(1);
-      peer.emit(peer.message({ authorizationToken: 'renewed-token' }));
-      await expect(renewal).resolves.toMatchObject({ authorizationToken: 'renewed-token' });
-    },
-  );
+  it.each(['consent', 'credits'] as const)('invalidates a rejected token in a peer without deleting a concurrent renewal: %s', async (operation) => {
+    const storage = memoryStorage();
+    const rejecting = harness({ storage, fetch: async () => Response.json({
+      error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Rejected.' },
+    }, { status: 401 }) });
+    await rejecting.connect();
+    const peer = harness({ storage });
+    await expect(operation === 'consent' ? rejecting.game.requestConsent(attempt) : rejecting.game.credits.getBalance())
+      .rejects.toMatchObject({ status: 401 });
+    expect(peer.game.getAuthorization()).toBeUndefined();
+    await connectionError(peer.game.requestConsent(attempt), 'authorization_required');
+    peer.setAuthorization({ authorizationToken: 'renewed-token' });
+    await expect(peer.game.connect()).resolves.toMatchObject({ authorizationToken: 'renewed-token' });
+  });
 
   it('does not delete a renewal written during stale authorization cleanup', async () => {
     const persistent = memoryStorage();
     const renewed = { ...authorization, authorizationToken: 'renewed-token' };
     let interleaveRenewal = false;
     const storage: ConnectSessionStorage = {
-      getItem(key) {
-        const value = persistent.getItem(key);
-        if (interleaveRenewal && key.startsWith('superrare.connect.game-authorization:')) {
-          interleaveRenewal = false;
-          persistent.setItem(key, JSON.stringify(renewed));
-        }
-        return value;
-      },
+      getItem: persistent.getItem,
       setItem(key, value) {
         if (interleaveRenewal && key.includes(':rejected:')) {
           interleaveRenewal = false;
@@ -398,124 +486,48 @@ describe('game connection', () => {
       },
       removeItem: persistent.removeItem,
     };
-    let resolveResponse: ((response: Response) => void) | undefined;
-    const oldClient = harness({ storage, fetch: () => new Promise<Response>((resolve) => {
-      resolveResponse = resolve;
-    }) });
+    let resolveResponse: (response: Response) => void = () => { throw new Error('Request not started.'); };
+    const oldClient = harness({ storage, fetch: () => new Promise<Response>((resolve) => { resolveResponse = resolve; }) });
     await oldClient.connect();
     const pending = oldClient.game.requestConsent(attempt);
     interleaveRenewal = true;
-    if (resolveResponse === undefined) throw new Error('Consent request did not start.');
-    resolveResponse(Response.json({
-      error: { code: 'GAME_AUTHORIZATION_REQUIRED', message: 'Authorization rejected.' },
-    }, { status: 401 }));
+    resolveResponse(Response.json({ error: 'Rejected.' }, { status: 401 }));
     await expect(pending).rejects.toMatchObject({ status: 401 });
-
-    expect(harness({ storage: persistent }).game.getAuthorization()).toEqual(renewed);
     expect(oldClient.game.getAuthorization()).toEqual(renewed);
+    expect(harness({ storage: persistent }).game.getAuthorization()).toEqual(renewed);
   });
 
-  it('uses newer stored authorization when a cached authorization expires', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
-    const storage = memoryStorage();
-    const oldClient = harness({ storage });
-    const initial = oldClient.game.connect();
-    oldClient.emit(oldClient.message({ expiresAt: '2026-01-01T00:01:00.000Z' }));
-    await initial;
-
-    vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
-    const renewingClient = harness({ storage });
-    const renewal = renewingClient.game.connect();
-    renewingClient.emit(renewingClient.message({ authorizationToken: 'renewed-token' }));
-    await renewal;
-
-    expect(oldClient.game.getAuthorization()).toMatchObject({ authorizationToken: 'renewed-token' });
+  it.each(['connect', 'getAuthorization'] as const)('returns immutable cache snapshots through %s', async (source) => {
+    const requests: Request[] = [];
+    const h = harness({ fetch: async (input, init) => { requests.push(new Request(input, init)); return consentResponse(); } });
+    const connected = await h.connect();
+    const exposed = source === 'connect' ? connected : h.game.getAuthorization();
+    if (exposed === undefined) throw new Error('Missing authorization.');
+    exposed.authorizationToken = 'caller-mutated-token';
+    await h.game.requestConsent(attempt);
+    expect(at(requests, 0).headers.get('authorization')).toBe('GameAuthorization scoped-authorization');
   });
 
-  it.each(['connect', 'getAuthorization'] as const)(
-    'does not expose cached authorization through %s',
-    async (source) => {
-      const requests: Request[] = [];
-      const h = harness({
-        storage: memoryStorage(),
-        fetch: async (input, init) => {
-          requests.push(new Request(input, init));
-          return consentResponse();
-        },
-      });
-      const connected = await h.connect();
-      const exposed = source === 'connect' ? connected : h.game.getAuthorization();
-      if (exposed === undefined) throw new Error('Expected a connected authorization.');
-      exposed.authorizationToken = 'caller-mutated-token';
+  it.each(['clearSession', 'logout'] as const)('rejects an authorization arriving after pending connection %s', async (replacement) => {
+    let resolveResponse: (response: Response) => void = () => { throw new Error('Request not started.'); };
+    const h = harness({ authorizationFetch: () => new Promise<Response>((resolve) => { resolveResponse = resolve; }) });
+    const pending = h.game.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    if (replacement === 'clearSession') h.client.auth.clearSession();
+    else await h.client.auth.logout();
+    resolveResponse(Response.json({ version: '1', issuedAt, authorization }));
+    await connectionError(pending, 'authorization_required');
+    expect(h.game.getAuthorization()).toBeUndefined();
+    await expect(h.game.connect()).rejects.toBeInstanceOf(ConnectSessionRequiredError);
+  });
 
-      await h.game.requestConsent(attempt);
-
-      expect(at(requests, 0).headers.get('authorization')).toBe('GameAuthorization scoped-authorization');
-    },
-  );
-
-  it.each(['clearSession', 'logout'] as const)(
-    'opens a fresh game authorization after pending connection %s',
-    async (replacement) => {
-      const h = harness();
-      const stale = h.game.connect();
-      if (replacement === 'clearSession') {
-        h.client.auth.clearSession();
-      } else {
-        await h.client.auth.logout();
-      }
-
-      const current = h.game.connect();
-      expect(h.urls).toHaveLength(2);
-      at(h.windows, 0).closed = true;
-      await connectionError(stale, 'cancelled');
-
-      const shared = h.game.connect();
-      expect(h.urls).toHaveLength(2);
-      h.emit();
-      await expect(current).resolves.toEqual(authorization);
-      await expect(shared).resolves.toEqual(authorization);
-    },
-  );
-
-  it('shares valid authorization across instances for the same scope, not another app', async () => {
+  it.each(['clearSession', 'logout'] as const)('keeps saved game authorization independent from session %s', async (replacement) => {
     const h = harness();
     await h.connect();
-    const sameGame = h.client.games.forGame({ appId, groupId });
-    await expect(sameGame.connect()).resolves.toEqual(authorization);
-    const otherGame = h.client.games.forGame({ appId: '20000000-0000-0000-0000-000000000002', groupId });
-    await connectionError(otherGame.requestConsent(attempt), 'authorization_required');
-    expect(h.urls).toHaveLength(1);
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
-  });
-
-  it.each(['clearSession', 'logout'] as const)(
-    'keeps game authorization independent from SuperRare session %s',
-    async (replacement) => {
-      const h = harness();
-      await h.connect();
-      if (replacement === 'clearSession') h.client.auth.clearSession();
-      else await h.client.auth.logout();
-      expect(h.game.getAuthorization()).toEqual(authorization);
-      await expect(h.game.connect()).resolves.toEqual(authorization);
-      expect(h.urls).toHaveLength(1);
-    },
-  );
-
-  it.each(['success', 'cancelled'] as const)('settles %s even if unsubscribe throws', async (outcome) => {
-    const h = harness({ throwOnUnsubscribe: true });
-    const pending = h.game.connect();
-    if (outcome === 'success') {
-      h.emit();
-      await expect(pending).resolves.toEqual(authorization);
-    } else {
-      h.emit({ type: 'superrare-connect:game-authorization-cancelled',
-        state: h.message().state, appId, groupId });
-      await connectionError(pending, 'cancelled');
-    }
-    expect(at(h.windows, 0).closed).toBe(true);
-    expect(h.fetchImplementation).not.toHaveBeenCalled();
+    if (replacement === 'clearSession') h.client.auth.clearSession();
+    else await h.client.auth.logout();
+    await expect(h.game.connect()).resolves.toEqual(authorization);
+    expect(h.authorizationFetch).toHaveBeenCalledOnce();
   });
 });
 
@@ -594,6 +606,7 @@ describe('game credit purchases', () => {
       return Response.json({ error: 'Unknown game-scoped credit operation.' }, { status: 404 });
     } });
     await h.connect();
+    h.client.auth.clearSession();
     expect(h.client.auth.getSession()).toBeUndefined();
     await expect(h.game.credits.getBalance()).resolves.toEqual(balance);
     const quote = await h.game.credits.createPurchase();
@@ -603,7 +616,7 @@ describe('game credit purchases', () => {
       .resolves.toEqual({ purchase: creditedPurchase, balance: creditedBalance });
     await expect(h.game.credits.getPurchase(quote.id)).resolves.toEqual(creditedPurchase);
     await expect(h.game.credits.getBalance()).resolves.toEqual(creditedBalance);
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
   });
 
   it.each(operations)('requires explicit game connection before %s without fetching or opening a popup', async (_name, operation) => {
@@ -620,17 +633,17 @@ describe('game credit purchases', () => {
     const h = harness({ storage });
     const pending = h.game.connect();
     const expiresAt = '2026-01-01T00:01:00.000Z';
-    h.emit(h.message({ expiresAt }));
+    h.setAuthorization({ expiresAt });
     await pending;
     vi.setSystemTime(new Date(expiresAt));
     await connectionError(operation(h.game), 'authorization_required');
     expect(h.game.getAuthorization()).toBeUndefined();
     expect(h.fetchImplementation).not.toHaveBeenCalled();
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
     expect(harness({ storage }).game.getAuthorization()).toBeUndefined();
     const renewed = h.game.connect();
-    expect(h.urls).toHaveLength(2);
-    h.emit();
+    expect(h.open).not.toHaveBeenCalled();
+    h.setAuthorization();
     await expect(renewed).resolves.toEqual(authorization);
   });
 
@@ -649,10 +662,10 @@ describe('game credit purchases', () => {
       await connectionError(nextOperation(h.game), 'authorization_required');
     }
     expect(h.fetchImplementation).toHaveBeenCalledOnce();
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
     const renewed = h.game.connect();
-    expect(h.urls).toHaveLength(2);
-    h.emit();
+    expect(h.open).not.toHaveBeenCalled();
+    h.setAuthorization();
     await expect(renewed).resolves.toEqual(authorization);
   });
 
@@ -736,7 +749,7 @@ describe('inline paid confirmation', () => {
     expect(at(requests, 1).request.headers.get('idempotency-key')).toBe(attempt.idempotencyKey);
     expect(at(requests, 1).body).toEqual({ idempotencyKey: attempt.idempotencyKey,
       clientSessionId: attempt.clientSessionId, clientBuildId: attempt.clientBuildId, metadata: attempt.metadata });
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -749,34 +762,45 @@ describe('inline paid confirmation', () => {
     await expect(pending).rejects.toBeInstanceOf(SuperRareConnectApiError);
     await expect(pending).rejects.toMatchObject({ status, code });
     expect(h.fetchImplementation).toHaveBeenCalledTimes(1);
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
     if (status === 401) {
       await connectionError(h.game.requestConsent(attempt), 'authorization_required');
       expect(h.game.getAuthorization()).toBeUndefined();
       expect(h.fetchImplementation).toHaveBeenCalledTimes(1);
       const renewed = h.game.connect();
-      expect(h.urls).toHaveLength(2);
-      h.emit();
+      expect(h.open).not.toHaveBeenCalled();
+      h.setAuthorization();
       await renewed;
     } else {
       await h.game.connect();
-      expect(h.urls).toHaveLength(1);
+      expect(h.open).not.toHaveBeenCalled();
     }
   });
 
-  it('asks Studio to reject expired unused consent instead of returning a cached credential', async () => {
+  it.each(['expired', 'server-rejected'] as const)('checks saved %s consent with Studio before declaring the original attempt unused', async (mode) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     let issuanceCount = 0;
-    const h = harness({ fetch: async () => {
-      issuanceCount += 1;
-      if (issuanceCount === 1) return consentResponse();
-      return Response.json({ error: { code: 'CREDIT_GROUP_CONSENT_EXPIRED', message: 'Unused consent expired' } }, { status: 409 });
+    const h = harness({ fetch: async (input, init) => {
+      if (new Request(input, init).url.endsWith('/consents')) {
+        issuanceCount += 1;
+        if (issuanceCount === 1) {
+          const { consentId, ...fields } = consent;
+          return Response.json({ version: '1', consent: {
+            ...fields, id: consentId, expiresAt: '2026-01-01T00:02:00.000Z',
+          } });
+        }
+        return Response.json({ error: { code: 'CREDIT_GROUP_CONSENT_EXPIRED', message: 'Unused consent expired' } }, { status: 409 });
+      }
+      return Response.json({ error: { code: 'CREDIT_GROUP_PAID_CONSENT_REQUIRED', message: 'Paid consent required' } }, { status: 401 });
     } });
     await h.connect();
     await h.game.requestConsent(attempt);
-    await expect(h.game.requestConsent(attempt)).rejects.toMatchObject({
+    if (mode === 'expired') vi.setSystemTime(new Date('2026-01-01T00:03:00.000Z'));
+    await expect(h.game.recoverStart({ idempotencyKey: attempt.idempotencyKey })).rejects.toMatchObject({
       status: 409, code: 'CREDIT_GROUP_CONSENT_EXPIRED',
     });
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
   });
 
   it('recovers an uncertain consumed start even after consent and game authorization expire', async () => {
@@ -798,7 +822,7 @@ describe('inline paid confirmation', () => {
       return sessionResponse(true);
     } });
     const connecting = h.game.connect();
-    h.emit(h.message({ expiresAt: '2026-01-01T00:15:00.000Z' }));
+    h.setAuthorization({ expiresAt: '2026-01-01T00:15:00.000Z' });
     await connecting;
     const issued = await h.game.requestConsent(attempt);
     await expect(h.game.startWithConsent({ ...attempt, consent: issued.consent })).rejects.toThrow('Lost committed start response.');
@@ -806,7 +830,7 @@ describe('inline paid confirmation', () => {
     await expect(h.game.recoverStart({ idempotencyKey: attempt.idempotencyKey }))
       .resolves.toMatchObject({ session: { id: 'session-1' } });
     expect(paths).toEqual([`${appPath}/consents`, `${appPath}/uses`, `${appPath}/uses`]);
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
   });
 
   it.each(['disabled', 'blocked'] as const)('reports memory-only recovery when persistence is %s', async (mode) => {
@@ -826,7 +850,7 @@ describe('inline paid confirmation', () => {
     await expect(h.game.recoverStart({ idempotencyKey: attempt.idempotencyKey }))
       .resolves.toMatchObject({ session: { id: 'session-1' } });
     expect(paths).toEqual([`${appPath}/consents`, `${appPath}/uses`]);
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
   });
 
   it('reports memory recovery if saving the issued consent fails after the attempt was persisted', async () => {
@@ -883,7 +907,7 @@ describe('inline paid confirmation', () => {
     expect(at(requests, 0).body).toEqual(originalIssuanceBody);
     expect(at(requests, 1).body).toEqual({ idempotencyKey: attempt.idempotencyKey,
       clientSessionId: attempt.clientSessionId, clientBuildId: attempt.clientBuildId, metadata: attempt.metadata });
-    expect(reloaded.urls).toHaveLength(0);
+    expect(reloaded.open).not.toHaveBeenCalled();
   });
 
   it.each(['network', '503'] as const)('recovers a lost paid start (%s) after reload with the saved consent and original body', async (failure) => {
@@ -926,7 +950,7 @@ describe('inline paid confirmation', () => {
     await h.game.requestConsent(attempt);
     await connectionError(h.game.requestConsent({ ...attempt, ...changed }), 'attempt_mismatch');
     expect(h.fetchImplementation).toHaveBeenCalledTimes(1);
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
   });
 
   it('rejects recovery that changes the saved start body', async () => {
@@ -945,7 +969,7 @@ describe('inline paid confirmation', () => {
     await connectionError(h.game.startWithConsent({ ...attempt, consent: issued.consent,
       metadata: { difficulty: 'easy' } }), 'attempt_mismatch');
     expect(h.fetchImplementation).toHaveBeenCalledTimes(1);
-    expect(h.urls).toHaveLength(1);
+    expect(h.open).not.toHaveBeenCalled();
   });
 });
 
