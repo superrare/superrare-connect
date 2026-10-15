@@ -10,6 +10,14 @@ SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auctio
 pnpm add @rareprotocol/connect
 ```
 
+To opt into the `0.9.0-beta.0` prerelease after it has been published to npm:
+
+```sh
+pnpm add @rareprotocol/connect@0.9.0-beta.0
+```
+
+Prereleases use npm's `beta` dist-tag, not `latest`. A GitHub prerelease does not publish the npm package; the stable install above stays on the stable channel.
+
 ```ts
 import { createSuperRareClient } from '@rareprotocol/connect';
 
