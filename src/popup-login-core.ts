@@ -82,6 +82,13 @@ export type ConnectPopupLoginResult =
   | {
     /** The login intent expired while the popup was open. */
     status: 'expired';
+  }
+  | {
+    /**
+     * `display: 'redirect'` only: the page is navigating to the hosted login.
+     * The session arrives on the return page through `auth.handleRedirectCallback`.
+     */
+    status: 'redirected';
   };
 
 export type ConnectHostedUrlResult =

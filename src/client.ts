@@ -41,7 +41,17 @@ import {
   type ConnectAuthPendingVerificationError,
   type PendingConnectAuth,
 } from './auth-flow-core.js';
-import type { ConnectAuthCallbackParams } from './callback-core.js';
+import {
+  parseConnectAuthCallbackSearchParams,
+  type ConnectAuthCallbackParams,
+  type ConnectAuthCallbackParseErrorCode,
+} from './callback-core.js';
+import {
+  parseStoredPendingConnectAuth,
+  parseStoredPendingConnectRedirectIntent,
+  type ConnectDisplay,
+  type ConnectNavigation,
+} from './redirect-core.js';
 import {
   buildConnectCheckoutIntentRequest,
   type CheckoutStartParams,
@@ -70,7 +80,7 @@ import {
   resolveConnectHostedUrl,
   type ConnectPopupLoginResult,
 } from './popup-login-core.js';
-import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
+import { resolveConnectIntentOutcome, type ConnectCheckoutStatus, type ConnectIntent } from './status-core.js';
 import {
   parseClientScore,
   parseCreditBalance,
@@ -113,8 +123,18 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   initiatingOrigin?: string;
   createState?: () => string;
   /**
-   * Every hosted flow — login, checkout, actions, offers — opens in a small
-   * centered window; the integrator's page always stays put. These options
+   * `'popup'` (default) opens every hosted flow in its own window.
+   * `'redirect'` navigates this page to the hosted flow instead, and Connect
+   * returns to `returnPath` when it finishes; read the result there with
+   * `intents.getRedirectResult()` or `auth.handleRedirectCallback()`. Games
+   * keep their own window in both modes.
+   */
+  display?: ConnectDisplay;
+  /** How `display: 'redirect'` navigates; defaults to `window.location`. */
+  navigation?: ConnectNavigation;
+  /**
+   * In the default popup display, every hosted flow — login, checkout,
+   * actions, offers — opens in a small centered window. These options
    * shape that window: its size, the opener (defaults to the browser's
    * `window.open`), and the `message`-event source the login listens on.
    */
@@ -191,6 +211,12 @@ export type SuperRareConnectAuthNamespace = {
    * intent instead.
    */
   prepareLogin: (params?: ConnectAuthLoginParams) => Promise<ConnectPreparedLogin>;
+  /**
+   * `display: 'redirect'` only: on the login's `returnPath`, exchanges the
+   * one-time code in the URL (defaults to `window.location.search`) for a
+   * Connect session and stores it.
+   */
+  handleRedirectCallback: (searchParams?: URLSearchParams) => Promise<ConnectRedirectLoginResult>;
   getSession: () => ConnectSession | undefined;
   /** Returns a current opaque access token, renewing the session when necessary. */
   getAccessToken: () => Promise<string>;
@@ -231,7 +257,25 @@ export type SuperRareConnectOffersNamespace = {
 
 export type SuperRareConnectIntentsNamespace = {
   get: (params: { intentId: string }) => Promise<ConnectIntent>;
+  /**
+   * `display: 'redirect'` only: the intent of the last action this browser
+   * redirected to, read fresh from Rare API, or `undefined` when there is
+   * none. The record is dropped once the intent is final.
+   */
+  getRedirectResult: () => Promise<ConnectIntent | undefined>;
 };
+
+export type ConnectRedirectLoginResult =
+  | {
+    status: 'authenticated';
+    session: ConnectSession;
+    /** Profile of the signed-in user; `undefined` when the lookup fails. */
+    user: ConnectCurrentUser | undefined;
+  }
+  | {
+    /** A logout or newer login on this client landed before the session was stored. */
+    status: 'cancelled';
+  };
 
 export type SuperRareGameStartParams = {
   idempotencyKey?: string;
@@ -292,6 +336,16 @@ export class ConnectAuthPendingError extends Error {
   constructor(code: ConnectAuthPendingVerificationError) {
     super(`Invalid Connect auth pending state: ${code}`);
     this.name = 'ConnectAuthPendingError';
+    this.code = code;
+  }
+}
+
+export class ConnectAuthCallbackError extends Error {
+  readonly code: ConnectAuthCallbackParseErrorCode;
+
+  constructor(code: ConnectAuthCallbackParseErrorCode) {
+    super(`Invalid Connect auth callback: ${code}`);
+    this.name = 'ConnectAuthCallbackError';
     this.code = code;
   }
 }
@@ -366,6 +420,33 @@ export function createSuperRareClient(
     }),
   });
   const createState = options.createState ?? createConnectState;
+  const redirectDisplay = options.display === 'redirect';
+  // Per tab by default: two tabs redirecting at once must not overwrite each
+  // other's pending login or intent, as a shared localStorage slot would.
+  const redirectStorage = options.sessionStorage === false
+    ? undefined
+    : options.sessionStorage ?? readBrowserSessionStorage();
+  const pendingRedirectLoginKey = `${storageKey}:redirect-login`;
+  const pendingRedirectIntentKey = `${storageKey}:redirect-intent`;
+  const navigateTo = (url: string): void => {
+    const navigation = options.navigation ?? readBrowserNavigation();
+    if (navigation === undefined) {
+      throw new Error('Redirect display needs window.location; provide options.navigation on hosts without it.');
+    }
+    navigation.assign(url);
+  };
+  const readRedirectRecord = (key: string): string | undefined => {
+    try {
+      return redirectStorage?.getItem(key) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const removeRedirectRecord = (key: string): void => {
+    try {
+      redirectStorage?.removeItem(key);
+    } catch { /* Blocked storage holds nothing to remove. */ }
+  };
   const commitSession = async (
     credentials: ConnectAuthCredentials,
     shouldCommit: () => boolean,
@@ -536,6 +617,20 @@ export function createSuperRareClient(
       throw requestResult.error === 'invalid_return_path'
         ? new ConnectReturnPathError()
         : new ConnectActionValidationError(requestResult.error);
+    }
+
+    if (redirectDisplay) {
+      const intent = resolveHostedIntent(await createConnectIntent({
+        ...apiOptions,
+        request: requestResult.request,
+      }));
+      requireNavigableHostedUrl(intent.url);
+      await beforeOpen?.({ ...intent });
+      try {
+        redirectStorage?.setItem(pendingRedirectIntentKey, JSON.stringify({ intentId: intent.intentId }));
+      } catch { /* The caller still has intentId to read the result. */ }
+      navigateTo(intent.url);
+      return intent;
     }
 
     // The popup must open before the first await to stay inside the user
@@ -1041,9 +1136,62 @@ export function createSuperRareClient(
     }
   };
 
+  const startRedirectLogin = async (
+    params: ConnectAuthLoginParams,
+  ): Promise<ConnectPopupLoginResult> => {
+    if (redirectStorage === undefined) {
+      throw new Error('A redirect login needs SDK storage to survive the navigation; it is unavailable or disabled with sessionStorage: false.');
+    }
+
+    const started = takePreparedLogin(params)?.started ?? await createLoginIntent(params, {
+      signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
+    });
+    requireNavigableHostedUrl(started.intent.url);
+    redirectStorage.setItem(pendingRedirectLoginKey, JSON.stringify(started.pendingAuth));
+    navigateTo(started.intent.url);
+    return { status: 'redirected' };
+  };
+
+  let inFlightRedirectCallback: { key: string; promise: Promise<ConnectRedirectLoginResult> } | undefined;
+  const completeRedirectLogin = async (searchParams: URLSearchParams): Promise<ConnectRedirectLoginResult> => {
+    const parsed = parseConnectAuthCallbackSearchParams(searchParams);
+    if (!parsed.ok) throw new ConnectAuthCallbackError(parsed.error);
+
+    const storedPendingAuth = readRedirectRecord(pendingRedirectLoginKey);
+    const verification = verifyConnectAuthCallbackAgainstPending({
+      pendingAuth: storedPendingAuth === undefined
+        ? undefined
+        : parseStoredPendingConnectAuth(storedPendingAuth),
+      callbackParams: parsed.params,
+    });
+    if (!verification.ok) throw new ConnectAuthPendingError(verification.error);
+
+    removeRedirectRecord(pendingRedirectLoginKey);
+    const operationGeneration = sessionCommitGeneration;
+    const credentials = await exchangeConnectAuthCode(parsed.params, {
+      ...apiOptions,
+      signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
+    });
+    const committed = await commitSession(
+      credentials,
+      () => operationGeneration === sessionCommitGeneration,
+    );
+    if (!committed) return { status: 'cancelled' };
+
+    const session = credentials.session;
+    const user = await getConnectCurrentUser({
+      ...apiOptions,
+      sessionId: session.sessionId,
+      signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
+    }).catch((): undefined => undefined);
+    return { status: 'authenticated', session, user };
+  };
+
   const login = async (
     params: ConnectAuthLoginParams = {},
   ): Promise<ConnectPopupLoginResult> => {
+    if (redirectDisplay) return await startRedirectLogin(params);
+
     // One login at a time: the SDK holds a single session, so a second
     // concurrent login could only race the first for the same slot. A
     // caller that asks again — a double click — joins the login already
@@ -1466,6 +1614,17 @@ export function createSuperRareClient(
       login,
       loginWithPopup: login,
       prepareLogin,
+      async handleRedirectCallback(
+        searchParams = readBrowserSearchParams(),
+      ): Promise<ConnectRedirectLoginResult> {
+        // A page that runs its callback handler twice (React StrictMode
+        // effects) joins the exchange already running for the same URL.
+        const callbackKey = searchParams.toString();
+        if (inFlightRedirectCallback?.key !== callbackKey) {
+          inFlightRedirectCallback = { key: callbackKey, promise: completeRedirectLogin(searchParams) };
+        }
+        return await inFlightRedirectCallback.promise;
+      },
       getSession: sessionLifecycle.getSession,
       async getAccessToken(): Promise<string> {
         const session = await sessionLifecycle.getCurrentSession();
@@ -1599,6 +1758,27 @@ export function createSuperRareClient(
           ...apiOptions,
           intentId: params.intentId,
         });
+      },
+      async getRedirectResult(): Promise<ConnectIntent | undefined> {
+        const storedPending = readRedirectRecord(pendingRedirectIntentKey);
+        const pending = storedPending === undefined
+          ? undefined
+          : parseStoredPendingConnectRedirectIntent(storedPending);
+        if (pending === undefined) return undefined;
+
+        let intent: ConnectIntent;
+        try {
+          intent = await getConnectIntent({ ...apiOptions, intentId: pending.intentId });
+        } catch (error) {
+          if (error instanceof SuperRareConnectApiError && (error.status === 404 || error.status === 410)) {
+            removeRedirectRecord(pendingRedirectIntentKey);
+          }
+          throw error;
+        }
+        if (resolveConnectIntentOutcome(intent).kind !== 'pending') {
+          removeRedirectRecord(pendingRedirectIntentKey);
+        }
+        return intent;
       },
     },
     games,
@@ -1873,6 +2053,35 @@ function createConnectPopupName(): string {
   }
 
   return `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+}
+
+function readBrowserNavigation(): ConnectNavigation | undefined {
+  const location = Reflect.get(globalThis, 'location');
+  if (typeof location !== 'object' || location === null) return undefined;
+  const assign: unknown = Reflect.get(location, 'assign');
+  return typeof assign === 'function'
+    ? { assign: (url) => { assign.call(location, url); } }
+    : undefined;
+}
+
+function readBrowserSessionStorage(): ConnectSessionStorage | undefined {
+  try {
+    const storage = Reflect.get(globalThis, 'sessionStorage');
+    return isConnectSessionStorage(storage) ? storage : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readBrowserSearchParams(): URLSearchParams {
+  const location = Reflect.get(globalThis, 'location');
+  const search: unknown = typeof location === 'object' && location !== null
+    ? Reflect.get(location, 'search')
+    : undefined;
+  if (typeof search !== 'string') {
+    throw new Error('handleRedirectCallback needs window.location; pass the callback URLSearchParams explicitly.');
+  }
+  return new URLSearchParams(search);
 }
 
 function readBrowserOrigin(): string | undefined {

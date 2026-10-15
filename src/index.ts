@@ -1,11 +1,13 @@
 export {
   ConnectActionValidationError,
+  ConnectAuthCallbackError,
   ConnectAuthPendingError,
   ConnectPopupBlockedError,
   ConnectReturnPathError,
   ConnectSessionRequiredError,
   createSuperRareClient,
   type SuperRareConnectActionsNamespace,
+  type ConnectRedirectLoginResult,
   type ConnectAuthLoginParams,
   type ConnectPopupMessageEvent,
   type ConnectPopupMessageEvents,
@@ -96,7 +98,12 @@ export {
 } from './auth-flow-core.js';
 export {
   type ConnectAuthCallbackParams,
+  type ConnectAuthCallbackParseErrorCode,
 } from './callback-core.js';
+export {
+  type ConnectDisplay,
+  type ConnectNavigation,
+} from './redirect-core.js';
 export {
   type CheckoutStartParams,
 } from './checkout-flow-core.js';
