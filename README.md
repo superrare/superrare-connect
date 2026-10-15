@@ -27,7 +27,9 @@ const superrare = createSuperRareClient({
 
 ## Studio Games, Credits, And Leaderboards (Beta)
 
-**Beta access:** This feature is not generally released. Use is limited to integrations with a beta API key. Contact SuperRare for beta access before using this SDK surface.
+For a cloneable, multi-game organizer setup, use [Studio Games Example](https://github.com/superrare/studio-games-example) and its [organizer runbook](https://github.com/superrare/studio-games-example/blob/main/docs/organizer-runbook.md). That standalone repository consumes the published SDK and owns the game clients, server verifiers, shared-credit setup, deployment instructions, and recovery workflow; keep game-template development there rather than adding another copy to this SDK repository.
+
+**Studio permissions:** An authenticated organizer can create and manage their own credit groups with an `apps`-scoped CLI token; only an app's creator can publish its verifier and scoring events. The organizer workflow does not require a separate organizer-approval step, beta API key, or database/service-role credentials. Follow the standalone runbook for the deployed integration and current release requirements.
 
 Games use an explicit Studio origin; `studioUrl` is not the Rare/Connect API URL. A free game does not need a credit group:
 
