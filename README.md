@@ -699,7 +699,7 @@ await superrare.actions.buy({
 });
 ```
 
-The SDK remembers the intent it redirected to in the tab's `sessionStorage`, so two tabs redirecting at once do not overwrite each other. On the return page, read it back:
+The SDK remembers the intent it redirected to in the tab's `sessionStorage`, so two tabs redirecting at once do not overwrite each other. That holds even when you pass a custom `sessionStorage`: it only backs redirect records on hosts with no `sessionStorage` of their own. On the return page, read it back:
 
 ```ts
 const intent = await superrare.intents.getRedirectResult();
@@ -720,7 +720,10 @@ if (intent !== undefined) {
 
 ```ts
 const result = await superrare.auth.handleRedirectCallback();
-history.replaceState(null, '', location.pathname); // drop the one-time code from the URL
+// Drop the one-time callback parameters and keep the rest of your URL.
+const url = new URL(location.href);
+for (const key of ['intentId', 'state', 'code']) url.searchParams.delete(key);
+history.replaceState(null, '', url);
 if (result.status === 'authenticated') {
   result.session.address; // the authenticated wallet
 }

@@ -273,7 +273,7 @@ export type ConnectRedirectLoginResult =
     user: ConnectCurrentUser | undefined;
   }
   | {
-    /** A logout or newer login on this client landed before the session was stored. */
+    /** A logout, or a newer login on this client or another tab, landed before the session was stored. */
     status: 'cancelled';
   };
 
@@ -421,11 +421,13 @@ export function createSuperRareClient(
   });
   const createState = options.createState ?? createConnectState;
   const redirectDisplay = options.display === 'redirect';
-  // Per tab by default: two tabs redirecting at once must not overwrite each
-  // other's pending login or intent, as a shared localStorage slot would.
+  // Per tab: two tabs redirecting at once must not overwrite each other's
+  // pending login or intent, as a shared credential slot would — so the tab's
+  // sessionStorage wins over an injected (often shared) storage, which only
+  // backs hosts that have no sessionStorage.
   const redirectStorage = options.sessionStorage === false
     ? undefined
-    : options.sessionStorage ?? readBrowserSessionStorage();
+    : readBrowserSessionStorage() ?? options.sessionStorage;
   const pendingRedirectLoginKey = `${storageKey}:redirect-login`;
   const pendingRedirectIntentKey = `${storageKey}:redirect-intent`;
   const navigateTo = (url: string): void => {
@@ -1143,9 +1145,11 @@ export function createSuperRareClient(
       throw new Error('A redirect login needs SDK storage to survive the navigation; it is unavailable or disabled with sessionStorage: false.');
     }
 
+    const operationGeneration = sessionCommitGeneration;
     const started = takePreparedLogin(params)?.started ?? await createLoginIntent(params, {
       signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
     });
+    if (operationGeneration !== sessionCommitGeneration) return { status: 'cancelled' };
     requireNavigableHostedUrl(started.intent.url);
     redirectStorage.setItem(pendingRedirectLoginKey, JSON.stringify(started.pendingAuth));
     navigateTo(started.intent.url);
@@ -1166,16 +1170,19 @@ export function createSuperRareClient(
     });
     if (!verification.ok) throw new ConnectAuthPendingError(verification.error);
 
-    removeRedirectRecord(pendingRedirectLoginKey);
     const operationGeneration = sessionCommitGeneration;
+    const replacementGeneration = sessionLifecycle.getReplacementGeneration();
     const credentials = await exchangeConnectAuthCode(parsed.params, {
       ...apiOptions,
       signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
     });
-    const committed = await commitSession(
-      credentials,
-      () => operationGeneration === sessionCommitGeneration,
-    );
+    removeRedirectRecord(pendingRedirectLoginKey);
+    const committed = await commitSession(credentials, () => {
+      const currentSession = sessionLifecycle.getSession();
+      return operationGeneration === sessionCommitGeneration &&
+        (currentSession === undefined ||
+          sessionLifecycle.getReplacementGeneration() === replacementGeneration);
+    });
     if (!committed) return { status: 'cancelled' };
 
     const session = credentials.session;
@@ -1621,7 +1628,12 @@ export function createSuperRareClient(
         // effects) joins the exchange already running for the same URL.
         const callbackKey = searchParams.toString();
         if (inFlightRedirectCallback?.key !== callbackKey) {
-          inFlightRedirectCallback = { key: callbackKey, promise: completeRedirectLogin(searchParams) };
+          const promise = completeRedirectLogin(searchParams);
+          inFlightRedirectCallback = { key: callbackKey, promise };
+          // A failed exchange keeps its pending record, so the same URL can retry.
+          promise.catch(() => {
+            if (inFlightRedirectCallback?.promise === promise) inFlightRedirectCallback = undefined;
+          });
         }
         return await inFlightRedirectCallback.promise;
       },

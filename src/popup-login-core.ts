@@ -76,7 +76,10 @@ export type ConnectPopupLoginResult =
     user: ConnectCurrentUser | undefined;
   }
   | {
-    /** The user closed the popup before completing the login. */
+    /**
+     * The user closed the popup before completing the login, or (redirect
+     * display) a logout landed before the page navigated to the hosted login.
+     */
     status: 'cancelled';
   }
   | {
