@@ -76,12 +76,22 @@ export type ConnectPopupLoginResult =
     user: ConnectCurrentUser | undefined;
   }
   | {
-    /** The user closed the popup before completing the login. */
+    /**
+     * The user closed the popup before completing the login, or (redirect
+     * display) a logout landed before the page navigated to the hosted login.
+     */
     status: 'cancelled';
   }
   | {
     /** The login intent expired while the popup was open. */
     status: 'expired';
+  }
+  | {
+    /**
+     * `display: 'redirect'` only: the page is navigating to the hosted login.
+     * The session arrives on the return page through `auth.handleRedirectCallback`.
+     */
+    status: 'redirected';
   };
 
 export type ConnectHostedUrlResult =

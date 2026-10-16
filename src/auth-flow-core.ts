@@ -341,9 +341,9 @@ export type BuildConnectLoginIntentRequestResult =
   | Extract<ReturnPathNormalizationResult, { ok: false }>;
 
 /**
- * A login's own record of the intent it started — held in memory by the
- * client for the life of the popup, and matched against the callback the
- * hosted page posts back.
+ * A login's own record of the intent it started, matched against the
+ * callback the hosted page reports back. A popup login holds it in memory;
+ * a redirect login keeps it in the tab's storage across the navigation.
  */
 export type PendingConnectAuth = {
   intentId: string;
