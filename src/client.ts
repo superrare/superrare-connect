@@ -430,12 +430,12 @@ export function createSuperRareClient(
     : readBrowserSessionStorage() ?? options.sessionStorage;
   const pendingRedirectLoginKey = `${storageKey}:redirect-login`;
   const pendingRedirectIntentKey = `${storageKey}:redirect-intent`;
-  const navigateTo = (url: string): void => {
+  const requireNavigation = (): ConnectNavigation => {
     const navigation = options.navigation ?? readBrowserNavigation();
     if (navigation === undefined) {
       throw new Error('Redirect display needs window.location; provide options.navigation on hosts without it.');
     }
-    navigation.assign(url);
+    return navigation;
   };
   const readRedirectRecord = (key: string): string | undefined => {
     try {
@@ -444,9 +444,11 @@ export function createSuperRareClient(
       return undefined;
     }
   };
-  const removeRedirectRecord = (key: string): void => {
+  // Only the operation that read a record may remove it: a newer redirect
+  // started meanwhile has written its own under the same key.
+  const removeRedirectRecord = (key: string, readRecord: string | undefined): void => {
     try {
-      redirectStorage?.removeItem(key);
+      if (readRecord !== undefined && redirectStorage?.getItem(key) === readRecord) redirectStorage.removeItem(key);
     } catch { /* Blocked storage holds nothing to remove. */ }
   };
   const commitSession = async (
@@ -622,6 +624,7 @@ export function createSuperRareClient(
     }
 
     if (redirectDisplay) {
+      const navigation = requireNavigation();
       const intent = resolveHostedIntent(await createConnectIntent({
         ...apiOptions,
         request: requestResult.request,
@@ -631,7 +634,7 @@ export function createSuperRareClient(
       try {
         redirectStorage?.setItem(pendingRedirectIntentKey, JSON.stringify({ intentId: intent.intentId }));
       } catch { /* The caller still has intentId to read the result. */ }
-      navigateTo(intent.url);
+      navigation.assign(intent.url);
       return intent;
     }
 
@@ -691,7 +694,7 @@ export function createSuperRareClient(
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
   const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
   let popupLoginReplacementGeneration = 0;
-  let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
+  let inFlightLogin: Promise<ConnectPopupLoginResult> | undefined;
   const createLoginIntent = async (
     params: ConnectAuthLoginParams,
     // Not `options`: that name belongs to the client options this closure
@@ -1145,14 +1148,17 @@ export function createSuperRareClient(
       throw new Error('A redirect login needs SDK storage to survive the navigation; it is unavailable or disabled with sessionStorage: false.');
     }
 
+    const navigation = requireNavigation();
+    const prepared = takePreparedLogin(params);
+    sessionCommitGeneration += 1;
     const operationGeneration = sessionCommitGeneration;
-    const started = takePreparedLogin(params)?.started ?? await createLoginIntent(params, {
+    const started = prepared?.started ?? await createLoginIntent(params, {
       signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
     });
     if (operationGeneration !== sessionCommitGeneration) return { status: 'cancelled' };
     requireNavigableHostedUrl(started.intent.url);
     redirectStorage.setItem(pendingRedirectLoginKey, JSON.stringify(started.pendingAuth));
-    navigateTo(started.intent.url);
+    navigation.assign(started.intent.url);
     return { status: 'redirected' };
   };
 
@@ -1176,7 +1182,7 @@ export function createSuperRareClient(
       ...apiOptions,
       signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
     });
-    removeRedirectRecord(pendingRedirectLoginKey);
+    removeRedirectRecord(pendingRedirectLoginKey, storedPendingAuth);
     const committed = await commitSession(credentials, () => {
       const currentSession = sessionLifecycle.getSession();
       return operationGeneration === sessionCommitGeneration &&
@@ -1197,20 +1203,19 @@ export function createSuperRareClient(
   const login = async (
     params: ConnectAuthLoginParams = {},
   ): Promise<ConnectPopupLoginResult> => {
-    if (redirectDisplay) return await startRedirectLogin(params);
-
     // One login at a time: the SDK holds a single session, so a second
     // concurrent login could only race the first for the same slot. A
     // caller that asks again — a double click — joins the login already
-    // running instead of opening a second window.
-    if (inFlightPopupLogin === undefined) {
-      const pending = runPopupLogin(params).finally(() => {
-        if (inFlightPopupLogin === pending) inFlightPopupLogin = undefined;
+    // running instead of opening a second window or navigating twice.
+    if (inFlightLogin === undefined) {
+      const started = redirectDisplay ? startRedirectLogin(params) : runPopupLogin(params);
+      const pending = started.finally(() => {
+        if (inFlightLogin === pending) inFlightLogin = undefined;
       });
-      inFlightPopupLogin = pending;
+      inFlightLogin = pending;
     }
 
-    return await inFlightPopupLogin;
+    return await inFlightLogin;
   };
 
   const gameAuthorizations = new Map<string, {
@@ -1655,12 +1660,12 @@ export function createSuperRareClient(
       },
       clearSession(): void {
         sessionCommitGeneration += 1;
-        inFlightPopupLogin = undefined;
+        inFlightLogin = undefined;
         sessionLifecycle.clear();
       },
       async logout(): Promise<void> {
         sessionCommitGeneration += 1;
-        inFlightPopupLogin = undefined;
+        inFlightLogin = undefined;
         await sessionLifecycle.logout();
       },
       onChange(callback): () => void {
@@ -1783,12 +1788,12 @@ export function createSuperRareClient(
           intent = await getConnectIntent({ ...apiOptions, intentId: pending.intentId });
         } catch (error) {
           if (error instanceof SuperRareConnectApiError && (error.status === 404 || error.status === 410)) {
-            removeRedirectRecord(pendingRedirectIntentKey);
+            removeRedirectRecord(pendingRedirectIntentKey, storedPending);
           }
           throw error;
         }
         if (resolveConnectIntentOutcome(intent).kind !== 'pending') {
-          removeRedirectRecord(pendingRedirectIntentKey);
+          removeRedirectRecord(pendingRedirectIntentKey, storedPending);
         }
         return intent;
       },

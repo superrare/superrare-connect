@@ -716,7 +716,7 @@ if (intent !== undefined) {
 
 ### Redirect login
 
-`auth.login()` resolves `{ status: 'redirected' }` and navigates to the hosted login. Connect returns to `returnPath` with `intentId`, `state`, and a one-time `code` in the query. Exchange them on that page:
+`auth.login()` resolves `{ status: 'redirected' }` and navigates to the hosted login; a second call while it starts joins it. Connect returns to `returnPath` with `intentId`, `state`, and a one-time `code` in the query. Exchange them on that page:
 
 ```ts
 const result = await superrare.auth.handleRedirectCallback();
@@ -735,7 +735,7 @@ if (result.status === 'authenticated') {
 - Malformed callback parameters throw `ConnectAuthCallbackError`. A callback that does not match the pending login throws `ConnectAuthPendingError`.
 - `auth.prepareLogin()` still works: the redirect uses the prepared intent.
 
-The `popup` and `onIntentSettled` options do not apply in redirect mode. `game.connect()` keeps its own window in both modes. On hosts without `window.location`, pass `navigation: { assign }`.
+The `popup` and `onIntentSettled` options do not apply in redirect mode. `game.connect()` keeps its own window in both modes. On hosts without `window.location`, pass `navigation: { assign }`; without either, redirect calls throw before creating an intent.
 
 ## Return Path Safety
 
