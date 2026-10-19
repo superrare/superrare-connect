@@ -288,8 +288,8 @@ export type SuperRareGameClient = {
   getActiveScoringEvent: () => Promise<{ eventId: string }>;
   /** Reads the highest completed authoritative run score, or null when no score exists. */
   getServerTopScore: () => Promise<number | null>;
-  /** Public top ten scorers' best completed authoritative runs across this game's events and deployments. */
-  getServerLeaderboard: () => Promise<GameLeaderboardEntry[]>;
+  /** Public top ten scorers across events/deployments; optional paired bounds scope database completion times to [from,to). */
+  getServerLeaderboard: (params?: { from: string; to: string }) => Promise<GameLeaderboardEntry[]>;
   startServerValidatedRun: (params: { sessionToken: string; eventId: string; idempotencyKey: string }) => Promise<ServerValidatedGameRun>;
   getLeaderboard: (params?: { leaderboardKey?: string; seasonKey?: string; limit?: number; cursor?: string }) => Promise<GameLeaderboard>;
   getMyBest: (params: { sessionToken: string; leaderboardKey?: string; seasonKey?: string }) => Promise<GameLeaderboardEntry | null>;
@@ -1568,9 +1568,10 @@ export function createSuperRareClient(
           return parseServerTopScore(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
             path: `${gamePath}/scoring/top-score`, }));
         },
-        async getServerLeaderboard(): Promise<GameLeaderboardEntry[]> {
+        async getServerLeaderboard(params): Promise<GameLeaderboardEntry[]> {
+          const suffix = params === undefined ? '' : `?${new URLSearchParams({ from: params.from, to: params.to }).toString()}`;
           return parseServerLeaderboard(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,
-            path: `${gamePath}/scoring/leaderboard`, }));
+            path: `${gamePath}/scoring/leaderboard${suffix}`, }), params);
         },
         async startServerValidatedRun(params): Promise<ServerValidatedGameRun> {
           return parseServerRun(await requestStudioJson({ studioUrl: requireStudioUrl(), fetch: options.fetch,

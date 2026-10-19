@@ -150,6 +150,19 @@ Studio provisions and pins the uploaded root `server-verifier.js` to the publish
 
 Wallet leaderboard players may additionally include `ensName: string | null`. Studio resolves Ethereum-mainnet ENS and verifies that the name resolves back to the original wallet before returning it. This is display metadata only: `id`, `chainId`, scores, ranks and ordering do not change. Prefer a non-null ENS name for a wallet label, retain the full wallet address for inspection, and fall back to `displayName` when the field is absent or null. Missing server configuration, RPC errors and bounded lookup deadlines do not make scores unavailable. Session identities need not include this optional field.
 
+Pass both `from` and `to` to request a weekly or other explicit time window:
+
+```ts
+const weeklyLeaders = await game.getServerLeaderboard({
+  from: '2026-10-19T00:00:00Z',
+  to: '2026-10-26T00:00:00Z',
+});
+```
+
+Bounds must be valid ISO timestamps with an explicit timezone and `from < to`. Studio uses each completed run's database-recorded completion time: `from` is inclusive and `to` is exclusive. It filters all matching runs before selecting each scorer's best run and ranking the top ten, so an older all-time best cannot hide a valid weekly score. Offset and fractional-second precision are preserved in the request. Omitting the bounds keeps all-time standings; `getServerTopScore()` also remains all-time. Weekly boundaries/timezones are chosen by the caller, not inferred from a player's browser clock. These reads require the corresponding Studio time-window API and migration `087_server_game_leaderboard_time_window.sql`; they do not reset scores or automate prizes.
+
+Windowed responses must acknowledge the exact requested bounds. The SDK rejects missing or mismatched acknowledgements, including an older API that silently ignores range parameters and returns all-time standings; it never filters an all-time top ten locally as a substitute.
+
 After a lost run-start response or socket disconnect, re-post the **original event, run key, and paid PlaySession token** using `startServerValidatedRun`; the platform returns the existing run with a fresh one-use socket ticket. Do not start another paid play to recover that run.
 
 Community/default leaderboard reads use the same game client but can include historical unverified or client-asserted scores. They are not a substitute for the authoritative server leaderboard:
