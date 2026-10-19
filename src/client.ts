@@ -639,10 +639,10 @@ export function createSuperRareClient(
       }));
       requireNavigableHostedUrl(intent.url);
       await beforeOpen?.({ ...intent });
+      navigation.assign(intent.url);
       try {
         redirectStorage?.setItem(pendingRedirectIntentKey, JSON.stringify({ intentId: intent.intentId }));
       } catch { /* The caller still has intentId to read the result. */ }
-      navigation.assign(intent.url);
       return intent;
     }
 

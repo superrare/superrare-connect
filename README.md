@@ -640,7 +640,7 @@ const superrare = createSuperRareClient({
 });
 ```
 
-Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
+Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations. Every login, popup or redirect, also needs Web Crypto (`crypto.subtle`, a secure context) for its PKCE verifier, even with a custom `createState`.
 
 ## Testing on Sepolia
 
@@ -730,7 +730,7 @@ if (result.status === 'authenticated') {
 ```
 
 - `handleRedirectCallback()` reads `window.location.search` by default, or the `URLSearchParams` you pass.
-- The login is bound to a PKCE verifier (S256) that the SDK keeps in the tab's `sessionStorage` and never puts in a URL, so the callback values cannot be exchanged or reclaimed without it. Login therefore needs a secure context (HTTPS or `localhost`) with Web Crypto, and throws before creating an intent without one.
+- The login is bound to a PKCE verifier (S256) that the SDK keeps in the tab's `sessionStorage` and never puts in a URL, so, against a Rare API that enforces PKCE, the callback values cannot be exchanged or reclaimed without it. Login therefore needs a secure context (HTTPS or `localhost`) with Web Crypto, and throws before creating an intent without one.
 - It checks `intentId` and `state` against the login this tab started, so it needs SDK storage. Without storage, `auth.login()` throws before creating an intent. The user has to come back in the tab that started the login.
 - It resolves `cancelled` when, while the code is being exchanged, a logout on this client lands, a newer login on this client navigates away, or another tab or client stores a session. A newer login that fails before navigating leaves the callback alone; one that navigates after the session is stored leaves it in place.
 - `auth.logout()` or `auth.clearSession()` before the callback is handled invalidates the pending login, even with no session: the callback then throws `ConnectAuthPendingError` (`missing_pending_auth`). The pending action redirect survives both, since an action does not need a session.

@@ -179,6 +179,33 @@ describe('display: redirect actions', () => {
     await expect(returnPage.intents.getRedirectResult()).resolves.toMatchObject({ intentId: 'connect_intent_buy' });
   });
 
+  it('keeps the earlier redirected intent when navigating to a new one throws', async () => {
+    const createdIntents = ['connect_intent_first', 'connect_intent_second'];
+    let navigationFails = false;
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: {
+        assign: () => {
+          if (navigationFails) throw new Error('navigation blocked');
+        },
+      },
+      sessionStorage: memoryStorage(),
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.method === 'POST') return intentCreationResponse(createdIntents.shift() ?? 'connect_intent_extra');
+        const intentId = new URL(request.url).pathname.split('/').at(-1) ?? '';
+        return intentResponse(intentId, 'processing');
+      },
+    });
+    await client.actions.buy(buyParams);
+
+    navigationFails = true;
+    await expect(client.actions.buy(buyParams)).rejects.toThrow('navigation blocked');
+
+    await expect(client.intents.getRedirectResult()).resolves.toMatchObject({ intentId: 'connect_intent_first' });
+  });
+
   it('returns undefined when no redirect was started', async () => {
     const fetchImplementation = vi.fn();
     const client = createSuperRareClient({
