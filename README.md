@@ -10,6 +10,8 @@ SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auctio
 pnpm add @rareprotocol/connect
 ```
 
+Version `0.9.0` is the stable release of `0.9.0-beta.0`, with the same SDK runtime and public API. Install the stable channel with `pnpm add @rareprotocol/connect@latest`; the `beta` npm tag remains a separate opt-in channel.
+
 ```ts
 import { createSuperRareClient } from '@rareprotocol/connect';
 
@@ -821,3 +823,18 @@ Package outputs:
 - `dist/index.cjs` for CommonJS consumers.
 - `dist/superrare-connect.global.js` for direct browser script usage.
 - `dist/index.d.ts` for TypeScript declarations.
+
+### Publishing A Stable Release
+
+From the merged release commit, run:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm test
+pnpm build
+npm pack
+npm publish ./rareprotocol-connect-0.9.0.tgz --access public --tag latest --dry-run
+npm publish ./rareprotocol-connect-0.9.0.tgz --access public --tag latest
+```
+
+Only the final command publishes to npm and updates `latest`. Creating or merging a GitHub release PR, or creating a GitHub release, does not publish the package to npm. Publishing requires npm credentials authorized for `@rareprotocol/connect` and any required two-factor authentication.
