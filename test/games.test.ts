@@ -155,6 +155,18 @@ describe('authoritative scoring reads', () => {
   });
 
   it.each([
+    { version: '1', entries: [] },
+    { version: '1', entries: [], from: '2026-10-12T00:00:00Z', to: '2026-10-26T00:00:00Z' },
+    { version: '1', entries: [], from: '2026-10-19T00:00:00Z', to: '2026-11-02T00:00:00Z' },
+  ])('rejects unacknowledged or mismatched weekly standings instead of accepting an all-time response: %j', async (body) => {
+    const h = harness({ signedIn: false, fetch: async () => Response.json(body) });
+    await expect(h.game.getServerLeaderboard({
+      from: '2026-10-19T00:00:00Z',
+      to: '2026-10-26T00:00:00Z',
+    })).rejects.toThrow();
+  });
+
+  it.each([
     { trustLevel: 'legacy_unverified' }, { trustLevel: 'client_asserted' }, { trustLevel: 'replay_verified' },
     { score: '-1' }, { score: '1e3' }, { score: ' 42' }, { score: '' }, { score: 42 },
     { score: '1.5' }, { score: '1.0' }, { score: '00' }, { score: '042' },

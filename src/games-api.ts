@@ -94,6 +94,11 @@ const serverLeaderboardResponseSchema = z.object({
   })).max(10),
 }).strict();
 
+const windowedServerLeaderboardResponseSchema = serverLeaderboardResponseSchema.extend({
+  from: z.string(),
+  to: z.string(),
+});
+
 export async function requestStudioJson(input: StudioApiOptions & {
   path: string; method?: 'GET' | 'POST'; body?: unknown; authorization?: string; idempotencyKey?: string;
 }): Promise<unknown> {
@@ -133,4 +138,11 @@ export const parseActiveScoringEvent = (value: unknown): { eventId: string } => 
   return { eventId: response.eventId };
 };
 export const parseServerTopScore = (value: unknown): number | null => serverTopScoreSchema.parse(value).topScore;
-export const parseServerLeaderboard = (value: unknown): GameLeaderboardEntry[] => serverLeaderboardResponseSchema.parse(value).entries;
+export const parseServerLeaderboard = (value: unknown, window?: { from: string; to: string }): GameLeaderboardEntry[] => {
+  if (window === undefined) return serverLeaderboardResponseSchema.parse(value).entries;
+  const response = windowedServerLeaderboardResponseSchema.parse(value);
+  if (response.from !== window.from || response.to !== window.to) {
+    throw new Error('Leaderboard response does not match the requested time window.');
+  }
+  return response.entries;
+};

@@ -10,7 +10,7 @@ SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auctio
 pnpm add @rareprotocol/connect
 ```
 
-Version `0.9.0` is the stable release of `0.9.0-beta.0`, with the same SDK runtime and public API. Install the stable channel with `pnpm add @rareprotocol/connect@latest`; the `beta` npm tag remains a separate opt-in channel.
+Version `0.11.0` adds database-completion-time windows to public server-verified leaderboards. Install the stable channel with `pnpm add @rareprotocol/connect@latest`; the `beta` npm tag remains a separate opt-in channel.
 
 ```ts
 import { createSuperRareClient } from '@rareprotocol/connect';
@@ -149,6 +149,19 @@ Studio provisions and pins the uploaded root `server-verifier.js` to the publish
 `getServerLeaderboard()` is a public read: no player login or PlaySession token is required. It returns each scorer's best completed authoritative run across all events and deployments of this app, ordered by descending score with stable tied ordering and competition ranks (`1, 1, 3`). Entries reuse `GameLeaderboardEntry`: `scoreId` identifies the winning run, `score` remains a nonnegative decimal string without numeric precision loss, `trustLevel` is always `server_verified`, `secondaryValue` is `null`, and `isCurrentPlayer` is `false`. An empty array means no completed scorers; malformed or unavailable responses reject.
 
 Wallet leaderboard players may additionally include `ensName: string | null`. Studio resolves Ethereum-mainnet ENS and verifies that the name resolves back to the original wallet before returning it. This is display metadata only: `id`, `chainId`, scores, ranks and ordering do not change. Prefer a non-null ENS name for a wallet label, retain the full wallet address for inspection, and fall back to `displayName` when the field is absent or null. Missing server configuration, RPC errors and bounded lookup deadlines do not make scores unavailable. Session identities need not include this optional field.
+
+Pass both `from` and `to` to request a weekly or other explicit time window:
+
+```ts
+const weeklyLeaders = await game.getServerLeaderboard({
+  from: '2026-10-19T00:00:00Z',
+  to: '2026-10-26T00:00:00Z',
+});
+```
+
+Bounds must be valid ISO timestamps with an explicit timezone and `from < to`. Studio uses each completed run's database-recorded completion time: `from` is inclusive and `to` is exclusive. It filters all matching runs before selecting each scorer's best run and ranking the top ten, so an older all-time best cannot hide a valid weekly score. Offset and fractional-second precision are preserved in the request. Omitting the bounds keeps all-time standings; `getServerTopScore()` also remains all-time. Weekly boundaries/timezones are chosen by the caller, not inferred from a player's browser clock. These reads require the corresponding Studio time-window API and migration `087_server_game_leaderboard_time_window.sql`; they do not reset scores or automate prizes.
+
+Windowed responses must acknowledge the exact requested bounds. The SDK rejects missing or mismatched acknowledgements, including an older API that silently ignores range parameters and returns all-time standings; it never filters an all-time top ten locally as a substitute.
 
 After a lost run-start response or socket disconnect, re-post the **original event, run key, and paid PlaySession token** using `startServerValidatedRun`; the platform returns the existing run with a fresh one-use socket ticket. Do not start another paid play to recover that run.
 
@@ -837,8 +850,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 npm pack
-npm publish ./rareprotocol-connect-0.9.0.tgz --access public --tag latest --dry-run
-npm publish ./rareprotocol-connect-0.9.0.tgz --access public --tag latest
+npm publish ./rareprotocol-connect-0.11.0.tgz --access public --tag latest --dry-run
+npm publish ./rareprotocol-connect-0.11.0.tgz --access public --tag latest
 ```
 
 Only the final command publishes to npm and updates `latest`. Creating or merging a GitHub release PR, or creating a GitHub release, does not publish the package to npm. Publishing requires npm credentials authorized for `@rareprotocol/connect` and any required two-factor authentication.
