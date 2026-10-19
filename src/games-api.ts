@@ -9,6 +9,7 @@ const playerSchema = z.object({
   handle: z.string().nullable(),
   displayName: z.string(),
   avatarUrl: z.string().nullable(),
+  ensName: z.string().nullable().optional(),
   chainId: z.number().int().optional(),
 });
 
@@ -33,7 +34,8 @@ export type GameCreditBalance = z.infer<typeof creditBalanceSchema>;
 
 const purchaseSchema = z.object({
   id: z.string(), accountId: z.string(), paymentConfigId: z.string(), chainId: z.number().int(),
-  address: z.string(), treasuryAddress: z.string(), usdcAddress: z.string(), packPriceAtomic: z.string(),
+  address: z.string(), treasuryAddress: z.string(), currency: z.enum(['ETH', 'USDC']),
+  tokenAddress: z.string().nullable(), packPriceAtomic: z.string(),
   packCredits: z.number().int(), minBlock: z.string(), createdAt: z.string(), expiresAt: z.string(),
   transactionHash: z.string().nullable(), creditedAt: z.string().nullable(),
 }).passthrough();
@@ -65,6 +67,32 @@ const serverRunResponseSchema = z.object({
   }),
 });
 export type ServerValidatedGameRun = z.infer<typeof serverRunResponseSchema>;
+
+const activeScoringEventSchema = z.object({
+  version: z.literal('1'), eventId: z.string().uuid(),
+}).strict();
+
+const serverScoreSchema = z.union([
+  z.number(),
+  z.string().regex(/^[0-9]+$/).transform(Number),
+]).pipe(z.number().int().nonnegative().refine(Number.isSafeInteger, 'Score must be a safe integer'));
+
+const serverTopScoreSchema = z.object({
+  version: z.literal('1'), topScore: serverScoreSchema.nullable(),
+}).strict();
+
+const serverLeaderboardResponseSchema = z.object({
+  version: z.literal('1'),
+  entries: z.array(leaderboardEntrySchema.extend({
+    rank: z.number().int().min(1).max(10),
+    scoreId: z.string().uuid(),
+    score: z.string().regex(/^(0|[1-9][0-9]*)$/),
+    secondaryValue: z.null(),
+    trustLevel: z.literal('server_verified'),
+    achievedAt: z.string().datetime({ offset: true }),
+    isCurrentPlayer: z.literal(false),
+  })).max(10),
+}).strict();
 
 export async function requestStudioJson(input: StudioApiOptions & {
   path: string; method?: 'GET' | 'POST'; body?: unknown; authorization?: string; idempotencyKey?: string;
@@ -100,3 +128,9 @@ export const parseLeaderboard = (value: unknown): GameLeaderboard => leaderboard
 export const parseMyBest = (value: unknown): GameLeaderboardEntry | null => z.object({ entry: leaderboardEntrySchema.nullable() }).parse(value).entry;
 export const parseClientScore = (value: unknown): ClientAssertedScoreResult => clientScoreResponseSchema.parse(value);
 export const parseServerRun = (value: unknown): ServerValidatedGameRun => serverRunResponseSchema.parse(value);
+export const parseActiveScoringEvent = (value: unknown): { eventId: string } => {
+  const response = activeScoringEventSchema.parse(value);
+  return { eventId: response.eventId };
+};
+export const parseServerTopScore = (value: unknown): number | null => serverTopScoreSchema.parse(value).topScore;
+export const parseServerLeaderboard = (value: unknown): GameLeaderboardEntry[] => serverLeaderboardResponseSchema.parse(value).entries;

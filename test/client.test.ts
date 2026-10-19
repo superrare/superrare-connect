@@ -23,6 +23,8 @@ import type { ConnectPopupWindow } from '../src/popup-core.js';
 import type { ConnectSessionStorage } from '../src/session-storage-core.js';
 import type { ConnectAuthCredentials } from '../src/api.js';
 
+const realSetTimeout = globalThis.setTimeout;
+
 const loginIntentBodySchema = z.object({ pkce: z.object({ codeChallenge: z.string() }) });
 const codeVerifierBodySchema = z.object({ codeVerifier: z.string() });
 
@@ -2768,10 +2770,11 @@ describe('auth.login', () => {
       // advancing timers, and an unobserved rejection is reported as an
       // unhandled error. Real callers await the call immediately.
       const outcome = resultPromise.catch((error: unknown) => error);
-      // Advance rather than vi.waitFor: with fake timers, waitFor polls on a
-      // faked timer nobody is advancing and deadlocks.
-      await vi.advanceTimersByTimeAsync(0);
-      expect(popup.replacedUrls).toHaveLength(1);
+      // Not vi.waitFor: its polling advances the faked clock this test drives
+      // by hand. The PKCE digest settles on a real turn of the event loop.
+      while (popup.replacedUrls.length === 0) {
+        await new Promise((resolve) => { realSetTimeout(resolve, 1); });
+      }
 
       emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
       await vi.advanceTimersByTimeAsync(0);
@@ -2985,7 +2988,9 @@ describe('auth.login', () => {
         settledStatus = result.status;
       });
 
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
       emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
       // Let the exchange resolve and commit; the profile lookup then hangs.
       await vi.waitFor(() => {

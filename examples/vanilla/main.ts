@@ -1,6 +1,7 @@
 import {
   createSuperRareClient,
   GameConnectionError,
+  ConnectSessionRequiredError,
   SuperRareConnectApiError,
   type GameAuthorization,
   type GameCreditTerms,
@@ -111,6 +112,10 @@ const restoreGameConnection = async (): Promise<void> => {
   updateControls();
 };
 const handlePaidError = async (error: unknown, issuingConsent = false): Promise<void> => {
+  if (error instanceof ConnectSessionRequiredError) {
+    render({ error: 'Sign in to SuperRare first, then click Connect game. No play was started.' });
+    return;
+  }
   if (error instanceof GameConnectionError) {
     clearConnection();
     render({ error: error.code, action: 'Connection stopped. Click Connect game explicitly; no play was started by connecting.' });
