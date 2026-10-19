@@ -1,3 +1,13 @@
+import { z } from 'zod';
+
+const callbackParameterValueSchema = z.string().refine(isWellFormedCallbackParameterValue);
+
+const connectAuthCallbackParamsSchema = z.object({
+  intentId: callbackParameterValueSchema,
+  state: callbackParameterValueSchema,
+  code: callbackParameterValueSchema,
+});
+
 /**
  * The one-time parameters the hosted login page reports back to the SDK
  * (via `postMessage` to the opener, or in the return URL's query for a
@@ -5,11 +15,7 @@
  * created, and the single-use code the backend exchanges for a Connect
  * session.
  */
-export type ConnectAuthCallbackParams = {
-  intentId: string;
-  state: string;
-  code: string;
-};
+export type ConnectAuthCallbackParams = z.infer<typeof connectAuthCallbackParamsSchema>;
 
 export type ConnectAuthCallbackParseErrorCode =
   | 'missing_intent_id'
@@ -84,17 +90,15 @@ function readRequiredCallbackParameter(
   if (values.length === 0) return { ok: false, error: rule.missingError };
   if (values.length > 1) return { ok: false, error: rule.duplicateError };
 
-  const value = values[0];
-  if (value === undefined || isMalformedCallbackParameterValue(value)) {
-    return { ok: false, error: rule.malformedError };
-  }
+  const parsed = callbackParameterValueSchema.safeParse(values[0]);
+  if (!parsed.success) return { ok: false, error: rule.malformedError };
 
-  return { ok: true, value };
+  return { ok: true, value: parsed.data };
 }
 
-function isMalformedCallbackParameterValue(value: string): boolean {
-  return value.trim().length === 0 || Array.from(value).some((character) => {
+function isWellFormedCallbackParameterValue(value: string): boolean {
+  return value.trim().length > 0 && Array.from(value).every((character) => {
     const codePoint = character.codePointAt(0);
-    return codePoint !== undefined && codePoint < 32;
+    return codePoint === undefined || codePoint >= 32;
   });
 }

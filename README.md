@@ -730,8 +730,10 @@ if (result.status === 'authenticated') {
 ```
 
 - `handleRedirectCallback()` reads `window.location.search` by default, or the `URLSearchParams` you pass.
-- It checks `intentId` and `state` against the login this tab started, so it needs SDK storage. Without storage, `auth.login()` throws before creating an intent.
-- It resolves `cancelled` when a logout or newer login on this client lands while the code is being exchanged. Calling it twice for the same URL (for example from a React StrictMode effect) returns the same result.
+- It checks `intentId` and `state` against the login this tab started, so it needs SDK storage. Without storage, `auth.login()` throws before creating an intent. The user has to come back in the tab that started the login.
+- It resolves `cancelled` when, while the code is being exchanged, a logout on this client lands, a newer login on this client navigates away, or another tab stores a session. A newer login that fails before navigating leaves the callback alone.
+- `auth.logout()` or `auth.clearSession()` before the callback is handled invalidates the pending login, even with no session: the callback then throws `ConnectAuthPendingError` (`missing_pending_auth`). Logging out also forgets the pending action redirect.
+- Calls with the same `intentId`, `state`, and `code` on one client while the first is running (for example from a React StrictMode effect) share its result. Nothing is kept once it settles. After a success, or once Rare API refuses the code for good (`400`, `401`, `404`, `410`), a new call throws `missing_pending_auth`. After a network or server error the same URL can retry.
 - Malformed callback parameters throw `ConnectAuthCallbackError`. A callback that does not match the pending login throws `ConnectAuthPendingError`.
 - `auth.prepareLogin()` still works: the redirect uses the prepared intent.
 

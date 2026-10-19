@@ -273,7 +273,7 @@ export type ConnectRedirectLoginResult =
     user: ConnectCurrentUser | undefined;
   }
   | {
-    /** A logout, or a newer login on this client or another tab, landed before the session was stored. */
+    /** A logout or a navigating newer login on this client, or a session another tab stored, landed first. */
     status: 'cancelled';
   };
 
@@ -407,6 +407,7 @@ export function createSuperRareClient(
   // Login/preparation generations belong to this client. Credential renewal
   // coordination belongs to the shared storage slot.
   let sessionCommitGeneration = 0;
+  let logoutGeneration = 0;
   const apiOptions = {
     apiUrl: options.apiUrl,
     fetch: options.fetch,
@@ -450,6 +451,10 @@ export function createSuperRareClient(
     try {
       if (readRecord !== undefined && redirectStorage?.getItem(key) === readRecord) redirectStorage.removeItem(key);
     } catch { /* Blocked storage holds nothing to remove. */ }
+  };
+  const forgetRedirectRecords = (): void => {
+    removeRedirectRecord(pendingRedirectLoginKey, readRedirectRecord(pendingRedirectLoginKey));
+    removeRedirectRecord(pendingRedirectIntentKey, readRedirectRecord(pendingRedirectIntentKey));
   };
   const commitSession = async (
     credentials: ConnectAuthCredentials,
@@ -1149,39 +1154,49 @@ export function createSuperRareClient(
     }
 
     const navigation = requireNavigation();
-    const prepared = takePreparedLogin(params);
-    sessionCommitGeneration += 1;
-    const operationGeneration = sessionCommitGeneration;
-    const started = prepared?.started ?? await createLoginIntent(params, {
+    const operationLogoutGeneration = logoutGeneration;
+    const started = takePreparedLogin(params)?.started ?? await createLoginIntent(params, {
       signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
     });
-    if (operationGeneration !== sessionCommitGeneration) return { status: 'cancelled' };
+    if (operationLogoutGeneration !== logoutGeneration) return { status: 'cancelled' };
     requireNavigableHostedUrl(started.intent.url);
     redirectStorage.setItem(pendingRedirectLoginKey, JSON.stringify(started.pendingAuth));
+    // Only a login that navigates supersedes a callback still exchanging; one
+    // that fails before this point leaves that callback's session alone.
+    sessionCommitGeneration += 1;
     navigation.assign(started.intent.url);
     return { status: 'redirected' };
   };
 
-  let inFlightRedirectCallback: { key: string; promise: Promise<ConnectRedirectLoginResult> } | undefined;
-  const completeRedirectLogin = async (searchParams: URLSearchParams): Promise<ConnectRedirectLoginResult> => {
-    const parsed = parseConnectAuthCallbackSearchParams(searchParams);
-    if (!parsed.ok) throw new ConnectAuthCallbackError(parsed.error);
-
+  const inFlightRedirectCallbacks = new Map<string, Promise<ConnectRedirectLoginResult>>();
+  const completeRedirectLogin = async (
+    callbackParams: ConnectAuthCallbackParams,
+  ): Promise<ConnectRedirectLoginResult> => {
     const storedPendingAuth = readRedirectRecord(pendingRedirectLoginKey);
     const verification = verifyConnectAuthCallbackAgainstPending({
       pendingAuth: storedPendingAuth === undefined
         ? undefined
         : parseStoredPendingConnectAuth(storedPendingAuth),
-      callbackParams: parsed.params,
+      callbackParams,
     });
     if (!verification.ok) throw new ConnectAuthPendingError(verification.error);
 
     const operationGeneration = sessionCommitGeneration;
     const replacementGeneration = sessionLifecycle.getReplacementGeneration();
-    const credentials = await exchangeConnectAuthCode(parsed.params, {
-      ...apiOptions,
-      signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
-    });
+    let credentials: ConnectAuthCredentials;
+    try {
+      credentials = await exchangeConnectAuthCode(callbackParams, {
+        ...apiOptions,
+        signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
+      });
+    } catch (error) {
+      // Rare API answers these once the code or intent can never be exchanged;
+      // anything else (network, 5xx, 429) keeps the record so the URL can retry.
+      if (error instanceof SuperRareConnectApiError && [400, 401, 404, 410].includes(error.status)) {
+        removeRedirectRecord(pendingRedirectLoginKey, storedPendingAuth);
+      }
+      throw error;
+    }
     removeRedirectRecord(pendingRedirectLoginKey, storedPendingAuth);
     const committed = await commitSession(credentials, () => {
       const currentSession = sessionLifecycle.getSession();
@@ -1629,18 +1644,24 @@ export function createSuperRareClient(
       async handleRedirectCallback(
         searchParams = readBrowserSearchParams(),
       ): Promise<ConnectRedirectLoginResult> {
+        const parsed = parseConnectAuthCallbackSearchParams(searchParams);
+        if (!parsed.ok) throw new ConnectAuthCallbackError(parsed.error);
+
         // A page that runs its callback handler twice (React StrictMode
-        // effects) joins the exchange already running for the same URL.
-        const callbackKey = searchParams.toString();
-        if (inFlightRedirectCallback?.key !== callbackKey) {
-          const promise = completeRedirectLogin(searchParams);
-          inFlightRedirectCallback = { key: callbackKey, promise };
-          // A failed exchange keeps its pending record, so the same URL can retry.
-          promise.catch(() => {
-            if (inFlightRedirectCallback?.promise === promise) inFlightRedirectCallback = undefined;
-          });
+        // effects) joins the exchange already running for the same code; a
+        // settled result is not kept, since it could outlive its session.
+        const { intentId, state, code } = parsed.params;
+        const callbackKey = JSON.stringify([intentId, state, code]);
+        const running = inFlightRedirectCallbacks.get(callbackKey);
+        if (running !== undefined) return await running;
+
+        const promise = completeRedirectLogin(parsed.params);
+        inFlightRedirectCallbacks.set(callbackKey, promise);
+        try {
+          return await promise;
+        } finally {
+          inFlightRedirectCallbacks.delete(callbackKey);
         }
-        return await inFlightRedirectCallback.promise;
       },
       getSession: sessionLifecycle.getSession,
       async getAccessToken(): Promise<string> {
@@ -1660,12 +1681,16 @@ export function createSuperRareClient(
       },
       clearSession(): void {
         sessionCommitGeneration += 1;
+        logoutGeneration += 1;
         inFlightLogin = undefined;
+        forgetRedirectRecords();
         sessionLifecycle.clear();
       },
       async logout(): Promise<void> {
         sessionCommitGeneration += 1;
+        logoutGeneration += 1;
         inFlightLogin = undefined;
+        forgetRedirectRecords();
         await sessionLifecycle.logout();
       },
       onChange(callback): () => void {

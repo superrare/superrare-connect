@@ -1,17 +1,11 @@
 import { z } from 'zod';
-import type { PendingConnectAuth } from './auth-flow-core.js';
+import { pendingConnectAuthSchema, type PendingConnectAuth } from './auth-flow-core.js';
 
 export type ConnectDisplay = 'popup' | 'redirect';
 
 export type ConnectNavigation = {
   assign: (url: string) => void;
 };
-
-const pendingConnectAuthSchema = z.object({
-  intentId: z.string().min(1),
-  state: z.string().min(1),
-  expiresAt: z.string().min(1),
-});
 
 const pendingConnectRedirectIntentSchema = z.object({
   intentId: z.string().min(1),

@@ -1,10 +1,19 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ConnectAuthCallbackError,
   ConnectAuthPendingError,
   createSuperRareClient,
   type ConnectSessionStorage,
 } from '../src/index.js';
+
+beforeEach(() => {
+  vi.stubGlobal('sessionStorage', undefined);
+  vi.stubGlobal('location', undefined);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
 
@@ -141,6 +150,30 @@ describe('display: redirect actions', () => {
     await expect(returnPage.intents.getRedirectResult()).resolves.toBeUndefined();
   });
 
+  it('forgets the redirected intent on logout', async () => {
+    const storage = memoryStorage();
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
+      return intentCreationResponse('connect_intent_buy');
+    });
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign: () => {} },
+      sessionStorage: storage,
+      fetch: fetchImplementation,
+    } as const;
+    await createSuperRareClient(options).actions.buy(buyParams);
+
+    const returnPage = createSuperRareClient(options);
+    await returnPage.auth.logout();
+    fetchImplementation.mockClear();
+
+    await expect(returnPage.intents.getRedirectResult()).resolves.toBeUndefined();
+    expect(fetchImplementation).not.toHaveBeenCalled();
+  });
+
   it('returns undefined when no redirect was started', async () => {
     const fetchImplementation = vi.fn();
     const client = createSuperRareClient({
@@ -154,7 +187,7 @@ describe('display: redirect actions', () => {
     expect(fetchImplementation).not.toHaveBeenCalled();
   });
 
-  it('forgets a redirected intent Rare API no longer serves', async () => {
+  it.each([404, 410])('forgets a redirected intent Rare API answers with %i', async (status) => {
     const storage = memoryStorage();
     let gone = false;
     const options = {
@@ -166,13 +199,13 @@ describe('display: redirect actions', () => {
         const request = input instanceof Request ? input : new Request(input, init);
         if (request.method === 'POST') return intentCreationResponse('connect_intent_buy');
         gone = true;
-        return jsonResponse({ error: 'Connect intent expired' }, { status: 410 });
+        return jsonResponse({ error: 'Connect intent unavailable' }, { status });
       },
     } as const;
     await createSuperRareClient(options).actions.buy(buyParams);
 
     const returnPage = createSuperRareClient(options);
-    await expect(returnPage.intents.getRedirectResult()).rejects.toMatchObject({ status: 410 });
+    await expect(returnPage.intents.getRedirectResult()).rejects.toMatchObject({ status });
     expect(gone).toBe(true);
     await expect(returnPage.intents.getRedirectResult()).resolves.toBeUndefined();
   });
@@ -205,10 +238,6 @@ describe('display: redirect actions', () => {
 });
 
 describe('display: redirect storage and guards', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
   it('keeps redirect records in the tab, not in the shared session storage', async () => {
     const tabStorage = memoryStorage();
     const sharedStorage = memoryStorage();
@@ -260,6 +289,71 @@ describe('display: redirect storage and guards', () => {
     await expect(client.auth.login()).rejects.toThrow('Redirect display needs window.location');
     expect(fetchImplementation).not.toHaveBeenCalled();
     expect(beforeOpen).not.toHaveBeenCalled();
+  });
+
+  it('keeps redirect records out of the tab storage with sessionStorage: false', async () => {
+    const tabStorage = memoryStorage();
+    vi.stubGlobal('sessionStorage', tabStorage);
+    const fetchImplementation = vi.fn(async () => intentCreationResponse('connect_intent_buy'));
+    const assign = vi.fn<(url: string) => void>();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign },
+      sessionStorage: false,
+      fetch: fetchImplementation,
+    });
+
+    await client.actions.buy(buyParams);
+    expect(assign).toHaveBeenCalledWith('https://connect.superrare.test/intents/connect_intent_buy');
+    await expect(client.auth.login()).rejects.toThrow('redirect login needs SDK storage');
+    expect(fetchImplementation).toHaveBeenCalledTimes(1);
+    expect(tabStorage.values.size).toBe(0);
+  });
+
+  it('navigates through window.location and reads the callback from its query by default', async () => {
+    const assigned: string[] = [];
+    const browserLocation = {
+      origin: 'https://artist.example',
+      search: '',
+      assign(this: unknown, url: string) {
+        if (this !== browserLocation) throw new TypeError('Illegal invocation');
+        assigned.push(url);
+      },
+    };
+    vi.stubGlobal('location', browserLocation);
+    vi.stubGlobal('sessionStorage', memoryStorage());
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      createState: () => 'state_login',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.url.endsWith('/v1/connect/auth/exchange')) {
+          return jsonResponse({
+            data: {
+              session: {
+                sessionId: 'connect_session_default',
+                userId: 'user_default',
+                address: '0x0000000000000000000000000000000000000009',
+                expiresAt: futureExpiry(),
+              },
+              refreshToken: 'connect_refresh_default',
+              refreshExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString(),
+            },
+          });
+        }
+        if (request.url.endsWith('/v1/connect/users/me')) return jsonResponse({ error: 'unavailable' }, { status: 503 });
+        return intentCreationResponse('connect_intent_login', 'login');
+      },
+    } as const;
+
+    await expect(createSuperRareClient(options).auth.login()).resolves.toEqual({ status: 'redirected' });
+    expect(assigned).toEqual(['https://connect.superrare.test/login?intentId=connect_intent_login']);
+
+    browserLocation.search = '?intentId=connect_intent_login&state=state_login&code=one_time_code';
+    await expect(createSuperRareClient(options).auth.handleRedirectCallback())
+      .resolves.toMatchObject({ status: 'authenticated', session: { sessionId: 'connect_session_default' } });
   });
 
   it('never navigates the page to a non-web hosted URL', async () => {
@@ -548,18 +642,14 @@ describe('display: redirect login', () => {
 
     await expect(firstCallback).resolves.toEqual({ status: 'cancelled' });
     expect(secondTab.auth.getSession()?.sessionId).toBe('connect_session_second_tab_code');
-    vi.unstubAllGlobals();
   });
 
-  it('lets a newer login on the return page win over the callback still exchanging', async () => {
+  it('lets a newer login that navigates cancel the callback still exchanging', async () => {
     let releaseExchange: () => void = () => {};
     const exchangeGate = new Promise<void>((resolve) => { releaseExchange = resolve; });
-    let releaseIntent: () => void = () => {};
-    const intentGate = new Promise<void>((resolve) => { releaseIntent = resolve; });
     const assign = vi.fn<(url: string) => void>();
     const states = ['state_older', 'state_newer'];
     const baseFetch = loginFetch([]);
-    let gateIntents = false;
     const options = {
       apiUrl: 'https://rare-api.test',
       display: 'redirect',
@@ -569,7 +659,6 @@ describe('display: redirect login', () => {
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = input instanceof Request ? input.url : String(input);
         if (url.endsWith('/v1/connect/auth/exchange')) await exchangeGate;
-        if (url.endsWith('/v1/connect/intents') && gateIntents) await intentGate;
         return await baseFetch(input, init);
       },
     } as const;
@@ -580,15 +669,54 @@ describe('display: redirect login', () => {
     const callback = returnPage.auth.handleRedirectCallback(
       new URLSearchParams('intentId=connect_intent_login&state=state_older&code=one_time_code'),
     );
-    gateIntents = true;
-    const newerLogin = returnPage.auth.login();
+    await expect(returnPage.auth.login()).resolves.toEqual({ status: 'redirected' });
     releaseExchange();
-    await expect(callback).resolves.toEqual({ status: 'cancelled' });
-    releaseIntent();
 
-    await expect(newerLogin).resolves.toEqual({ status: 'redirected' });
+    await expect(callback).resolves.toEqual({ status: 'cancelled' });
     expect(assign).toHaveBeenCalledTimes(1);
     expect(returnPage.auth.getSession()).toBeUndefined();
+  });
+
+  it('keeps the callback session when a newer login fails before navigating', async () => {
+    let releaseExchange: () => void = () => {};
+    const exchangeGate = new Promise<void>((resolve) => { releaseExchange = resolve; });
+    let releaseIntent: () => void = () => {};
+    const intentGate = new Promise<void>((resolve) => { releaseIntent = resolve; });
+    const assign = vi.fn<(url: string) => void>();
+    const baseFetch = loginFetch([]);
+    let failIntents = false;
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign },
+      sessionStorage: memoryStorage(),
+      createState: () => 'state_login',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.endsWith('/v1/connect/auth/exchange')) await exchangeGate;
+        if (url.endsWith('/v1/connect/intents') && failIntents) {
+          await intentGate;
+          return jsonResponse({ error: 'unavailable' }, { status: 503 });
+        }
+        return await baseFetch(input, init);
+      },
+    } as const;
+    await createSuperRareClient(options).auth.login();
+    assign.mockClear();
+
+    const returnPage = createSuperRareClient(options);
+    const callback = returnPage.auth.handleRedirectCallback(
+      new URLSearchParams('intentId=connect_intent_login&state=state_login&code=one_time_code'),
+    );
+    failIntents = true;
+    const newerLogin = returnPage.auth.login();
+    releaseIntent();
+    await expect(newerLogin).rejects.toMatchObject({ status: 503 });
+    releaseExchange();
+
+    await expect(callback).resolves.toMatchObject({ status: 'authenticated' });
+    expect(returnPage.auth.getSession()?.sessionId).toBe('connect_session_login');
+    expect(assign).not.toHaveBeenCalled();
   });
 
   it('keeps the pending record of a newer login when an older callback finishes', async () => {
@@ -642,6 +770,123 @@ describe('display: redirect login', () => {
     expect(second).toEqual({ status: 'redirected' });
     expect(requests.filter((path) => path === '/v1/connect/intents')).toHaveLength(1);
     expect(assign).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a callback whose login was invalidated by a logout before it was handled', async () => {
+    const requests: string[] = [];
+    const baseFetch = loginFetch(requests);
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign: () => {} },
+      sessionStorage: memoryStorage(),
+      createState: () => 'state_login',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
+        return await baseFetch(input, init);
+      },
+    } as const;
+    await createSuperRareClient(options).auth.login();
+    await createSuperRareClient(options).auth.logout();
+
+    const returnPage = createSuperRareClient(options);
+    await expect(returnPage.auth.handleRedirectCallback(
+      new URLSearchParams('intentId=connect_intent_login&state=state_login&code=one_time_code'),
+    )).rejects.toMatchObject({ code: 'missing_pending_auth' });
+    expect(requests).not.toContain('/v1/connect/auth/exchange');
+    expect(returnPage.auth.getSession()).toBeUndefined();
+  });
+
+  it('does not replay a settled callback once its session is gone', async () => {
+    const baseFetch = loginFetch([]);
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign: () => {} },
+      sessionStorage: memoryStorage(),
+      createState: () => 'state_login',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.endsWith('/v1/connect/auth/logout')) return jsonResponse({ data: { revoked: true } });
+        return await baseFetch(input, init);
+      },
+    } as const;
+    await createSuperRareClient(options).auth.login();
+
+    const returnPage = createSuperRareClient(options);
+    const callback = new URLSearchParams('intentId=connect_intent_login&state=state_login&code=one_time_code');
+    await expect(returnPage.auth.handleRedirectCallback(callback)).resolves.toMatchObject({ status: 'authenticated' });
+    await returnPage.auth.logout();
+
+    await expect(returnPage.auth.handleRedirectCallback(new URLSearchParams(callback)))
+      .rejects.toMatchObject({ code: 'missing_pending_auth' });
+  });
+
+  it('forgets the pending login once Rare API refuses its code for good', async () => {
+    let exchangeAttempts = 0;
+    const baseFetch = loginFetch([]);
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign: () => {} },
+      sessionStorage: memoryStorage(),
+      createState: () => 'state_login',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.endsWith('/v1/connect/auth/exchange')) {
+          exchangeAttempts += 1;
+          return jsonResponse({ error: 'Connect auth code is invalid' }, { status: 401 });
+        }
+        return await baseFetch(input, init);
+      },
+    } as const;
+    await createSuperRareClient(options).auth.login();
+
+    const returnPage = createSuperRareClient(options);
+    const callback = new URLSearchParams('intentId=connect_intent_login&state=state_login&code=one_time_code');
+    await expect(returnPage.auth.handleRedirectCallback(callback)).rejects.toMatchObject({ status: 401 });
+    await expect(returnPage.auth.handleRedirectCallback(new URLSearchParams(callback)))
+      .rejects.toMatchObject({ code: 'missing_pending_auth' });
+    expect(exchangeAttempts).toBe(1);
+  });
+
+  it('exchanges a code once however its callback URL is spelled or interleaved', async () => {
+    let releaseExchange: () => void = () => {};
+    const exchangeGate = new Promise<void>((resolve) => { releaseExchange = resolve; });
+    const requests: string[] = [];
+    const baseFetch = loginFetch(requests);
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign: () => {} },
+      sessionStorage: memoryStorage(),
+      createState: () => 'state_login',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.endsWith('/v1/connect/auth/exchange')) await exchangeGate;
+        return await baseFetch(input, init);
+      },
+    } as const;
+    await createSuperRareClient(options).auth.login();
+
+    const returnPage = createSuperRareClient(options);
+    const first = returnPage.auth.handleRedirectCallback(
+      new URLSearchParams('intentId=connect_intent_login&state=state_login&code=one_time_code'),
+    );
+    const other = returnPage.auth.handleRedirectCallback(
+      new URLSearchParams('intentId=connect_intent_login&state=state_login&code=other_code'),
+    );
+    const reordered = returnPage.auth.handleRedirectCallback(
+      new URLSearchParams('code=one_time_code&state=state_login&intentId=connect_intent_login&from=menu'),
+    );
+    releaseExchange();
+
+    await expect(first).resolves.toMatchObject({ status: 'authenticated' });
+    await expect(reordered).resolves.toBe(await first);
+    await other.catch(() => undefined);
+    const exchanges = requests.filter((path) => path === '/v1/connect/auth/exchange');
+    expect(exchanges).toHaveLength(2);
   });
 
   it('lets the same callback retry after a failed exchange', async () => {

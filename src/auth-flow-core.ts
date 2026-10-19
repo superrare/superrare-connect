@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
 
@@ -340,16 +341,18 @@ export type BuildConnectLoginIntentRequestResult =
   | { ok: true; request: CreateConnectLoginIntentRequest }
   | Extract<ReturnPathNormalizationResult, { ok: false }>;
 
+export const pendingConnectAuthSchema = z.object({
+  intentId: z.string().min(1),
+  state: z.string().min(1),
+  expiresAt: z.string().min(1),
+});
+
 /**
  * A login's own record of the intent it started, matched against the
  * callback the hosted page reports back. A popup login holds it in memory;
  * a redirect login keeps it in the tab's storage across the navigation.
  */
-export type PendingConnectAuth = {
-  intentId: string;
-  state: string;
-  expiresAt: string;
-};
+export type PendingConnectAuth = z.infer<typeof pendingConnectAuthSchema>;
 
 export type ConnectAuthPendingVerificationError =
   | 'missing_pending_auth'
