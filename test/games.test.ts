@@ -564,8 +564,8 @@ describe('game credit purchases', () => {
     id: 'purchase-1', accountId: balance.accountId, paymentConfigId: 'config-1',
     chainId: balance.chainId, address: balance.address,
     treasuryAddress: '0x1111111111111111111111111111111111111111',
-    usdcAddress: '0x2222222222222222222222222222222222222222',
-    packPriceAtomic: '2500000', packCredits: 10, minBlock: '7000000',
+    currency: 'ETH', tokenAddress: null,
+    packPriceAtomic: '2500000000000000', packCredits: 10, minBlock: '7000000',
     createdAt: '2026-01-01T00:00:00.000Z', expiresAt: '2030-01-01T00:00:00.000Z',
     transactionHash: null, creditedAt: null,
   };
@@ -577,7 +577,7 @@ describe('game credit purchases', () => {
     ['claimPurchase', (game) => game.credits.claimPurchase({ purchaseId: purchase.id, transactionHash })],
   ];
 
-  it('quotes, recovers, and claims an authoritative purchase using scoped game authorization without SDK login', async () => {
+  it('quotes the exact ETH purchase terms and recovers/claims with scoped authorization without SDK login', async () => {
     let claimed = false;
     const creditedPurchase = { ...purchase, transactionHash, creditedAt: '2026-01-01T00:01:00.000Z' };
     const creditedBalance = { ...balance, balance: 15, available: 12 };

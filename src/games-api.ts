@@ -9,6 +9,7 @@ const playerSchema = z.object({
   handle: z.string().nullable(),
   displayName: z.string(),
   avatarUrl: z.string().nullable(),
+  ensName: z.string().nullable().optional(),
   chainId: z.number().int().optional(),
 });
 
@@ -33,7 +34,8 @@ export type GameCreditBalance = z.infer<typeof creditBalanceSchema>;
 
 const purchaseSchema = z.object({
   id: z.string(), accountId: z.string(), paymentConfigId: z.string(), chainId: z.number().int(),
-  address: z.string(), treasuryAddress: z.string(), usdcAddress: z.string(), packPriceAtomic: z.string(),
+  address: z.string(), treasuryAddress: z.string(), currency: z.enum(['ETH', 'USDC']),
+  tokenAddress: z.string().nullable(), packPriceAtomic: z.string(),
   packCredits: z.number().int(), minBlock: z.string(), createdAt: z.string(), expiresAt: z.string(),
   transactionHash: z.string().nullable(), creditedAt: z.string().nullable(),
 }).passthrough();
