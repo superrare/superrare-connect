@@ -148,6 +148,8 @@ Studio provisions and pins the uploaded root `server-verifier.js` to the publish
 
 `getServerLeaderboard()` is a public read: no player login or PlaySession token is required. It returns each scorer's best completed authoritative run across all events and deployments of this app, ordered by descending score with stable tied ordering and competition ranks (`1, 1, 3`). Entries reuse `GameLeaderboardEntry`: `scoreId` identifies the winning run, `score` remains a nonnegative decimal string without numeric precision loss, `trustLevel` is always `server_verified`, `secondaryValue` is `null`, and `isCurrentPlayer` is `false`. An empty array means no completed scorers; malformed or unavailable responses reject.
 
+Wallet leaderboard players may additionally include `ensName: string | null`. Studio resolves Ethereum-mainnet ENS and verifies that the name resolves back to the original wallet before returning it. This is display metadata only: `id`, `chainId`, scores, ranks and ordering do not change. Prefer a non-null ENS name for a wallet label, retain the full wallet address for inspection, and fall back to `displayName` when the field is absent or null. Missing server configuration, RPC errors and bounded lookup deadlines do not make scores unavailable. Session identities need not include this optional field.
+
 After a lost run-start response or socket disconnect, re-post the **original event, run key, and paid PlaySession token** using `startServerValidatedRun`; the platform returns the existing run with a fresh one-use socket ticket. Do not start another paid play to recover that run.
 
 Community/default leaderboard reads use the same game client but can include historical unverified or client-asserted scores. They are not a substitute for the authoritative server leaderboard:
@@ -158,7 +160,9 @@ const mine = await game.getMyBest({ sessionToken: started.session.token });
 await game.complete({ sessionId: started.session.id, sessionToken: started.session.token });
 ```
 
-With a `groupId`, `game.credits` exposes balance and the real quote/claim/recovery endpoints. It does not create or execute the quoted USDC payment: send the exact quoted transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
+With a `groupId`, `game.credits` exposes balance and the immutable purchase quote/claim/recovery endpoints. A quote includes its `currency`, `tokenAddress`, `packPriceAtomic`, and `packCredits`: ETH quotes have a null token address and use wei (18 decimals); USDC quotes include the configured token address and use six-decimal atomic units. The SDK does not execute payment: send the exact quoted ETH or USDC transfer with a wallet separately, then pass its transaction hash to `claimPurchase`. Retrying the same quote/hash is safe.
+
+Upgrading from `0.9.x`: credit-purchase quotes replace `usdcAddress` with `currency` and nullable `tokenAddress`. Update payment rendering and transfer construction to use the immutable quote's asset and decimals; do not assume every pack is USDC. This contract change is released as `0.10.0`.
 
 ## Browser Embed
 
