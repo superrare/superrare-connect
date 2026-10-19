@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { encodeBase64Url } from '../src/auth-flow-core.js';
 import {
   ConnectActionValidationError,
   ConnectPopupBlockedError,
@@ -20,6 +22,13 @@ import type { ConnectIntent } from '../src/status-core.js';
 import type { ConnectPopupWindow } from '../src/popup-core.js';
 import type { ConnectSessionStorage } from '../src/session-storage-core.js';
 import type { ConnectAuthCredentials } from '../src/api.js';
+
+const loginIntentBodySchema = z.object({ pkce: z.object({ codeChallenge: z.string() }) });
+const codeVerifierBodySchema = z.object({ codeVerifier: z.string() });
+
+const s256 = async (codeVerifier: string): Promise<string> => encodeBase64Url(
+  new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier))),
+);
 
 const directListingTarget: ConnectErc721DirectListingTarget = {
   kind: 'erc721-direct-listing',
@@ -1896,23 +1905,34 @@ describe('auth.login claims a result the posted callback never delivered', () =>
     vi.useFakeTimers();
     try {
       const requestedPaths: string[] = [];
+      const codeChallenges: string[] = [];
+      const codeVerifiers: string[] = [];
       const { client, opened } = createLoginTestClient({
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/intents')) {
+            codeChallenges.push(loginIntentBodySchema.parse(await request.clone().json()).pkce.codeChallenge);
+          }
           if (request.url.endsWith('/v1/connect/auth/claim')) {
-            expect(await request.json()).toEqual({
+            const body: unknown = await request.json();
+            expect(body).toEqual({
               intentId: 'connect_intent_login',
               state: 'state_login',
+              codeVerifier: expect.any(String),
             });
+            codeVerifiers.push(codeVerifierBodySchema.parse(body).codeVerifier);
             return claimIssuedResponse();
           }
           if (request.url.endsWith('/v1/connect/auth/exchange')) {
-            expect(await request.json()).toEqual({
+            const body: unknown = await request.json();
+            expect(body).toEqual({
               intentId: 'connect_intent_login',
               state: 'state_login',
               code: 'connect_auth_code_claimed',
+              codeVerifier: expect.any(String),
             });
+            codeVerifiers.push(codeVerifierBodySchema.parse(body).codeVerifier);
             return sessionResponse();
           }
           if (request.url.endsWith('/v1/connect/users/me')) {
@@ -1935,6 +1955,10 @@ describe('auth.login claims a result the posted callback never delivered', () =>
       const result = await resultPromise;
       expect(result.status).toBe('authenticated');
       expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+      const [claimVerifier, exchangeVerifier] = codeVerifiers;
+      if (claimVerifier === undefined) throw new Error('expected a claim');
+      expect(exchangeVerifier).toBe(claimVerifier);
+      expect(codeChallenges).toEqual([await s256(claimVerifier)]);
       expect(requestedPaths).toEqual([
         '/v1/connect/intents',
         '/v1/connect/auth/claim',
@@ -2212,6 +2236,8 @@ describe('auth.prepareLogin', () => {
 
 describe('auth.login', () => {
   it('exchanges the posted callback, stores the session, and resolves with the user', async () => {
+    const codeChallenges: string[] = [];
+    const codeVerifiers: string[] = [];
     const storage = createMemoryStorage();
     const popup = createPopupStub();
     const emitter = createMessageEmitter();
@@ -2224,13 +2250,19 @@ describe('auth.login', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         requestedPaths.push(new URL(request.url).pathname);
+        if (request.url.endsWith('/v1/connect/intents')) {
+          codeChallenges.push(loginIntentBodySchema.parse(await request.clone().json()).pkce.codeChallenge);
+        }
 
         if (request.url.endsWith('/v1/connect/auth/exchange')) {
-          expect(await request.json()).toEqual({
+          const body: unknown = await request.json();
+          expect(body).toEqual({
             intentId: 'connect_intent_login',
             state: 'state_login',
             code: 'connect_auth_code_login',
+            codeVerifier: expect.any(String),
           });
+          codeVerifiers.push(codeVerifierBodySchema.parse(body).codeVerifier);
           return sessionResponse();
         }
 
@@ -2299,6 +2331,9 @@ describe('auth.login', () => {
       '/v1/connect/auth/exchange',
       '/v1/connect/users/me',
     ]);
+    const [codeVerifier] = codeVerifiers;
+    if (codeVerifier === undefined) throw new Error('expected an exchange');
+    expect(codeChallenges).toEqual([await s256(codeVerifier)]);
   });
 
   it('still resolves authenticated when the profile lookup fails', async () => {

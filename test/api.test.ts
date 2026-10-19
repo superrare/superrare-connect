@@ -53,7 +53,12 @@ const malformedCredentials: unknown[] = [
 
 describe('Connect API client', () => {
   it('exchanges the callback for access and refresh credentials', async () => {
-    const params = { code: 'connect_auth_code_123', intentId: 'connect_intent_123', state: 'state_123' };
+    const params = {
+      code: 'connect_auth_code_123',
+      intentId: 'connect_intent_123',
+      state: 'state_123',
+      codeVerifier: 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk',
+    };
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);
       expect(request.url).toBe('https://rare-api.test/v1/connect/auth/exchange');
@@ -77,6 +82,7 @@ describe('Connect API client', () => {
       code: 'connect_auth_code_123',
       intentId: 'connect_intent_123',
       state: 'state_123',
+      codeVerifier: 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk',
     }, { fetch: fetchImplementation })).rejects.toThrow('Invalid Connect auth exchange response.');
   });
 

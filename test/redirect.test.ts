@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { encodeBase64Url } from '../src/auth-flow-core.js';
 import {
   ConnectAuthCallbackError,
   ConnectAuthPendingError,
@@ -14,6 +16,10 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+const s256 = async (codeVerifier: string): Promise<string> => encodeBase64Url(
+  new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier))),
+);
 
 const futureExpiry = (): string => new Date(Date.now() + 30 * 60_000).toISOString();
 
@@ -476,6 +482,89 @@ describe('display: redirect login', () => {
     await expect(returnPage.auth.handleRedirectCallback(
       new URLSearchParams('intentId=connect_intent_login&state=state_login&code=replayed_code'),
     )).rejects.toMatchObject({ code: 'missing_pending_auth' });
+  });
+
+  it('binds the exchange to the PKCE verifier kept in the tab, never one from the URL', async () => {
+    const storage = memoryStorage();
+    const bodies: Array<{ path: string; body: unknown }> = [];
+    const baseFetch = loginFetch([]);
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign: () => {} },
+      sessionStorage: storage,
+      createState: () => 'state_login',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.method === 'POST') {
+          bodies.push({ path: new URL(request.url).pathname, body: await request.clone().json() });
+        }
+        return await baseFetch(input, init);
+      },
+    } as const;
+    await createSuperRareClient(options).auth.login();
+    const [record] = [...storage.values.values()];
+    const { codeVerifier } = z.object({ codeVerifier: z.string() }).parse(JSON.parse(record ?? '{}'));
+
+    await expect(createSuperRareClient(options).auth.handleRedirectCallback(new URLSearchParams(
+      'intentId=connect_intent_login&state=state_login&code=one_time_code&codeVerifier=forged_forged_forged_forged_forged_forged_forged',
+    ))).resolves.toMatchObject({ status: 'authenticated' });
+
+    expect(bodies).toEqual([
+      {
+        path: '/v1/connect/intents',
+        body: expect.objectContaining({
+          pkce: { codeChallenge: await s256(codeVerifier), codeChallengeMethod: 'S256' },
+        }),
+      },
+      {
+        path: '/v1/connect/auth/exchange',
+        body: { intentId: 'connect_intent_login', state: 'state_login', code: 'one_time_code', codeVerifier },
+      },
+    ]);
+  });
+
+  it('refuses a pending login stored without a PKCE verifier', async () => {
+    const storage = memoryStorage();
+    const requests: string[] = [];
+    const options = {
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign: () => {} },
+      sessionStorage: storage,
+      createState: () => 'state_login',
+      fetch: loginFetch(requests),
+    } as const;
+    await createSuperRareClient(options).auth.login();
+    const [key] = [...storage.values.keys()];
+    if (key === undefined) throw new Error('expected a pending login');
+    storage.values.set(key, JSON.stringify({
+      intentId: 'connect_intent_login',
+      state: 'state_login',
+      expiresAt: futureExpiry(),
+    }));
+
+    await expect(createSuperRareClient(options).auth.handleRedirectCallback(
+      new URLSearchParams('intentId=connect_intent_login&state=state_login&code=one_time_code'),
+    )).rejects.toMatchObject({ code: 'missing_pending_auth' });
+    expect(requests).not.toContain('/v1/connect/auth/exchange');
+  });
+
+  it('refuses a login without Web Crypto before creating an intent', async () => {
+    vi.stubGlobal('crypto', { randomUUID: () => 'state_login' });
+    const fetchImplementation = vi.fn();
+    const assign = vi.fn<(url: string) => void>();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign },
+      sessionStorage: memoryStorage(),
+      fetch: fetchImplementation,
+    });
+
+    await expect(client.auth.login()).rejects.toThrow('Secure browser crypto is required');
+    expect(fetchImplementation).not.toHaveBeenCalled();
+    expect(assign).not.toHaveBeenCalled();
   });
 
   it('refuses a callback whose state does not match the login this browser started', async () => {

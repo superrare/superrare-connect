@@ -548,7 +548,7 @@ createSuperRareClient({
 
 Both default to the browser's own `window.open` and `window.addEventListener('message', ...)`.
 
-Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session.
+Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side with the login's PKCE verifier, which it holds in memory — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session.
 
 ## Session And User
 
@@ -687,7 +687,7 @@ Call `actions.buy()` (or any other action) directly from the click handler: the 
 
 ## Full-Page Redirect
 
-Set `display: 'redirect'` to navigate the page to SuperRare Connect instead of opening a window. Connect sends the user back to `returnPath` on your origin when the flow finishes. Popup stays the default, and nothing changes for clients that do not set `display`.
+Set `display: 'redirect'` to navigate the page to SuperRare Connect instead of opening a window. Connect sends the user back to `returnPath` on your origin once the action completes. When it is cancelled, fails, expires, or is still processing, the user comes back with the browser Back button instead, so also read the result on the page that started the redirect, including on `pageshow` (a back/forward-cache restore does not run your mount code again). Popup stays the default, and nothing changes for clients that do not set `display`.
 
 ```ts
 const superrare = createSuperRareClient({ display: 'redirect' });
@@ -709,8 +709,8 @@ if (intent !== undefined) {
 ```
 
 - `getRedirectResult()` reads the intent fresh from Rare API and returns `undefined` when this tab started no redirect. It forgets the intent once it is final, so a later call returns `undefined`. It also forgets it when Rare API answers `404`.
-- It keeps a still-`processing` intent, so a reload can check again. A transient Rare API error rejects and keeps it too.
-- Rare API answers an expired intent with `410`, so `getRedirectResult()` rejects with `SuperRareConnectApiError` (`status` 410) and forgets the intent.
+- It keeps an intent that is not final yet (`pending`, `requires_user`, or `processing`, so check `intent.status`), and a transient Rare API error rejects and keeps it too, so the page can check again until the intent's `expiresAt`.
+- After `expiresAt`, Rare API answers `410` for every intent but a transfer, completed or still settling, so `getRedirectResult()` rejects with `SuperRareConnectApiError` (`status` 410) and forgets the intent. A `410` means the outcome can no longer be read, not that the action failed: confirm a card purchase on your server.
 - With `sessionStorage: false` nothing is remembered: keep the `intentId` that the action returns, or record it in `beforeOpen`.
 - `actions.transfer`'s `beforeOpen` runs before the page navigates. If it throws, the page stays put and the call rejects with that error.
 
@@ -730,6 +730,7 @@ if (result.status === 'authenticated') {
 ```
 
 - `handleRedirectCallback()` reads `window.location.search` by default, or the `URLSearchParams` you pass.
+- The login is bound to a PKCE verifier (S256) that the SDK keeps in the tab's `sessionStorage` and never puts in a URL, so the callback values cannot be exchanged or reclaimed without it. Login therefore needs a secure context (HTTPS or `localhost`) with Web Crypto, and throws before creating an intent without one.
 - It checks `intentId` and `state` against the login this tab started, so it needs SDK storage. Without storage, `auth.login()` throws before creating an intent. The user has to come back in the tab that started the login.
 - It resolves `cancelled` when, while the code is being exchanged, a logout on this client lands, a newer login on this client navigates away, or another tab or client stores a session. A newer login that fails before navigating leaves the callback alone; one that navigates after the session is stored leaves it in place.
 - `auth.logout()` or `auth.clearSession()` before the callback is handled invalidates the pending login, even with no session: the callback then throws `ConnectAuthPendingError` (`missing_pending_auth`). The pending action redirect survives both, since an action does not need a session.

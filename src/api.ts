@@ -1,5 +1,9 @@
 import { z } from 'zod';
-import type { CreateConnectIntentRequest, CreateConnectLoginIntentRequest } from './auth-flow-core.js';
+import type {
+  ConnectAuthExchangeParams,
+  CreateConnectIntentRequest,
+  CreateConnectLoginIntentRequest,
+} from './auth-flow-core.js';
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import { SuperRareConnectApiError } from './errors.js';
 import {
@@ -243,7 +247,7 @@ export async function getConnectIntent(input: {
 }
 
 export async function exchangeConnectAuthCode(
-  params: ConnectAuthCallbackParams,
+  params: ConnectAuthExchangeParams,
   options: ConnectAuthApiOptions & { signal?: AbortSignal } = {},
 ): Promise<ConnectAuthCredentials> {
   const body = await requestConnectApiJson({
@@ -310,7 +314,7 @@ export async function revokeConnectAuthSession(
  * `state`.
  */
 export async function claimConnectAuthCode(
-  input: { intentId: string; state: string },
+  input: { intentId: string; state: string; codeVerifier: string },
   options: ConnectAuthApiOptions & { signal?: AbortSignal } = {},
 ): Promise<ConnectAuthClaimResult> {
   let body: unknown;

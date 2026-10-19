@@ -37,7 +37,9 @@ import {
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
+  encodeBase64Url,
   verifyConnectAuthCallbackAgainstPending,
+  type ConnectAuthExchangeParams,
   type ConnectAuthPendingVerificationError,
   type PendingConnectAuth,
 } from './auth-flow-core.js';
@@ -124,8 +126,9 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   createState?: () => string;
   /**
    * `'popup'` (default) opens every hosted flow in its own window.
-   * `'redirect'` navigates this page to the hosted flow instead, and Connect
-   * returns to `returnPath` when it finishes; read the result there with
+   * `'redirect'` navigates this page to the hosted flow instead. Connect
+   * returns to `returnPath` once the action completes; otherwise the user
+   * comes back with the browser Back button. Read the result with
    * `intents.getRedirectResult()` or `auth.handleRedirectCallback()`. Games
    * keep their own window in both modes.
    */
@@ -706,7 +709,9 @@ export function createSuperRareClient(
     // reads for initiatingOrigin.
     intentOptions: { signal?: AbortSignal } = {},
   ): Promise<StartedLoginIntent> => {
+    const pkce = await createConnectPkcePair();
     const requestResult = buildConnectLoginIntentRequest({
+      codeChallenge: pkce.codeChallenge,
       returnPath: params.returnPath,
       state: createState(),
       initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
@@ -726,6 +731,7 @@ export function createSuperRareClient(
         intentId: intent.intentId,
         state: requestResult.request.state,
         expiresAt: intent.expiresAt,
+        codeVerifier: pkce.codeVerifier,
       },
     };
   };
@@ -784,7 +790,7 @@ export function createSuperRareClient(
     return prepared;
   };
   const completePopupLogin = async (input: {
-    params: ConnectAuthCallbackParams;
+    exchangeParams: ConnectAuthExchangeParams;
     operationGeneration: number;
     // True once the watcher settled this login (timed out, dismissed); a
     // response that arrives afterwards must not write a session behind its back.
@@ -793,7 +799,7 @@ export function createSuperRareClient(
     // deadline stops applying to the best-effort profile lookup that follows.
     onCommitted: () => void;
   }): Promise<ConnectPopupLoginResult> => {
-    const credentials = await exchangeConnectAuthCode(input.params, {
+    const credentials = await exchangeConnectAuthCode(input.exchangeParams, {
       ...apiOptions,
       signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
     });
@@ -906,7 +912,7 @@ export function createSuperRareClient(
         exchanging = true;
         completionDeadline = Date.now() + POPUP_LOGIN_COMPLETION_TIMEOUT_MS;
         completePopupLogin({
-          params,
+          exchangeParams: verification.exchangeParams,
           operationGeneration: input.operationGeneration,
           isAbandoned: () => settled,
           onCommitted: () => {
@@ -951,7 +957,11 @@ export function createSuperRareClient(
         claiming = true;
         try {
           const claim = await claimConnectAuthCode(
-            { intentId: input.pendingAuth.intentId, state: input.pendingAuth.state },
+            {
+              intentId: input.pendingAuth.intentId,
+              state: input.pendingAuth.state,
+              codeVerifier: input.pendingAuth.codeVerifier,
+            },
             { ...apiOptions, signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS) },
           );
           // The posted callback may have landed while the claim was out.
@@ -1185,7 +1195,7 @@ export function createSuperRareClient(
     const replacementGeneration = sessionLifecycle.getReplacementGeneration();
     let credentials: ConnectAuthCredentials;
     try {
-      credentials = await exchangeConnectAuthCode(callbackParams, {
+      credentials = await exchangeConnectAuthCode(verification.exchangeParams, {
         ...apiOptions,
         signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
       });
@@ -2071,6 +2081,17 @@ function isConnectSessionStorage(value: unknown): value is ConnectSessionStorage
     typeof value.setItem === 'function' &&
     typeof value.removeItem === 'function'
   );
+}
+
+async function createConnectPkcePair(): Promise<{ codeVerifier: string; codeChallenge: string }> {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) {
+    throw new Error('Secure browser crypto is required to create a Connect login.');
+  }
+
+  const codeVerifier = encodeBase64Url(globalThis.crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+  return { codeVerifier, codeChallenge: encodeBase64Url(new Uint8Array(digest)) };
 }
 
 function createConnectState(): string {
