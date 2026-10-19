@@ -260,7 +260,8 @@ export type SuperRareConnectIntentsNamespace = {
   /**
    * `display: 'redirect'` only: the intent of the last action this browser
    * redirected to, read fresh from Rare API, or `undefined` when there is
-   * none. The record is dropped once the intent is final.
+   * none. The record is dropped once the intent is final or Rare API answers
+   * 404 or 410; it survives a logout, since an action does not need a session.
    */
   getRedirectResult: () => Promise<ConnectIntent | undefined>;
 };
@@ -452,9 +453,8 @@ export function createSuperRareClient(
       if (readRecord !== undefined && redirectStorage?.getItem(key) === readRecord) redirectStorage.removeItem(key);
     } catch { /* Blocked storage holds nothing to remove. */ }
   };
-  const forgetRedirectRecords = (): void => {
+  const forgetPendingRedirectLogin = (): void => {
     removeRedirectRecord(pendingRedirectLoginKey, readRedirectRecord(pendingRedirectLoginKey));
-    removeRedirectRecord(pendingRedirectIntentKey, readRedirectRecord(pendingRedirectIntentKey));
   };
   const commitSession = async (
     credentials: ConnectAuthCredentials,
@@ -1161,10 +1161,10 @@ export function createSuperRareClient(
     if (operationLogoutGeneration !== logoutGeneration) return { status: 'cancelled' };
     requireNavigableHostedUrl(started.intent.url);
     redirectStorage.setItem(pendingRedirectLoginKey, JSON.stringify(started.pendingAuth));
+    navigation.assign(started.intent.url);
     // Only a login that navigates supersedes a callback still exchanging; one
     // that fails before this point leaves that callback's session alone.
     sessionCommitGeneration += 1;
-    navigation.assign(started.intent.url);
     return { status: 'redirected' };
   };
 
@@ -1683,14 +1683,14 @@ export function createSuperRareClient(
         sessionCommitGeneration += 1;
         logoutGeneration += 1;
         inFlightLogin = undefined;
-        forgetRedirectRecords();
+        forgetPendingRedirectLogin();
         sessionLifecycle.clear();
       },
       async logout(): Promise<void> {
         sessionCommitGeneration += 1;
         logoutGeneration += 1;
         inFlightLogin = undefined;
-        forgetRedirectRecords();
+        forgetPendingRedirectLogin();
         await sessionLifecycle.logout();
       },
       onChange(callback): () => void {

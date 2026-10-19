@@ -687,7 +687,7 @@ Call `actions.buy()` (or any other action) directly from the click handler: the 
 
 ## Full-Page Redirect
 
-Set `display: 'redirect'` to navigate the page to SuperRare Connect instead of opening a window. Connect sends the user back to `returnPath` on your origin when the flow finishes. On a cancelled, failed, or expired action it shows a **Back to site** link to the same path. Popup stays the default, and nothing changes for clients that do not set `display`.
+Set `display: 'redirect'` to navigate the page to SuperRare Connect instead of opening a window. Connect sends the user back to `returnPath` on your origin when the flow finishes. Popup stays the default, and nothing changes for clients that do not set `display`.
 
 ```ts
 const superrare = createSuperRareClient({ display: 'redirect' });
@@ -708,7 +708,7 @@ if (intent !== undefined) {
 }
 ```
 
-- `getRedirectResult()` reads the intent fresh from Rare API and returns `undefined` when this tab started no redirect. It forgets the intent once it is final, so a later call returns `undefined`.
+- `getRedirectResult()` reads the intent fresh from Rare API and returns `undefined` when this tab started no redirect. It forgets the intent once it is final, so a later call returns `undefined`. It also forgets it when Rare API answers `404`.
 - It keeps a still-`processing` intent, so a reload can check again. A transient Rare API error rejects and keeps it too.
 - Rare API answers an expired intent with `410`, so `getRedirectResult()` rejects with `SuperRareConnectApiError` (`status` 410) and forgets the intent.
 - With `sessionStorage: false` nothing is remembered: keep the `intentId` that the action returns, or record it in `beforeOpen`.
@@ -731,8 +731,8 @@ if (result.status === 'authenticated') {
 
 - `handleRedirectCallback()` reads `window.location.search` by default, or the `URLSearchParams` you pass.
 - It checks `intentId` and `state` against the login this tab started, so it needs SDK storage. Without storage, `auth.login()` throws before creating an intent. The user has to come back in the tab that started the login.
-- It resolves `cancelled` when, while the code is being exchanged, a logout on this client lands, a newer login on this client navigates away, or another tab stores a session. A newer login that fails before navigating leaves the callback alone.
-- `auth.logout()` or `auth.clearSession()` before the callback is handled invalidates the pending login, even with no session: the callback then throws `ConnectAuthPendingError` (`missing_pending_auth`). Logging out also forgets the pending action redirect.
+- It resolves `cancelled` when, while the code is being exchanged, a logout on this client lands, a newer login on this client navigates away, or another tab or client stores a session. A newer login that fails before navigating leaves the callback alone; one that navigates after the session is stored leaves it in place.
+- `auth.logout()` or `auth.clearSession()` before the callback is handled invalidates the pending login, even with no session: the callback then throws `ConnectAuthPendingError` (`missing_pending_auth`). The pending action redirect survives both, since an action does not need a session.
 - Calls with the same `intentId`, `state`, and `code` on one client while the first is running (for example from a React StrictMode effect) share its result. Nothing is kept once it settles. After a success, or once Rare API refuses the code for good (`400`, `401`, `404`, `410`), a new call throws `missing_pending_auth`. After a network or server error the same URL can retry.
 - Malformed callback parameters throw `ConnectAuthCallbackError`. A callback that does not match the pending login throws `ConnectAuthPendingError`.
 - `auth.prepareLogin()` still works: the redirect uses the prepared intent.
