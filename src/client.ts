@@ -52,6 +52,7 @@ import {
 import {
   parseStoredPendingConnectAuth,
   parseStoredPendingConnectRedirectIntent,
+  resolveConnectDisplay,
   type ConnectDisplay,
   type ConnectNavigation,
 } from './redirect-core.js';
@@ -137,8 +138,10 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
    * `'redirect'` navigates this page to the hosted flow instead. Connect
    * returns to `returnPath` once the action completes; otherwise the user
    * comes back with the browser Back button. Read the result with
-   * `intents.getRedirectResult()` or `auth.handleRedirectCallback()`. Games
-   * keep their own window in both modes.
+   * `intents.getRedirectResult()` or `auth.handleRedirectCallback()`.
+   * `'embed'` runs hosted flows in the iframe the `embed` adapter mounts.
+   * An explicit `display` always wins over the `embed` adapter. Games keep
+   * their own window in every mode.
    */
   display?: ConnectDisplay;
   /** How `display: 'redirect'` navigates; defaults to `window.location`. */
@@ -161,7 +164,12 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
      */
     visibilityEvents?: ConnectPopupVisibilityEvents;
   };
-  /** Opt-in hosted Connect iframe transport; game authorization is an API exchange. */
+  /**
+   * The iframe adapter for `display: 'embed'`; game authorization is an API
+   * exchange. Without `display`, passing `embed` still selects embedded
+   * display for backwards compatibility. That implicit switch is deprecated
+   * and will be removed: set `display: 'embed'` together with `embed`.
+   */
   embed?: ConnectEmbedOptions;
   /**
    * Called with the terminal status when a hosted action/checkout flow
@@ -454,7 +462,15 @@ export function createSuperRareClient(
     }),
   });
   const createState = options.createState ?? createConnectState;
-  const redirectDisplay = options.display === 'redirect';
+  const display = resolveConnectDisplay({
+    display: options.display,
+    hasEmbedAdapter: options.embed !== undefined,
+  });
+  const embedOptions = display === 'embed' ? options.embed : undefined;
+  if (display === 'embed' && embedOptions === undefined) {
+    throw new Error("display: 'embed' needs an embed adapter; pass embed.open to mount the hosted iframe.");
+  }
+  const redirectDisplay = display === 'redirect';
   // Per tab: two tabs redirecting at once must not overwrite each other's
   // pending login or intent, as a shared credential slot would — so the tab's
   // sessionStorage wins over an injected (often shared) storage, which only
@@ -519,16 +535,16 @@ export function createSuperRareClient(
   };
   const embeddedMessageSources = new WeakMap<ConnectPopupWindow, unknown>();
   const hostedDisplayUrl = (url: string): string =>
-    options.embed === undefined ? appendConnectPopupDisplay(url) : appendConnectEmbedDisplay(url);
+    embedOptions === undefined ? appendConnectPopupDisplay(url) : appendConnectEmbedDisplay(url);
   const openHostedWindow = (
     target: string,
     url = 'about:blank',
   ): ConnectPopupWindow | null => {
-    if (options.embed === undefined) return openPopupWindow(target, url);
+    if (embedOptions === undefined) return openPopupWindow(target, url);
     if (hostedMessageEvents === undefined) {
       throw new Error('Embedded Connect requires a message-event source.');
     }
-    const frame = options.embed.open(url, target);
+    const frame = embedOptions.open(url, target);
     if (frame !== null) {
       if (frame.messageSource === undefined || frame.messageSource === null) {
         frame.close();
@@ -554,7 +570,7 @@ export function createSuperRareClient(
     let lastPollFailed = false;
     let consecutiveGoneResponses = 0;
     const closePopup = (): void => {
-      if (options.embed !== undefined) return;
+      if (embedOptions !== undefined) return;
       try {
         if (!isPopupClosed(input.popup)) input.popup.close();
       } catch {
@@ -662,7 +678,7 @@ export function createSuperRareClient(
     isAbandoned: () => boolean;
   }): Promise<void> => {
     let unavailable = false;
-    const unsubscribe = options.embed === undefined ? undefined : hostedMessageEvents?.subscribe((event) => {
+    const unsubscribe = embedOptions === undefined ? undefined : hostedMessageEvents?.subscribe((event) => {
       const parsed = parseConnectEmbedMessage({
         ...event,
         expectedOrigin: input.connectOrigin,
@@ -674,7 +690,7 @@ export function createSuperRareClient(
       if (!parsed.ok || parsed.message.type !== 'superrare-connect:embed-unavailable'
         || unavailable || input.isAbandoned()) return;
       unavailable = true;
-      options.embed?.onUnavailable(new ConnectEmbedUnavailableError(input.intentId));
+      embedOptions?.onUnavailable(new ConnectEmbedUnavailableError(input.intentId));
     });
     return watchPopupIntent({
       ...input,
@@ -746,7 +762,7 @@ export function createSuperRareClient(
 
     let abandoned = false;
     try {
-      if (options.embed === undefined) popup.location.replace(hostedDisplayUrl(intent.url));
+      if (embedOptions === undefined) popup.location.replace(hostedDisplayUrl(intent.url));
       void watchHostedIntent({
         popup,
         intentId: intent.intentId,
@@ -760,7 +776,7 @@ export function createSuperRareClient(
       }).catch(() => {
         // The watcher owns cleanup; callback failures must not become unhandled rejections.
       });
-      if (options.embed !== undefined) popup.location.replace(hostedDisplayUrl(intent.url));
+      if (embedOptions !== undefined) popup.location.replace(hostedDisplayUrl(intent.url));
       return intent;
     } catch (error) {
       abandoned = true;
@@ -780,7 +796,7 @@ export function createSuperRareClient(
     });
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
-  const hostedMessageEvents = options.embed?.messageEvents ?? messageEvents;
+  const hostedMessageEvents = embedOptions?.messageEvents ?? messageEvents;
   const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
   let popupLoginReplacementGeneration = 0;
   let inFlightLogin: Promise<ConnectPopupLoginResult> | undefined;
@@ -963,7 +979,7 @@ export function createSuperRareClient(
         try {
           unsubscribe();
           unsubscribeVisibility();
-          if (options.embed === undefined && !isPopupClosed(input.popup)) input.popup.close();
+          if (embedOptions === undefined && !isPopupClosed(input.popup)) input.popup.close();
         } catch {
           // The window/emitter is already gone; nothing left to release.
         }
@@ -1103,7 +1119,7 @@ export function createSuperRareClient(
       };
       unsubscribe = input.messageEvents.subscribe((event) => {
         if (settled || exchanging) return;
-        if (options.embed !== undefined) {
+        if (embedOptions !== undefined) {
           if (event.source !== embeddedMessageSources.get(input.popup)) return;
           const embedded = parseConnectEmbedMessage({
             ...event,
@@ -1116,7 +1132,7 @@ export function createSuperRareClient(
             if (embedded.message.type === 'superrare-connect:embed-unavailable') {
               const error = new ConnectEmbedUnavailableError(input.pendingAuth.intentId);
               settle(() => reject(error));
-              options.embed.onUnavailable(error);
+              embedOptions.onUnavailable(error);
             } else {
               void reconcileEmbeddedStatus();
             }
@@ -1204,7 +1220,7 @@ export function createSuperRareClient(
     // suspended opener to leave unfinished.
     const popup = openHostedWindow(
       `superrare-connect-login-${createConnectPopupName()}`,
-      options.embed === undefined ? prepared?.popupUrl : undefined,
+      embedOptions === undefined ? prepared?.popupUrl : undefined,
     );
     if (popup === null) {
       throw new ConnectPopupBlockedError();
@@ -1226,7 +1242,7 @@ export function createSuperRareClient(
           }),
           operationGeneration,
         });
-        if (options.embed !== undefined) popup.location.replace(prepared.popupUrl);
+        if (embedOptions !== undefined) popup.location.replace(prepared.popupUrl);
         return await completion;
       } catch (error) {
         // A rejected watcher is observed even if navigation failed before await.
@@ -1289,7 +1305,7 @@ export function createSuperRareClient(
     });
     let completion: Promise<ConnectPopupLoginResult> | undefined;
     try {
-      if (options.embed === undefined) popup.location.replace(popupUrl);
+      if (embedOptions === undefined) popup.location.replace(popupUrl);
       completion = watchPopupLogin({
         popup,
         pendingAuth,
@@ -1299,7 +1315,7 @@ export function createSuperRareClient(
         deadline,
         operationGeneration,
       });
-      if (options.embed !== undefined) popup.location.replace(popupUrl);
+      if (embedOptions !== undefined) popup.location.replace(popupUrl);
       return await completion;
     } catch (error) {
       // The watcher settles and cleans up on its own; this boundary covers a

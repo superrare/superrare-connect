@@ -1,7 +1,19 @@
 import { z } from 'zod';
 import { pendingConnectAuthSchema, type PendingConnectAuth } from './auth-flow-core.js';
 
-export type ConnectDisplay = 'popup' | 'redirect';
+export type ConnectDisplay = 'popup' | 'redirect' | 'embed';
+
+/**
+ * An explicit `display` always wins. Without one, an `embed` adapter still
+ * selects embedded display, kept only for clients written before `display`
+ * accepted `'embed'`.
+ */
+export function resolveConnectDisplay(input: {
+  display: ConnectDisplay | undefined;
+  hasEmbedAdapter: boolean;
+}): ConnectDisplay {
+  return input.display ?? (input.hasEmbedAdapter ? 'embed' : 'popup');
+}
 
 export type ConnectNavigation = {
   assign: (url: string) => void;

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ConnectEmbedUnavailableError,
   createSuperRareClient,
+  type ConnectDisplay,
   type ConnectEmbedWindow,
   type ConnectIntent,
   type ConnectIntentStatus,
@@ -19,7 +20,12 @@ const transfer = {
   amount: '2500000',
 } as const;
 
-function harness(input: { onNavigate?: () => void; onSubscribe?: () => void; intentType?: 'login' | 'transfer' } = {}) {
+function harness(input: {
+  display?: ConnectDisplay;
+  onNavigate?: () => void;
+  onSubscribe?: () => void;
+  intentType?: 'login' | 'transfer';
+} = {}) {
   const listeners = new Set<(event: ConnectPopupMessageEvent) => void>();
   const source = {};
   const urls: string[] = [];
@@ -37,6 +43,7 @@ function harness(input: { onNavigate?: () => void; onSubscribe?: () => void; int
   const client = createSuperRareClient({
     apiUrl: 'https://api.test', studioUrl: 'https://studio.test', initiatingOrigin: 'https://game.test',
     createState: () => state, sessionStorage: false,
+    ...(input.display === undefined ? {} : { display: input.display }),
     embed: {
       open: () => frame,
       messageEvents: { subscribe(listener) { input.onSubscribe?.(); listeners.add(listener); return () => { listeners.delete(listener); }; } },
@@ -244,5 +251,53 @@ describe('embedded hosted Connect lifecycle', () => {
     expect(h.popupOpen).not.toHaveBeenCalled();
     expect(h.requests.filter((request) => new URL(request.url).pathname.endsWith('/authorizations'))).toHaveLength(1);
     expect(h.requests.some((request) => /\/(consents|uses)$/.test(new URL(request.url).pathname))).toBe(false);
+  });
+});
+
+describe('display option with an embed adapter', () => {
+  it('runs embedded when display is embed', async () => {
+    vi.useFakeTimers();
+    const h = harness({ display: 'embed', onNavigate: () => h.emit(h.callback()) });
+
+    await expect(h.client.auth.login()).resolves.toMatchObject({ status: 'authenticated' });
+    expect(new URL(h.urls[0] ?? '').searchParams.get('display')).toBe('embed');
+    expect(h.popupOpen).not.toHaveBeenCalled();
+  });
+
+  it('lets display popup override the embed adapter', async () => {
+    const embedOpen = vi.fn((): ConnectEmbedWindow | null => null);
+    const popupOpen = vi.fn(() => null);
+    const client = createSuperRareClient({
+      apiUrl: 'https://api.test',
+      display: 'popup',
+      embed: { open: embedOpen, onUnavailable: () => {} },
+      popup: { open: popupOpen, messageEvents: { subscribe: () => () => {} } },
+      fetch: vi.fn(),
+    });
+
+    await expect(client.auth.login()).rejects.toMatchObject({ name: 'ConnectPopupBlockedError' });
+    expect(popupOpen).toHaveBeenCalledTimes(1);
+    expect(embedOpen).not.toHaveBeenCalled();
+  });
+
+  it('lets display redirect override the embed adapter', async () => {
+    const open = vi.fn((): ConnectEmbedWindow | null => null);
+    const assign = vi.fn<(url: string) => void>();
+    const client = createSuperRareClient({
+      apiUrl: 'https://api.test',
+      display: 'redirect',
+      embed: { open, onUnavailable: () => {} },
+      navigation: { assign },
+      fetch: async () => Response.json({ data: { intentId, url: `${origin}/action/${intentId}`, expiresAt } }),
+    });
+
+    await client.actions.transfer(transfer);
+
+    expect(assign).toHaveBeenCalledWith(`${origin}/action/${intentId}`);
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it('refuses display embed without an embed adapter', () => {
+    expect(() => createSuperRareClient({ display: 'embed' })).toThrow("display: 'embed' needs an embed adapter");
   });
 });

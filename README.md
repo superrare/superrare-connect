@@ -206,7 +206,7 @@ ESM CDN-style usage:
 
 ## Embedded Hosted Login And Checkout
 
-Set `embed` on the client to run hosted Connect login, checkout, actions, and offers in a merchant-owned iframe. Popup mode remains the default. The SDK owns intent creation, callback verification, and status reconciliation; your adapter owns the iframe DOM and dismissal. The public adapter types are `ConnectEmbedOptions` and `ConnectEmbedWindow`.
+Set `display: 'embed'` and pass an `embed` adapter to run hosted Connect login, checkout, actions, and offers in a merchant-owned iframe. Popup mode remains the default. The SDK owns intent creation, callback verification, and status reconciliation; your adapter owns the iframe DOM and dismissal. The public adapter types are `ConnectEmbedOptions` and `ConnectEmbedWindow`.
 
 Create `#connect-embed`, `#connect-status`, and a `#sign-in` button before this script:
 
@@ -218,6 +218,7 @@ const status = document.querySelector('#connect-status');
 if (container === null || status === null) throw new Error('Missing Connect embed elements.');
 
 const superrare = createSuperRareClient({
+  display: 'embed',
   embed: {
     open(url) {
       const frame = document.createElement('iframe');
@@ -240,7 +241,7 @@ const superrare = createSuperRareClient({
       };
     },
     onUnavailable(error) {
-      status.textContent = `${error.code}: restart explicitly using a new popup flow.`;
+      status.textContent = `${error.code}: restart explicitly in a new popup or redirect flow.`;
     },
   },
 });
@@ -251,17 +252,19 @@ document.querySelector('#sign-in')?.addEventListener('click', async () => {
     status.textContent = result.status;
   } catch (error) {
     status.textContent = error instanceof ConnectEmbedUnavailableError
-      ? 'Embedded storage is unavailable. Offer a new popup login.'
+      ? 'Embedded storage is unavailable. Offer a new popup or redirect login.'
       : 'Login failed.';
   }
 });
 ```
 
+- `display` accepts `'popup'` (default), `'redirect'`, or `'embed'`, and an explicit `display` always wins over the `embed` adapter. `display: 'embed'` without an adapter throws when the client is created.
+- **Deprecated:** passing `embed` without `display` still selects embedded display, so existing clients keep working. That implicit switch will be removed in a future major version; always set `display: 'embed'` with the adapter.
 - The adapter opens a blank frame synchronously. The SDK subscribes before assigning the hosted URL with `display=embed`; `messageSource` must be that exact iframe's `contentWindow`. Browser message events are used by default; non-browser hosts can inject `embed.messageEvents`.
 - Call `auth.login()`, `checkout.start()`, `actions.transfer()` and other hosted methods normally. `transfer.beforeOpen(intent)` still finishes before the iframe navigates, allowing your backend to record the intent before checkout is shown.
 - Auth callbacks require the hosted origin, frame source, intent ID, and original state. Terminal outcomes are reconciled through authoritative API reads, not frontend payment crediting. `onIntentSettled` retains its existing status contract, including possibly non-terminal state after dismissal; check status and reconcile purchases on your backend.
 - Successful login and authoritative terminal outcomes leave dismissal to the merchant. Remove the iframe to dismiss it; login checks the API for a missed completion before returning `cancelled`. Intent creation, `beforeOpen`, navigation, subscription, or login exchange failures clean up the adapter and reject the operation; the original failure is preserved.
-- `superrare-connect:embed-unavailable` invokes `embed.onUnavailable` with `ConnectEmbedUnavailableError` (`code: 'embed_unavailable'`, `intentId`). An embedded login also rejects with that error; an already-created action stops its watcher without reporting a fabricated completion. The SDK never silently opens a popup. A user-initiated restart must use a separate popup-mode client and a fresh intent, never the consumed iframe URL.
+- `superrare-connect:embed-unavailable` invokes `embed.onUnavailable` with `ConnectEmbedUnavailableError` (`code: 'embed_unavailable'`, `intentId`). An embedded login also rejects with that error; an already-created action stops its watcher without reporting a fabricated completion. The SDK never silently switches display. A user-initiated restart must use a separate client and a fresh intent, never the consumed iframe URL: `display: 'popup'`, or `display: 'redirect'` where popups are blocked too (for example wallet in-app browsers).
 - **Studio `game.connect()` is API-only**, including on an embedded client. Use the existing embedded `auth.login()` separately if signed out; connecting never creates a hosted game-authorization URL or starts a paid play.
 - Use an HTTPS merchant origin; HTTP loopback origins are supported for local development. The SDK creates intents directly against `apiUrl` from the merchant browser so the browser's `Origin` matches `initiatingOrigin`; configure CORS and the matching `connectUrl` rather than proxying an untrusted body origin.
 - Embedded sessions use the hosted app's partitioned cookies and can be unavailable in some browsers. Reown, OAuth, external wallets, and provider confirmations retain their own UI. Do not impose an opaque iframe sandbox; preserve the script, same-origin, form, popup, and payment permissions required by the hosted providers. Arbitrary merchant embedding accepts framing/clickjacking risk; origin-bound messages do not make the surrounding merchant UI trustworthy.
@@ -779,7 +782,7 @@ Call `actions.buy()` (or any other action) directly from the click handler: the 
 
 ## Full-Page Redirect
 
-Set `display: 'redirect'` to navigate the page to SuperRare Connect instead of opening a window. Connect sends the user back to `returnPath` on your origin once the action completes. When it is cancelled, fails, expires, or is still processing, the user comes back with the browser Back button instead, so also read the result on the page that started the redirect, including on `pageshow` (a back/forward-cache restore does not run your mount code again). Popup stays the default, and nothing changes for clients that do not set `display`.
+Set `display: 'redirect'` to navigate the page to SuperRare Connect instead of opening a window or an iframe. Connect sends the user back to `returnPath` on your origin once the action completes. When it is cancelled, fails, expires, or is still processing, the user comes back with the browser Back button instead, so also read the result on the page that started the redirect, including on `pageshow` (a back/forward-cache restore does not run your mount code again). Popup stays the default, and nothing changes for clients that do not set `display`.
 
 ```ts
 const superrare = createSuperRareClient({ display: 'redirect' });
