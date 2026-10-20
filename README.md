@@ -833,7 +833,7 @@ if (result.status === 'authenticated') {
 - Malformed callback parameters throw `ConnectAuthCallbackError`. A callback that does not match the pending login throws `ConnectAuthPendingError`.
 - `auth.prepareLogin()` still works: the redirect uses the prepared intent.
 
-The `popup` and `onIntentSettled` options do not apply in redirect mode. `game.connect()` keeps its own window in both modes. On hosts without `window.location`, pass `navigation: { assign }`; without either, redirect calls throw before creating an intent.
+The `popup` and `onIntentSettled` options do not apply in redirect mode. `game.connect()` is API-only in every display, so it never navigates the page. On hosts without `window.location`, pass `navigation: { assign }`; without either, redirect calls throw before creating an intent.
 
 ## Return Path Safety
 

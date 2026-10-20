@@ -140,8 +140,8 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
    * comes back with the browser Back button. Read the result with
    * `intents.getRedirectResult()` or `auth.handleRedirectCallback()`.
    * `'embed'` runs hosted flows in the iframe the `embed` adapter mounts.
-   * An explicit `display` always wins over the `embed` adapter. Games keep
-   * their own window in every mode.
+   * An explicit `display` always wins over the `embed` adapter.
+   * `game.connect()` is API-only in every display.
    */
   display?: ConnectDisplay;
   /** How `display: 'redirect'` navigates; defaults to `window.location`. */
