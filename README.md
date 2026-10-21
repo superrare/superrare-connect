@@ -10,7 +10,13 @@ SuperRare Connect handles wallet connection, checkout, buys, bids, mints, auctio
 pnpm add @rareprotocol/connect
 ```
 
-Version `0.11.0` adds database-completion-time windows to public server-verified leaderboards. Install the stable channel with `pnpm add @rareprotocol/connect@latest`; the `beta` npm tag remains a separate opt-in channel.
+Version `0.12.0` adds `display: 'redirect'` (full-page navigation instead of a window, for browsers that block popups), accepts `display: 'embed'`, and binds every login to a PKCE (S256) verifier. Install the stable channel with `pnpm add @rareprotocol/connect@latest`; the `beta` npm tag remains a separate opt-in channel.
+
+Upgrading from `0.11.x`:
+
+- `auth.login()` results include `{ status: 'redirected' }`, returned only with `display: 'redirect'`. Exhaustive `switch` statements over the result need that case.
+- Every login, popup, embed, or redirect, needs Web Crypto (`crypto.subtle`, a secure context) for its PKCE verifier, even with a custom `createState`. `PendingConnectAuth` gains `codeVerifier`.
+- Passing `embed` without `display` still selects embedded display but is deprecated; set `display: 'embed'` with the `embed` adapter. An explicit `display` always wins.
 
 ```ts
 import { createSuperRareClient } from '@rareprotocol/connect';
@@ -908,8 +914,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 npm pack
-npm publish ./rareprotocol-connect-0.11.0.tgz --access public --tag latest --dry-run
-npm publish ./rareprotocol-connect-0.11.0.tgz --access public --tag latest
+npm publish ./rareprotocol-connect-0.12.0.tgz --access public --tag latest --dry-run
+npm publish ./rareprotocol-connect-0.12.0.tgz --access public --tag latest
 ```
 
 Only the final command publishes to npm and updates `latest`. Creating or merging a GitHub release PR, or creating a GitHub release, does not publish the package to npm. Publishing requires npm credentials authorized for `@rareprotocol/connect` and any required two-factor authentication.
