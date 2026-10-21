@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { ConnectAuthCallbackParams } from './callback-core.js';
 import { normalizeReturnPath, type ReturnPathNormalizationResult } from './return-path-core.js';
 
@@ -20,10 +21,16 @@ export type ConnectIntentPayment = {
   method?: 'card' | 'wallet';
 };
 
+export type ConnectPkceChallenge = {
+  codeChallenge: string;
+  codeChallengeMethod: 'S256';
+};
+
 export type CreateConnectLoginIntentRequest = {
   action: ConnectActionInput;
   initiatingOrigin?: string;
   payment?: ConnectIntentPayment;
+  pkce?: ConnectPkceChallenge;
   returnPath: string;
   state: string;
 };
@@ -331,6 +338,7 @@ export type ConnectActionInput =
   };
 
 export type BuildConnectLoginIntentRequestInput = {
+  codeChallenge: string;
   returnPath?: string;
   state: string;
   initiatingOrigin?: string;
@@ -340,24 +348,30 @@ export type BuildConnectLoginIntentRequestResult =
   | { ok: true; request: CreateConnectLoginIntentRequest }
   | Extract<ReturnPathNormalizationResult, { ok: false }>;
 
+export const pendingConnectAuthSchema = z.object({
+  intentId: z.string().min(1),
+  state: z.string().min(1),
+  expiresAt: z.string().min(1),
+  codeVerifier: z.string().min(43),
+});
+
 /**
- * A login's own record of the intent it started — held in memory by the
- * client for the life of the popup, and matched against the callback the
- * hosted page posts back.
+ * A login's own record of the intent it started, matched against the
+ * callback the hosted page reports back. A popup login holds it in memory;
+ * a redirect login keeps it in the tab's storage across the navigation.
  */
-export type PendingConnectAuth = {
-  intentId: string;
-  state: string;
-  expiresAt: string;
-};
+export type PendingConnectAuth = z.infer<typeof pendingConnectAuthSchema>;
 
 export type ConnectAuthPendingVerificationError =
   | 'missing_pending_auth'
   | 'intent_mismatch'
   | 'state_mismatch';
 
+/** What the auth exchange sends: the callback plus this login's own PKCE verifier. */
+export type ConnectAuthExchangeParams = ConnectAuthCallbackParams & { codeVerifier: string };
+
 export type ConnectAuthPendingVerificationResult =
-  | { ok: true }
+  | { ok: true; exchangeParams: ConnectAuthExchangeParams }
   | { ok: false; error: ConnectAuthPendingVerificationError };
 
 export function buildConnectLoginIntentRequest(
@@ -372,6 +386,7 @@ export function buildConnectLoginIntentRequest(
     ok: true,
     request: {
       action: { type: 'login' },
+      pkce: { codeChallenge: input.codeChallenge, codeChallengeMethod: 'S256' },
       returnPath: returnPathResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
@@ -395,6 +410,21 @@ export function verifyConnectAuthCallbackAgainstPending(input: {
     return { ok: false, error: 'state_mismatch' };
   }
 
-  return { ok: true };
+  return {
+    ok: true,
+    exchangeParams: {
+      intentId: input.callbackParams.intentId,
+      state: input.callbackParams.state,
+      code: input.callbackParams.code,
+      codeVerifier: input.pendingAuth.codeVerifier,
+    },
+  };
+}
+
+export function encodeBase64Url(bytes: Uint8Array): string {
+  return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 }
 

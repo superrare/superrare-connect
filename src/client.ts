@@ -38,11 +38,24 @@ import {
 } from './actions-flow-core.js';
 import {
   buildConnectLoginIntentRequest,
+  encodeBase64Url,
   verifyConnectAuthCallbackAgainstPending,
+  type ConnectAuthExchangeParams,
   type ConnectAuthPendingVerificationError,
   type PendingConnectAuth,
 } from './auth-flow-core.js';
-import type { ConnectAuthCallbackParams } from './callback-core.js';
+import {
+  parseConnectAuthCallbackSearchParams,
+  type ConnectAuthCallbackParams,
+  type ConnectAuthCallbackParseErrorCode,
+} from './callback-core.js';
+import {
+  parseStoredPendingConnectAuth,
+  parseStoredPendingConnectRedirectIntent,
+  resolveConnectDisplay,
+  type ConnectDisplay,
+  type ConnectNavigation,
+} from './redirect-core.js';
 import {
   buildConnectCheckoutIntentRequest,
   type CheckoutStartParams,
@@ -76,7 +89,7 @@ import {
   resolveConnectHostedUrl,
   type ConnectPopupLoginResult,
 } from './popup-login-core.js';
-import type { ConnectCheckoutStatus, ConnectIntent } from './status-core.js';
+import { resolveConnectIntentOutcome, type ConnectCheckoutStatus, type ConnectIntent } from './status-core.js';
 import {
   parseActiveScoringEvent,
   parseClientScore,
@@ -121,8 +134,21 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
   initiatingOrigin?: string;
   createState?: () => string;
   /**
-   * Every hosted flow — login, checkout, actions, offers — opens in a small
-   * centered window; the integrator's page always stays put. These options
+   * `'popup'` (default) opens every hosted flow in its own window.
+   * `'redirect'` navigates this page to the hosted flow instead. Connect
+   * returns to `returnPath` once the action completes; otherwise the user
+   * comes back with the browser Back button. Read the result with
+   * `intents.getRedirectResult()` or `auth.handleRedirectCallback()`.
+   * `'embed'` runs hosted flows in the iframe the `embed` adapter mounts.
+   * An explicit `display` always wins over the `embed` adapter.
+   * `game.connect()` is API-only in every display.
+   */
+  display?: ConnectDisplay;
+  /** How `display: 'redirect'` navigates; defaults to `window.location`. */
+  navigation?: ConnectNavigation;
+  /**
+   * In the default popup display, every hosted flow — login, checkout,
+   * actions, offers — opens in a small centered window. These options
    * shape that window: its size, the opener (defaults to the browser's
    * `window.open`), and the `message`-event source the login listens on.
    */
@@ -138,7 +164,12 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
      */
     visibilityEvents?: ConnectPopupVisibilityEvents;
   };
-  /** Opt-in hosted Connect iframe transport; game authorization is an API exchange. */
+  /**
+   * The iframe adapter for `display: 'embed'`; game authorization is an API
+   * exchange. Without `display`, passing `embed` still selects embedded
+   * display for backwards compatibility. That implicit switch is deprecated
+   * and will be removed: set `display: 'embed'` together with `embed`.
+   */
   embed?: ConnectEmbedOptions;
   /**
    * Called with the terminal status when a hosted action/checkout flow
@@ -214,6 +245,12 @@ export type SuperRareConnectAuthNamespace = {
    * intent instead.
    */
   prepareLogin: (params?: ConnectAuthLoginParams) => Promise<ConnectPreparedLogin>;
+  /**
+   * `display: 'redirect'` only: on the login's `returnPath`, exchanges the
+   * one-time code in the URL (defaults to `window.location.search`) for a
+   * Connect session and stores it.
+   */
+  handleRedirectCallback: (searchParams?: URLSearchParams) => Promise<ConnectRedirectLoginResult>;
   getSession: () => ConnectSession | undefined;
   /** Returns a current opaque access token, renewing the session when necessary. */
   getAccessToken: () => Promise<string>;
@@ -254,7 +291,26 @@ export type SuperRareConnectOffersNamespace = {
 
 export type SuperRareConnectIntentsNamespace = {
   get: (params: { intentId: string }) => Promise<ConnectIntent>;
+  /**
+   * `display: 'redirect'` only: the intent of the last action this browser
+   * redirected to, read fresh from Rare API, or `undefined` when there is
+   * none. The record is dropped once the intent is final or Rare API answers
+   * 404 or 410; it survives a logout, since an action does not need a session.
+   */
+  getRedirectResult: () => Promise<ConnectIntent | undefined>;
 };
+
+export type ConnectRedirectLoginResult =
+  | {
+    status: 'authenticated';
+    session: ConnectSession;
+    /** Profile of the signed-in user; `undefined` when the lookup fails. */
+    user: ConnectCurrentUser | undefined;
+  }
+  | {
+    /** A logout or a navigating newer login on this client, or a session another tab stored, landed first. */
+    status: 'cancelled';
+  };
 
 export type SuperRareGameStartParams = {
   idempotencyKey?: string;
@@ -325,6 +381,16 @@ export class ConnectAuthPendingError extends Error {
   }
 }
 
+export class ConnectAuthCallbackError extends Error {
+  readonly code: ConnectAuthCallbackParseErrorCode;
+
+  constructor(code: ConnectAuthCallbackParseErrorCode) {
+    super(`Invalid Connect auth callback: ${code}`);
+    this.name = 'ConnectAuthCallbackError';
+    this.code = code;
+  }
+}
+
 export class ConnectReturnPathError extends Error {
   readonly code = 'invalid_return_path';
 
@@ -382,6 +448,7 @@ export function createSuperRareClient(
   // Login/preparation generations belong to this client. Credential renewal
   // coordination belongs to the shared storage slot.
   let sessionCommitGeneration = 0;
+  let logoutGeneration = 0;
   const apiOptions = {
     apiUrl: options.apiUrl,
     fetch: options.fetch,
@@ -395,6 +462,48 @@ export function createSuperRareClient(
     }),
   });
   const createState = options.createState ?? createConnectState;
+  const display = resolveConnectDisplay({
+    display: options.display,
+    hasEmbedAdapter: options.embed !== undefined,
+  });
+  const embedOptions = display === 'embed' ? options.embed : undefined;
+  if (display === 'embed' && embedOptions === undefined) {
+    throw new Error("display: 'embed' needs an embed adapter; pass embed.open to mount the hosted iframe.");
+  }
+  const redirectDisplay = display === 'redirect';
+  // Per tab: two tabs redirecting at once must not overwrite each other's
+  // pending login or intent, as a shared credential slot would — so the tab's
+  // sessionStorage wins over an injected (often shared) storage, which only
+  // backs hosts that have no sessionStorage.
+  const redirectStorage = options.sessionStorage === false
+    ? undefined
+    : readBrowserSessionStorage() ?? options.sessionStorage;
+  const pendingRedirectLoginKey = `${storageKey}:redirect-login`;
+  const pendingRedirectIntentKey = `${storageKey}:redirect-intent`;
+  const requireNavigation = (): ConnectNavigation => {
+    const navigation = options.navigation ?? readBrowserNavigation();
+    if (navigation === undefined) {
+      throw new Error('Redirect display needs window.location; provide options.navigation on hosts without it.');
+    }
+    return navigation;
+  };
+  const readRedirectRecord = (key: string): string | undefined => {
+    try {
+      return redirectStorage?.getItem(key) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  // Only the operation that read a record may remove it: a newer redirect
+  // started meanwhile has written its own under the same key.
+  const removeRedirectRecord = (key: string, readRecord: string | undefined): void => {
+    try {
+      if (readRecord !== undefined && redirectStorage?.getItem(key) === readRecord) redirectStorage.removeItem(key);
+    } catch { /* Blocked storage holds nothing to remove. */ }
+  };
+  const forgetPendingRedirectLogin = (): void => {
+    removeRedirectRecord(pendingRedirectLoginKey, readRedirectRecord(pendingRedirectLoginKey));
+  };
   const commitSession = async (
     credentials: ConnectAuthCredentials,
     shouldCommit: () => boolean,
@@ -426,16 +535,16 @@ export function createSuperRareClient(
   };
   const embeddedMessageSources = new WeakMap<ConnectPopupWindow, unknown>();
   const hostedDisplayUrl = (url: string): string =>
-    options.embed === undefined ? appendConnectPopupDisplay(url) : appendConnectEmbedDisplay(url);
+    embedOptions === undefined ? appendConnectPopupDisplay(url) : appendConnectEmbedDisplay(url);
   const openHostedWindow = (
     target: string,
     url = 'about:blank',
   ): ConnectPopupWindow | null => {
-    if (options.embed === undefined) return openPopupWindow(target, url);
+    if (embedOptions === undefined) return openPopupWindow(target, url);
     if (hostedMessageEvents === undefined) {
       throw new Error('Embedded Connect requires a message-event source.');
     }
-    const frame = options.embed.open(url, target);
+    const frame = embedOptions.open(url, target);
     if (frame !== null) {
       if (frame.messageSource === undefined || frame.messageSource === null) {
         frame.close();
@@ -461,7 +570,7 @@ export function createSuperRareClient(
     let lastPollFailed = false;
     let consecutiveGoneResponses = 0;
     const closePopup = (): void => {
-      if (options.embed !== undefined) return;
+      if (embedOptions !== undefined) return;
       try {
         if (!isPopupClosed(input.popup)) input.popup.close();
       } catch {
@@ -569,7 +678,7 @@ export function createSuperRareClient(
     isAbandoned: () => boolean;
   }): Promise<void> => {
     let unavailable = false;
-    const unsubscribe = options.embed === undefined ? undefined : hostedMessageEvents?.subscribe((event) => {
+    const unsubscribe = embedOptions === undefined ? undefined : hostedMessageEvents?.subscribe((event) => {
       const parsed = parseConnectEmbedMessage({
         ...event,
         expectedOrigin: input.connectOrigin,
@@ -581,7 +690,7 @@ export function createSuperRareClient(
       if (!parsed.ok || parsed.message.type !== 'superrare-connect:embed-unavailable'
         || unavailable || input.isAbandoned()) return;
       unavailable = true;
-      options.embed?.onUnavailable(new ConnectEmbedUnavailableError(input.intentId));
+      embedOptions?.onUnavailable(new ConnectEmbedUnavailableError(input.intentId));
     });
     return watchPopupIntent({
       ...input,
@@ -611,6 +720,21 @@ export function createSuperRareClient(
         : new ConnectActionValidationError(requestResult.error);
     }
 
+    if (redirectDisplay) {
+      const navigation = requireNavigation();
+      const intent = resolveHostedIntent(await createConnectIntent({
+        ...apiOptions,
+        request: requestResult.request,
+      }));
+      requireNavigableHostedUrl(intent.url);
+      await beforeOpen?.({ ...intent });
+      navigation.assign(intent.url);
+      try {
+        redirectStorage?.setItem(pendingRedirectIntentKey, JSON.stringify({ intentId: intent.intentId }));
+      } catch { /* The caller still has intentId to read the result. */ }
+      return intent;
+    }
+
     // The popup must open before the first await to stay inside the user
     // gesture; otherwise browsers block it. It navigates once the intent
     // exists and `beforeOpen` has resolved. A blocked window fails the whole
@@ -638,7 +762,7 @@ export function createSuperRareClient(
 
     let abandoned = false;
     try {
-      if (options.embed === undefined) popup.location.replace(hostedDisplayUrl(intent.url));
+      if (embedOptions === undefined) popup.location.replace(hostedDisplayUrl(intent.url));
       void watchHostedIntent({
         popup,
         intentId: intent.intentId,
@@ -652,7 +776,7 @@ export function createSuperRareClient(
       }).catch(() => {
         // The watcher owns cleanup; callback failures must not become unhandled rejections.
       });
-      if (options.embed !== undefined) popup.location.replace(hostedDisplayUrl(intent.url));
+      if (embedOptions !== undefined) popup.location.replace(hostedDisplayUrl(intent.url));
       return intent;
     } catch (error) {
       abandoned = true;
@@ -672,17 +796,19 @@ export function createSuperRareClient(
     });
   };
   const messageEvents = options.popup?.messageEvents ?? readBrowserMessageEvents();
-  const hostedMessageEvents = options.embed?.messageEvents ?? messageEvents;
+  const hostedMessageEvents = embedOptions?.messageEvents ?? messageEvents;
   const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
   let popupLoginReplacementGeneration = 0;
-  let inFlightPopupLogin: Promise<ConnectPopupLoginResult> | undefined;
+  let inFlightLogin: Promise<ConnectPopupLoginResult> | undefined;
   const createLoginIntent = async (
     params: ConnectAuthLoginParams,
     // Not `options`: that name belongs to the client options this closure
     // reads for initiatingOrigin.
     intentOptions: { signal?: AbortSignal } = {},
   ): Promise<StartedLoginIntent> => {
+    const pkce = await createConnectPkcePair();
     const requestResult = buildConnectLoginIntentRequest({
+      codeChallenge: pkce.codeChallenge,
       returnPath: params.returnPath,
       state: createState(),
       initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
@@ -702,6 +828,7 @@ export function createSuperRareClient(
         intentId: intent.intentId,
         state: requestResult.request.state,
         expiresAt: intent.expiresAt,
+        codeVerifier: pkce.codeVerifier,
       },
     };
   };
@@ -760,7 +887,7 @@ export function createSuperRareClient(
     return prepared;
   };
   const completePopupLogin = async (input: {
-    params: ConnectAuthCallbackParams;
+    exchangeParams: ConnectAuthExchangeParams;
     operationGeneration: number;
     // True once the watcher settled this login (timed out, dismissed); a
     // response that arrives afterwards must not write a session behind its back.
@@ -769,7 +896,7 @@ export function createSuperRareClient(
     // deadline stops applying to the best-effort profile lookup that follows.
     onCommitted: () => void;
   }): Promise<ConnectPopupLoginResult> => {
-    const credentials = await exchangeConnectAuthCode(input.params, {
+    const credentials = await exchangeConnectAuthCode(input.exchangeParams, {
       ...apiOptions,
       signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
     });
@@ -852,7 +979,7 @@ export function createSuperRareClient(
         try {
           unsubscribe();
           unsubscribeVisibility();
-          if (options.embed === undefined && !isPopupClosed(input.popup)) input.popup.close();
+          if (embedOptions === undefined && !isPopupClosed(input.popup)) input.popup.close();
         } catch {
           // The window/emitter is already gone; nothing left to release.
         }
@@ -882,7 +1009,7 @@ export function createSuperRareClient(
         exchanging = true;
         completionDeadline = Date.now() + POPUP_LOGIN_COMPLETION_TIMEOUT_MS;
         completePopupLogin({
-          params,
+          exchangeParams: verification.exchangeParams,
           operationGeneration: input.operationGeneration,
           isAbandoned: () => settled,
           onCommitted: () => {
@@ -913,7 +1040,11 @@ export function createSuperRareClient(
         claiming = true;
         try {
           const claim = await claimConnectAuthCode(
-            { intentId: input.pendingAuth.intentId, state: input.pendingAuth.state },
+            {
+              intentId: input.pendingAuth.intentId,
+              state: input.pendingAuth.state,
+              codeVerifier: input.pendingAuth.codeVerifier,
+            },
             { ...apiOptions, signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS) },
           );
           // The posted callback may have landed while the claim was out.
@@ -988,7 +1119,7 @@ export function createSuperRareClient(
       };
       unsubscribe = input.messageEvents.subscribe((event) => {
         if (settled || exchanging) return;
-        if (options.embed !== undefined) {
+        if (embedOptions !== undefined) {
           if (event.source !== embeddedMessageSources.get(input.popup)) return;
           const embedded = parseConnectEmbedMessage({
             ...event,
@@ -1001,7 +1132,7 @@ export function createSuperRareClient(
             if (embedded.message.type === 'superrare-connect:embed-unavailable') {
               const error = new ConnectEmbedUnavailableError(input.pendingAuth.intentId);
               settle(() => reject(error));
-              options.embed.onUnavailable(error);
+              embedOptions.onUnavailable(error);
             } else {
               void reconcileEmbeddedStatus();
             }
@@ -1089,7 +1220,7 @@ export function createSuperRareClient(
     // suspended opener to leave unfinished.
     const popup = openHostedWindow(
       `superrare-connect-login-${createConnectPopupName()}`,
-      options.embed === undefined ? prepared?.popupUrl : undefined,
+      embedOptions === undefined ? prepared?.popupUrl : undefined,
     );
     if (popup === null) {
       throw new ConnectPopupBlockedError();
@@ -1111,7 +1242,7 @@ export function createSuperRareClient(
           }),
           operationGeneration,
         });
-        if (options.embed !== undefined) popup.location.replace(prepared.popupUrl);
+        if (embedOptions !== undefined) popup.location.replace(prepared.popupUrl);
         return await completion;
       } catch (error) {
         // A rejected watcher is observed even if navigation failed before await.
@@ -1174,7 +1305,7 @@ export function createSuperRareClient(
     });
     let completion: Promise<ConnectPopupLoginResult> | undefined;
     try {
-      if (options.embed === undefined) popup.location.replace(popupUrl);
+      if (embedOptions === undefined) popup.location.replace(popupUrl);
       completion = watchPopupLogin({
         popup,
         pendingAuth,
@@ -1184,7 +1315,7 @@ export function createSuperRareClient(
         deadline,
         operationGeneration,
       });
-      if (options.embed !== undefined) popup.location.replace(popupUrl);
+      if (embedOptions !== undefined) popup.location.replace(popupUrl);
       return await completion;
     } catch (error) {
       // The watcher settles and cleans up on its own; this boundary covers a
@@ -1198,21 +1329,91 @@ export function createSuperRareClient(
     }
   };
 
+  const startRedirectLogin = async (
+    params: ConnectAuthLoginParams,
+  ): Promise<ConnectPopupLoginResult> => {
+    if (redirectStorage === undefined) {
+      throw new Error('A redirect login needs SDK storage to survive the navigation; it is unavailable or disabled with sessionStorage: false.');
+    }
+
+    const navigation = requireNavigation();
+    const operationLogoutGeneration = logoutGeneration;
+    const started = takePreparedLogin(params)?.started ?? await createLoginIntent(params, {
+      signal: createRequestTimeoutSignal(LOGIN_INTENT_TIMEOUT_MS),
+    });
+    if (operationLogoutGeneration !== logoutGeneration) return { status: 'cancelled' };
+    requireNavigableHostedUrl(started.intent.url);
+    redirectStorage.setItem(pendingRedirectLoginKey, JSON.stringify(started.pendingAuth));
+    navigation.assign(started.intent.url);
+    // Only a login that navigates supersedes a callback still exchanging; one
+    // that fails before this point leaves that callback's session alone.
+    sessionCommitGeneration += 1;
+    return { status: 'redirected' };
+  };
+
+  const inFlightRedirectCallbacks = new Map<string, Promise<ConnectRedirectLoginResult>>();
+  const completeRedirectLogin = async (
+    callbackParams: ConnectAuthCallbackParams,
+  ): Promise<ConnectRedirectLoginResult> => {
+    const storedPendingAuth = readRedirectRecord(pendingRedirectLoginKey);
+    const verification = verifyConnectAuthCallbackAgainstPending({
+      pendingAuth: storedPendingAuth === undefined
+        ? undefined
+        : parseStoredPendingConnectAuth(storedPendingAuth),
+      callbackParams,
+    });
+    if (!verification.ok) throw new ConnectAuthPendingError(verification.error);
+
+    const operationGeneration = sessionCommitGeneration;
+    const replacementGeneration = sessionLifecycle.getReplacementGeneration();
+    let credentials: ConnectAuthCredentials;
+    try {
+      credentials = await exchangeConnectAuthCode(verification.exchangeParams, {
+        ...apiOptions,
+        signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
+      });
+    } catch (error) {
+      // Rare API answers these once the code or intent can never be exchanged;
+      // anything else (network, 5xx, 429) keeps the record so the URL can retry.
+      if (error instanceof SuperRareConnectApiError && [400, 401, 404, 410].includes(error.status)) {
+        removeRedirectRecord(pendingRedirectLoginKey, storedPendingAuth);
+      }
+      throw error;
+    }
+    removeRedirectRecord(pendingRedirectLoginKey, storedPendingAuth);
+    const committed = await commitSession(credentials, () => {
+      const currentSession = sessionLifecycle.getSession();
+      return operationGeneration === sessionCommitGeneration &&
+        (currentSession === undefined ||
+          sessionLifecycle.getReplacementGeneration() === replacementGeneration);
+    });
+    if (!committed) return { status: 'cancelled' };
+
+    const session = credentials.session;
+    const user = await getConnectCurrentUser({
+      ...apiOptions,
+      sessionId: session.sessionId,
+      signal: createRequestTimeoutSignal(POPUP_LOGIN_COMPLETION_TIMEOUT_MS),
+    }).catch((): undefined => undefined);
+    return { status: 'authenticated', session, user };
+  };
+
   const login = async (
     params: ConnectAuthLoginParams = {},
   ): Promise<ConnectPopupLoginResult> => {
     // One login at a time: the SDK holds a single session, so a second
     // concurrent login could only race the first for the same slot. A
     // caller that asks again — a double click — joins the login already
-    // running instead of opening a second window.
-    if (inFlightPopupLogin === undefined) {
-      const pending = runPopupLogin(params).finally(() => {
-        if (inFlightPopupLogin === pending) inFlightPopupLogin = undefined;
+    // running instead of opening a second window or navigating twice.
+    if (inFlightLogin === undefined) {
+      const started = redirectDisplay ? startRedirectLogin(params) : runPopupLogin(params);
+      const pending = started.finally(() => {
+        if (inFlightLogin === pending) inFlightLogin = undefined;
       });
-      inFlightPopupLogin = pending;
+      inFlightLogin = pending;
     }
 
-    return await inFlightPopupLogin;
+    return await inFlightLogin;
   };
 
   const gameAuthorizations = new Map<string, {
@@ -1622,6 +1823,28 @@ export function createSuperRareClient(
       login,
       loginWithPopup: login,
       prepareLogin,
+      async handleRedirectCallback(
+        searchParams = readBrowserSearchParams(),
+      ): Promise<ConnectRedirectLoginResult> {
+        const parsed = parseConnectAuthCallbackSearchParams(searchParams);
+        if (!parsed.ok) throw new ConnectAuthCallbackError(parsed.error);
+
+        // A page that runs its callback handler twice (React StrictMode
+        // effects) joins the exchange already running for the same code; a
+        // settled result is not kept, since it could outlive its session.
+        const { intentId, state, code } = parsed.params;
+        const callbackKey = JSON.stringify([intentId, state, code]);
+        const running = inFlightRedirectCallbacks.get(callbackKey);
+        if (running !== undefined) return await running;
+
+        const promise = completeRedirectLogin(parsed.params);
+        inFlightRedirectCallbacks.set(callbackKey, promise);
+        try {
+          return await promise;
+        } finally {
+          inFlightRedirectCallbacks.delete(callbackKey);
+        }
+      },
       getSession: sessionLifecycle.getSession,
       async getAccessToken(): Promise<string> {
         const session = await sessionLifecycle.getCurrentSession();
@@ -1640,12 +1863,16 @@ export function createSuperRareClient(
       },
       clearSession(): void {
         sessionCommitGeneration += 1;
-        inFlightPopupLogin = undefined;
+        logoutGeneration += 1;
+        inFlightLogin = undefined;
+        forgetPendingRedirectLogin();
         sessionLifecycle.clear();
       },
       async logout(): Promise<void> {
         sessionCommitGeneration += 1;
-        inFlightPopupLogin = undefined;
+        logoutGeneration += 1;
+        inFlightLogin = undefined;
+        forgetPendingRedirectLogin();
         await sessionLifecycle.logout();
       },
       onChange(callback): () => void {
@@ -1755,6 +1982,27 @@ export function createSuperRareClient(
           ...apiOptions,
           intentId: params.intentId,
         });
+      },
+      async getRedirectResult(): Promise<ConnectIntent | undefined> {
+        const storedPending = readRedirectRecord(pendingRedirectIntentKey);
+        const pending = storedPending === undefined
+          ? undefined
+          : parseStoredPendingConnectRedirectIntent(storedPending);
+        if (pending === undefined) return undefined;
+
+        let intent: ConnectIntent;
+        try {
+          intent = await getConnectIntent({ ...apiOptions, intentId: pending.intentId });
+        } catch (error) {
+          if (error instanceof SuperRareConnectApiError && (error.status === 404 || error.status === 410)) {
+            removeRedirectRecord(pendingRedirectIntentKey, storedPending);
+          }
+          throw error;
+        }
+        if (resolveConnectIntentOutcome(intent).kind !== 'pending') {
+          removeRedirectRecord(pendingRedirectIntentKey, storedPending);
+        }
+        return intent;
       },
     },
     games,
@@ -2007,6 +2255,17 @@ function isConnectSessionStorage(value: unknown): value is ConnectSessionStorage
   );
 }
 
+async function createConnectPkcePair(): Promise<{ codeVerifier: string; codeChallenge: string }> {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) {
+    throw new Error('Secure browser crypto is required to create a Connect login.');
+  }
+
+  const codeVerifier = encodeBase64Url(globalThis.crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+  return { codeVerifier, codeChallenge: encodeBase64Url(new Uint8Array(digest)) };
+}
+
 function createConnectState(): string {
   const crypto = globalThis.crypto;
   if (crypto === undefined) {
@@ -2029,6 +2288,35 @@ function createConnectPopupName(): string {
   }
 
   return `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+}
+
+function readBrowserNavigation(): ConnectNavigation | undefined {
+  const location = Reflect.get(globalThis, 'location');
+  if (typeof location !== 'object' || location === null) return undefined;
+  const assign: unknown = Reflect.get(location, 'assign');
+  return typeof assign === 'function'
+    ? { assign: (url) => { assign.call(location, url); } }
+    : undefined;
+}
+
+function readBrowserSessionStorage(): ConnectSessionStorage | undefined {
+  try {
+    const storage = Reflect.get(globalThis, 'sessionStorage');
+    return isConnectSessionStorage(storage) ? storage : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readBrowserSearchParams(): URLSearchParams {
+  const location = Reflect.get(globalThis, 'location');
+  const search: unknown = typeof location === 'object' && location !== null
+    ? Reflect.get(location, 'search')
+    : undefined;
+  if (typeof search !== 'string') {
+    throw new Error('handleRedirectCallback needs window.location; pass the callback URLSearchParams explicitly.');
+  }
+  return new URLSearchParams(search);
 }
 
 function readBrowserOrigin(): string | undefined {

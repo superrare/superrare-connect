@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { encodeBase64Url } from '../src/auth-flow-core.js';
 import {
   ConnectActionValidationError,
   ConnectPopupBlockedError,
@@ -20,6 +22,15 @@ import type { ConnectIntent } from '../src/status-core.js';
 import type { ConnectPopupWindow } from '../src/popup-core.js';
 import type { ConnectSessionStorage } from '../src/session-storage-core.js';
 import type { ConnectAuthCredentials } from '../src/api.js';
+
+const realSetTimeout = globalThis.setTimeout;
+
+const loginIntentBodySchema = z.object({ pkce: z.object({ codeChallenge: z.string() }) });
+const codeVerifierBodySchema = z.object({ codeVerifier: z.string() });
+
+const s256 = async (codeVerifier: string): Promise<string> => encodeBase64Url(
+  new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier))),
+);
 
 const directListingTarget: ConnectErc721DirectListingTarget = {
   kind: 'erc721-direct-listing',
@@ -1896,23 +1907,34 @@ describe('auth.login claims a result the posted callback never delivered', () =>
     vi.useFakeTimers();
     try {
       const requestedPaths: string[] = [];
+      const codeChallenges: string[] = [];
+      const codeVerifiers: string[] = [];
       const { client, opened } = createLoginTestClient({
         fetch: async (input, init) => {
           const request = input instanceof Request ? input : new Request(input, init);
           requestedPaths.push(new URL(request.url).pathname);
+          if (request.url.endsWith('/v1/connect/intents')) {
+            codeChallenges.push(loginIntentBodySchema.parse(await request.clone().json()).pkce.codeChallenge);
+          }
           if (request.url.endsWith('/v1/connect/auth/claim')) {
-            expect(await request.json()).toEqual({
+            const body: unknown = await request.json();
+            expect(body).toEqual({
               intentId: 'connect_intent_login',
               state: 'state_login',
+              codeVerifier: expect.any(String),
             });
+            codeVerifiers.push(codeVerifierBodySchema.parse(body).codeVerifier);
             return claimIssuedResponse();
           }
           if (request.url.endsWith('/v1/connect/auth/exchange')) {
-            expect(await request.json()).toEqual({
+            const body: unknown = await request.json();
+            expect(body).toEqual({
               intentId: 'connect_intent_login',
               state: 'state_login',
               code: 'connect_auth_code_claimed',
+              codeVerifier: expect.any(String),
             });
+            codeVerifiers.push(codeVerifierBodySchema.parse(body).codeVerifier);
             return sessionResponse();
           }
           if (request.url.endsWith('/v1/connect/users/me')) {
@@ -1935,6 +1957,10 @@ describe('auth.login claims a result the posted callback never delivered', () =>
       const result = await resultPromise;
       expect(result.status).toBe('authenticated');
       expect(client.auth.getSession()?.sessionId).toBe('connect_session_login');
+      const [claimVerifier, exchangeVerifier] = codeVerifiers;
+      if (claimVerifier === undefined) throw new Error('expected a claim');
+      expect(exchangeVerifier).toBe(claimVerifier);
+      expect(codeChallenges).toEqual([await s256(claimVerifier)]);
       expect(requestedPaths).toEqual([
         '/v1/connect/intents',
         '/v1/connect/auth/claim',
@@ -2212,6 +2238,8 @@ describe('auth.prepareLogin', () => {
 
 describe('auth.login', () => {
   it('exchanges the posted callback, stores the session, and resolves with the user', async () => {
+    const codeChallenges: string[] = [];
+    const codeVerifiers: string[] = [];
     const storage = createMemoryStorage();
     const popup = createPopupStub();
     const emitter = createMessageEmitter();
@@ -2224,13 +2252,19 @@ describe('auth.login', () => {
       fetch: async (input, init) => {
         const request = input instanceof Request ? input : new Request(input, init);
         requestedPaths.push(new URL(request.url).pathname);
+        if (request.url.endsWith('/v1/connect/intents')) {
+          codeChallenges.push(loginIntentBodySchema.parse(await request.clone().json()).pkce.codeChallenge);
+        }
 
         if (request.url.endsWith('/v1/connect/auth/exchange')) {
-          expect(await request.json()).toEqual({
+          const body: unknown = await request.json();
+          expect(body).toEqual({
             intentId: 'connect_intent_login',
             state: 'state_login',
             code: 'connect_auth_code_login',
+            codeVerifier: expect.any(String),
           });
+          codeVerifiers.push(codeVerifierBodySchema.parse(body).codeVerifier);
           return sessionResponse();
         }
 
@@ -2299,6 +2333,9 @@ describe('auth.login', () => {
       '/v1/connect/auth/exchange',
       '/v1/connect/users/me',
     ]);
+    const [codeVerifier] = codeVerifiers;
+    if (codeVerifier === undefined) throw new Error('expected an exchange');
+    expect(codeChallenges).toEqual([await s256(codeVerifier)]);
   });
 
   it('still resolves authenticated when the profile lookup fails', async () => {
@@ -2733,10 +2770,11 @@ describe('auth.login', () => {
       // advancing timers, and an unobserved rejection is reported as an
       // unhandled error. Real callers await the call immediately.
       const outcome = resultPromise.catch((error: unknown) => error);
-      // Advance rather than vi.waitFor: with fake timers, waitFor polls on a
-      // faked timer nobody is advancing and deadlocks.
-      await vi.advanceTimersByTimeAsync(0);
-      expect(popup.replacedUrls).toHaveLength(1);
+      // Not vi.waitFor: its polling advances the faked clock this test drives
+      // by hand. The PKCE digest settles on a real turn of the event loop.
+      while (popup.replacedUrls.length === 0) {
+        await new Promise((resolve) => { realSetTimeout(resolve, 1); });
+      }
 
       emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
       await vi.advanceTimersByTimeAsync(0);
@@ -2950,7 +2988,9 @@ describe('auth.login', () => {
         settledStatus = result.status;
       });
 
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(popup.replacedUrls).toHaveLength(1);
+      });
       emitter.emit({ origin: 'https://connect.superrare.test', data: authCallbackMessage });
       // Let the exchange resolve and commit; the profile lookup then hangs.
       await vi.waitFor(() => {

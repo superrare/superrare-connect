@@ -219,7 +219,7 @@ ESM CDN-style usage:
 
 ## Embedded Hosted Login And Checkout
 
-Set `embed` on the client to run hosted Connect login, checkout, actions, and offers in a merchant-owned iframe. Popup mode remains the default. The SDK owns intent creation, callback verification, and status reconciliation; your adapter owns the iframe DOM and dismissal. The public adapter types are `ConnectEmbedOptions` and `ConnectEmbedWindow`.
+Set `display: 'embed'` and pass an `embed` adapter to run hosted Connect login, checkout, actions, and offers in a merchant-owned iframe. Popup mode remains the default. The SDK owns intent creation, callback verification, and status reconciliation; your adapter owns the iframe DOM and dismissal. The public adapter types are `ConnectEmbedOptions` and `ConnectEmbedWindow`.
 
 Create `#connect-embed`, `#connect-status`, and a `#sign-in` button before this script:
 
@@ -231,6 +231,7 @@ const status = document.querySelector('#connect-status');
 if (container === null || status === null) throw new Error('Missing Connect embed elements.');
 
 const superrare = createSuperRareClient({
+  display: 'embed',
   embed: {
     open(url) {
       const frame = document.createElement('iframe');
@@ -253,7 +254,7 @@ const superrare = createSuperRareClient({
       };
     },
     onUnavailable(error) {
-      status.textContent = `${error.code}: restart explicitly using a new popup flow.`;
+      status.textContent = `${error.code}: restart explicitly in a new popup or redirect flow.`;
     },
   },
 });
@@ -264,17 +265,19 @@ document.querySelector('#sign-in')?.addEventListener('click', async () => {
     status.textContent = result.status;
   } catch (error) {
     status.textContent = error instanceof ConnectEmbedUnavailableError
-      ? 'Embedded storage is unavailable. Offer a new popup login.'
+      ? 'Embedded storage is unavailable. Offer a new popup or redirect login.'
       : 'Login failed.';
   }
 });
 ```
 
+- `display` accepts `'popup'` (default), `'redirect'`, or `'embed'`, and an explicit `display` always wins over the `embed` adapter. `display: 'embed'` without an adapter throws when the client is created.
+- **Deprecated:** passing `embed` without `display` still selects embedded display, so existing clients keep working. That implicit switch will be removed in a future major version; always set `display: 'embed'` with the adapter.
 - The adapter opens a blank frame synchronously. The SDK subscribes before assigning the hosted URL with `display=embed`; `messageSource` must be that exact iframe's `contentWindow`. Browser message events are used by default; non-browser hosts can inject `embed.messageEvents`.
 - Call `auth.login()`, `checkout.start()`, `actions.transfer()` and other hosted methods normally. `transfer.beforeOpen(intent)` still finishes before the iframe navigates, allowing your backend to record the intent before checkout is shown.
 - Auth callbacks require the hosted origin, frame source, intent ID, and original state. Terminal outcomes are reconciled through authoritative API reads, not frontend payment crediting. `onIntentSettled` retains its existing status contract, including possibly non-terminal state after dismissal; check status and reconcile purchases on your backend.
 - Successful login and authoritative terminal outcomes leave dismissal to the merchant. Remove the iframe to dismiss it; login checks the API for a missed completion before returning `cancelled`. Intent creation, `beforeOpen`, navigation, subscription, or login exchange failures clean up the adapter and reject the operation; the original failure is preserved.
-- `superrare-connect:embed-unavailable` invokes `embed.onUnavailable` with `ConnectEmbedUnavailableError` (`code: 'embed_unavailable'`, `intentId`). An embedded login also rejects with that error; an already-created action stops its watcher without reporting a fabricated completion. The SDK never silently opens a popup. A user-initiated restart must use a separate popup-mode client and a fresh intent, never the consumed iframe URL.
+- `superrare-connect:embed-unavailable` invokes `embed.onUnavailable` with `ConnectEmbedUnavailableError` (`code: 'embed_unavailable'`, `intentId`). An embedded login also rejects with that error; an already-created action stops its watcher without reporting a fabricated completion. The SDK never silently switches display. A user-initiated restart must use a separate client and a fresh intent, never the consumed iframe URL: `display: 'popup'`, or `display: 'redirect'` where popups are blocked too (for example wallet in-app browsers).
 - **Studio `game.connect()` is API-only**, including on an embedded client. Use the existing embedded `auth.login()` separately if signed out; connecting never creates a hosted game-authorization URL or starts a paid play.
 - Use an HTTPS merchant origin; HTTP loopback origins are supported for local development. The SDK creates intents directly against `apiUrl` from the merchant browser so the browser's `Origin` matches `initiatingOrigin`; configure CORS and the matching `connectUrl` rather than proxying an untrusted body origin.
 - Embedded sessions use the hosted app's partitioned cookies and can be unavailable in some browsers. Reown, OAuth, external wallets, and provider confirmations retain their own UI. Do not impose an opaque iframe sandbox; preserve the script, same-origin, form, popup, and payment permissions required by the hosted providers. Arbitrary merchant embedding accepts framing/clickjacking risk; origin-bound messages do not make the surrounding merchant UI trustworthy.
@@ -599,7 +602,7 @@ const outcome = resolveConnectIntentOutcome(intent);
 
 Auth is available for integrations that need a Connect session or `user.me()`. It is not required for checkout, buy, bid, mint, transfer, or intent status.
 
-`auth.login()` runs the login in a small centered window: the user authenticates on SuperRare Connect, the window closes itself, and the promise resolves with the session — including the authenticated wallet address — plus the signed-in user's profile. Your page never navigates away.
+By default, `auth.login()` runs the login in a small centered window: the user authenticates on SuperRare Connect, the window closes itself, and the promise resolves with the session — including the authenticated wallet address — plus the signed-in user's profile. Your page never navigates away. For a same-page login, see [Redirect login](#redirect-login).
 
 ```ts
 const result = await superrare.auth.login();
@@ -653,7 +656,7 @@ createSuperRareClient({
 
 Both default to the browser's own `window.open` and `window.addEventListener('message', ...)`.
 
-Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session.
+Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side with the login's PKCE verifier, which it holds in memory — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session.
 
 ## Session And User
 
@@ -741,12 +744,11 @@ Use HTTPS outside local development.
 const superrare = createSuperRareClient({
   apiUrl: 'https://api.superrare.com',
   connectUrl: 'https://connect.superrare.com',
-  navigation: false,
   sessionStorage: false,
 });
 ```
 
-Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations.
+Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in staging or local environments. It must be `https:`, or `http:` only for a loopback host (`localhost`, `127.0.0.1`, `[::1]`) — a plaintext hosted page on any other host is rejected, since its origin would become the one the SDK trusts for the auth callback. Use `sessionStorage: false` for tests or controlled apps that do not want SDK-managed browser storage. Custom `popup`, `sessionStorage`, `fetch`, and `createState` implementations are supported for tests and custom integrations. Every login, popup or redirect, also needs Web Crypto (`crypto.subtle`, a secure context) for its PKCE verifier, even with a custom `createState`.
 
 ## Testing on Sepolia
 
@@ -773,7 +775,7 @@ The dev environment resolves and executes both mainnet (`1`) and Sepolia (`11155
 
 ## Hosted Windows
 
-Every hosted flow — checkout, buy, sell, bid, mint, settle, transfer, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
+By default, every hosted flow — checkout, buy, sell, bid, mint, settle, transfer, offers, and login — opens in a small centered window, the way wallet and social sign-in flows behave, so your page keeps its state while the buyer pays. `popup` shapes that window and `onIntentSettled` reports how the flow ended:
 
 ```ts
 const superrare = createSuperRareClient({
@@ -790,6 +792,61 @@ const superrare = createSuperRareClient({
 ```
 
 Call `actions.buy()` (or any other action) directly from the click handler: the window opens synchronously inside the user gesture, so browsers allow it. When the window cannot be opened, the call rejects with `ConnectPopupBlockedError` before any intent is created — there is no same-page fallback.
+
+## Full-Page Redirect
+
+Set `display: 'redirect'` to navigate the page to SuperRare Connect instead of opening a window or an iframe. Connect sends the user back to `returnPath` on your origin once the action completes. When it is cancelled, fails, expires, or is still processing, the user comes back with the browser Back button instead, so also read the result on the page that started the redirect, including on `pageshow` (a back/forward-cache restore does not run your mount code again). Popup stays the default, and nothing changes for clients that do not set `display`.
+
+```ts
+const superrare = createSuperRareClient({ display: 'redirect' });
+
+await superrare.actions.buy({
+  target: { kind: 'erc721-direct-listing', chainId: 1, contract: '0x…', tokenId: '1' },
+  expected: { currency: 'ETH', price: '1000000000000000' },
+  returnPath: '/buy/complete',
+});
+```
+
+The SDK remembers the intent it redirected to in the tab's `sessionStorage`, so two tabs redirecting at once do not overwrite each other. That holds even when you pass a custom `sessionStorage`: it only backs redirect records on hosts with no `sessionStorage` of their own. On the return page, read it back:
+
+```ts
+const intent = await superrare.intents.getRedirectResult();
+if (intent !== undefined) {
+  const outcome = resolveConnectIntentOutcome(intent);
+}
+```
+
+- `getRedirectResult()` reads the intent fresh from Rare API and returns `undefined` when this tab started no redirect. It forgets the intent once it is final, so a later call returns `undefined`. It also forgets it when Rare API answers `404`.
+- It keeps an intent that is not final yet (`pending`, `requires_user`, or `processing`, so check `intent.status`), and a transient Rare API error rejects and keeps it too, so the page can check again until the intent's `expiresAt`.
+- After `expiresAt`, Rare API answers `410` for every intent but a transfer, completed or still settling, so `getRedirectResult()` rejects with `SuperRareConnectApiError` (`status` 410) and forgets the intent. A `410` means the outcome can no longer be read, not that the action failed: confirm a card purchase on your server.
+- With `sessionStorage: false` nothing is remembered: keep the `intentId` that the action returns, or record it in `beforeOpen`.
+- `actions.transfer`'s `beforeOpen` runs before the page navigates. If it throws, the page stays put and the call rejects with that error.
+
+### Redirect login
+
+`auth.login()` resolves `{ status: 'redirected' }` and navigates to the hosted login; a second call while it starts joins it. Connect returns to `returnPath` with `intentId`, `state`, and a one-time `code` in the query. Exchange them on that page:
+
+```ts
+const result = await superrare.auth.handleRedirectCallback();
+// Drop the one-time callback parameters and keep the rest of your URL.
+const url = new URL(location.href);
+for (const key of ['intentId', 'state', 'code']) url.searchParams.delete(key);
+history.replaceState(null, '', url);
+if (result.status === 'authenticated') {
+  result.session.address; // the authenticated wallet
+}
+```
+
+- `handleRedirectCallback()` reads `window.location.search` by default, or the `URLSearchParams` you pass.
+- The login is bound to a PKCE verifier (S256) that the SDK keeps in the tab's `sessionStorage` and never puts in a URL, so, against a Rare API that enforces PKCE, the callback values cannot be exchanged or reclaimed without it. Login therefore needs a secure context (HTTPS or `localhost`) with Web Crypto, and throws before creating an intent without one.
+- It checks `intentId` and `state` against the login this tab started, so it needs SDK storage. Without storage, `auth.login()` throws before creating an intent. The user has to come back in the tab that started the login.
+- It resolves `cancelled` when, while the code is being exchanged, a logout on this client lands, a newer login on this client navigates away, or another tab or client stores a session. A newer login that fails before navigating leaves the callback alone; one that navigates after the session is stored leaves it in place.
+- `auth.logout()` or `auth.clearSession()` before the callback is handled invalidates the pending login, even with no session: the callback then throws `ConnectAuthPendingError` (`missing_pending_auth`). The pending action redirect survives both, since an action does not need a session.
+- Calls with the same `intentId`, `state`, and `code` on one client while the first is running (for example from a React StrictMode effect) share its result. Nothing is kept once it settles. After a success, or once Rare API refuses the code for good (`400`, `401`, `404`, `410`), a new call throws `missing_pending_auth`. After a network or server error the same URL can retry.
+- Malformed callback parameters throw `ConnectAuthCallbackError`. A callback that does not match the pending login throws `ConnectAuthPendingError`.
+- `auth.prepareLogin()` still works: the redirect uses the prepared intent.
+
+The `popup` and `onIntentSettled` options do not apply in redirect mode. `game.connect()` is API-only in every display, so it never navigates the page. On hosts without `window.location`, pass `navigation: { assign }`; without either, redirect calls throw before creating an intent.
 
 ## Return Path Safety
 
@@ -817,6 +874,7 @@ The SDK throws typed errors for branchable public failures:
 - `ConnectReturnPathError` for invalid `returnPath`.
 - `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_address`, `invalid_min_received`, or `invalid_max_slippage_bps`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
+- `ConnectAuthCallbackError` when a redirect login callback has missing, duplicate, or malformed `intentId`, `state`, or `code`.
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.
 - `ConnectSessionRequiredError` when a local session is required but missing.
 - `SuperRareConnectApiError` for Rare API non-2xx responses, with `status` and `path`.
