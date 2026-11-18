@@ -39,6 +39,7 @@ export type ConnectActionTargetKind =
   | 'erc721-release'
   | 'erc1155-release'
   | 'erc1155-checkout'
+  | 'cart'
   | 'erc721-offer'
   | 'erc721-batch-offer'
   | 'liquid-edition'

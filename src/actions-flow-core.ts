@@ -160,7 +160,11 @@ export type ConnectActionValidationErrorCode =
   | 'invalid_amount'
   | 'invalid_address'
   | 'invalid_min_received'
-  | 'invalid_max_slippage_bps';
+  | 'invalid_max_slippage_bps'
+  | 'invalid_chain_id'
+  | 'invalid_cart_items'
+  | 'invalid_listing_digest'
+  | 'invalid_quantity';
 
 export type BuildConnectActionIntentRequestResult =
   | { ok: true; request: CreateConnectIntentRequest }
