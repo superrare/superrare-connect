@@ -362,6 +362,28 @@ const checkout = await superrare.checkout.getStatus({
 });
 ```
 
+## Cart Checkout
+
+`checkout.start` also takes a `cart` target: the Listings to buy, each named by its `listingDigest` (`0x` plus 64 hex characters) and a `quantity` (a positive integer string). Rare API answers with the hosted cart page for the intent, and the SDK opens that URL in the configured display (`popup`, `redirect`, or `embed`) like any other intent.
+
+```ts
+const intent = await superrare.checkout.start({
+  target: {
+    kind: 'cart',
+    chainId: 8453,
+    items: [
+      {
+        listingDigest: '0xcf6398559ea0e93d7d7233ca93b09912da8ff57b45ebe7a3ede9c74d17a76f13',
+        quantity: '1',
+      },
+    ],
+  },
+  returnPath: '/cart/complete',
+});
+```
+
+The SDK rejects a cart before any window opens with `ConnectActionValidationError`: `invalid_chain_id` for a `chainId` that is not a positive integer, `invalid_cart_items` for an empty `items` list, `invalid_listing_digest`, and `invalid_quantity` for a quantity with decimals, zero, or leading zeros. Rare API accepts up to five distinct Listings per cart; the hosted cart page currently completes a single item with quantity `'1'`.
+
 ## Anonymous ERC-721 Bid And Mint
 
 ```ts
@@ -878,7 +900,7 @@ const result = normalizeReturnPath('/account');
 The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
-- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_address`, `invalid_min_received`, or `invalid_max_slippage_bps`.
+- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_address`, `invalid_min_received`, `invalid_max_slippage_bps`, `invalid_chain_id`, `invalid_cart_items`, `invalid_listing_digest`, or `invalid_quantity`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
 - `ConnectAuthCallbackError` when a redirect login callback has missing, duplicate, or malformed `intentId`, `state`, or `code`.
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.

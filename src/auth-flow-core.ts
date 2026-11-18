@@ -199,6 +199,19 @@ export type ConnectErc1155CheckoutTarget = {
   items: Array<ConnectErc1155CheckoutReleaseItem | ConnectErc1155CheckoutListingItem>;
 };
 
+export type ConnectCartCheckoutItem = {
+  listingDigest: string;
+  quantity: string;
+};
+
+export type ConnectCartCheckoutTarget = {
+  kind: 'cart';
+  chainId: ConnectChainId;
+  items: ConnectCartCheckoutItem[];
+};
+
+export type ConnectCheckoutTarget = ConnectErc1155CheckoutTarget | ConnectCartCheckoutTarget;
+
 export type ConnectLiquidEditionTarget = {
   kind: 'liquid-edition';
   chainId: ConnectChainId;
@@ -329,7 +342,7 @@ export type ConnectActionInput =
   }
   | {
     type: 'checkout';
-    target: ConnectErc1155CheckoutTarget;
+    target: ConnectCheckoutTarget;
   }
   | {
     type: 'transfer';
