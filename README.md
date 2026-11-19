@@ -282,8 +282,9 @@ document.querySelector('#sign-in')?.addEventListener('click', async () => {
 - The adapter opens a blank frame synchronously. The SDK subscribes before assigning the hosted URL with `display=embed`; `messageSource` must be that exact iframe's `contentWindow`. Browser message events are used by default; non-browser hosts can inject `embed.messageEvents`.
 - Call `auth.login()`, `checkout.start()`, `actions.transfer()` and other hosted methods normally. `transfer.beforeOpen(intent)` still finishes before the iframe navigates, allowing your backend to record the intent before checkout is shown.
 - Auth callbacks require the hosted origin, frame source, intent ID, and original state. Terminal outcomes are reconciled through authoritative API reads, not frontend payment crediting. `onIntentSettled` retains its existing status contract, including possibly non-terminal state after dismissal; check status and reconcile purchases on your backend.
-- Successful login and authoritative terminal outcomes leave dismissal to the merchant. Remove the iframe to dismiss it; login checks the API for a missed completion before returning `cancelled`. Intent creation, `beforeOpen`, navigation, subscription, or login exchange failures clean up the adapter and reject the operation; the original failure is preserved.
+- Successful login and authoritative terminal outcomes leave dismissal to the merchant. Remove the iframe to dismiss it; legacy login checks the API for a missed completion before returning `cancelled`, while opt-in [browser delivery](#browser-verified-login-opt-in) never claims a result. Intent creation, `beforeOpen`, navigation, subscription, or login exchange failures clean up the adapter and reject the operation; the original failure is preserved.
 - `superrare-connect:embed-unavailable` invokes `embed.onUnavailable` with `ConnectEmbedUnavailableError` (`code: 'embed_unavailable'`, `intentId`). An embedded login also rejects with that error; an already-created action stops its watcher without reporting a fabricated completion. The SDK never silently switches display. A user-initiated restart must use a separate client and a fresh intent, never the consumed iframe URL: `display: 'popup'`, or `display: 'redirect'` where popups are blocked too (for example wallet in-app browsers).
+- Browser-delivered login can restart explicitly in a fresh popup with the same `authDelivery: 'browser'` option, but cannot restart as redirect or silently switch to legacy delivery.
 - **Studio `game.connect()` is API-only**, including on an embedded client. Use the existing embedded `auth.login()` separately if signed out; connecting never creates a hosted game-authorization URL or starts a paid play.
 - Use an HTTPS merchant origin; HTTP loopback origins are supported for local development. The SDK creates intents directly against `apiUrl` from the merchant browser so the browser's `Origin` matches `initiatingOrigin`; configure CORS and the matching `connectUrl` rather than proxying an untrusted body origin.
 - Embedded sessions use the hosted app's partitioned cookies and can be unavailable in some browsers. Reown, OAuth, external wallets, and provider confirmations retain their own UI. Do not impose an opaque iframe sandbox; preserve the script, same-origin, form, popup, and payment permissions required by the hosted providers. Arbitrary merchant embedding accepts framing/clickjacking risk; origin-bound messages do not make the surrounding merchant UI trustworthy.
@@ -627,9 +628,9 @@ Call it directly from a click handler so the browser allows the window. Possible
 
 When the window cannot be opened at all (a popup blocker, or a call outside a user gesture), `auth.login()` rejects with `ConnectPopupBlockedError` before any intent is created — there is no same-page fallback.
 
-Only one login runs at a time per client: the SDK holds a single session, so calling `login()` again while one is in flight joins the running login instead of opening a second window. If the backend stops responding after the callback arrives, the call rejects rather than hanging. `auth.loginWithPopup()` remains as a deprecated alias of `auth.login()`.
+Only one login runs at a time per client: the SDK holds a single session, so calling `login()` again while one is in flight joins the running login instead of opening a second window. A concurrent call with a different `authDelivery` rejects instead of joining. If the backend stops responding after the callback arrives, the call rejects rather than hanging. `auth.loginWithPopup()` remains as a deprecated alias of `auth.login()`.
 
-On iOS Safari the page is suspended the moment the hosted window takes focus, which has two consequences the SDK covers for you. First, the callback the hosted page posts when the login completes never arrives: the login therefore also claims its result from Rare API whenever the page becomes visible again or the hosted window is found closed, and a closed window is reported as `cancelled` only once Rare API confirms nothing completed. Second, `auth.login()` opens the window first and navigates it once the intent exists; if the page is suspended before that round trip finishes, the window stays blank. To rule that out, create the intent ahead of the tap with `auth.prepareLogin()` (on page load, or when the person is about to tap): the next `auth.login()` with the same params then opens the window already pointed at the hosted page, inside the gesture, with no round trip in between. A prepared login lasts as long as its intent (about fifteen minutes) and is dropped after a logout; `login` creates a fresh intent when none is usable.
+For legacy login (no `authDelivery` option), iOS Safari can suspend the page the moment the hosted window takes focus, which has two consequences the SDK covers for you. First, the callback the hosted page posts when the login completes may never arrive: legacy login therefore also claims its result from Rare API whenever the page becomes visible again or the hosted window is found closed, and a closed window is reported as `cancelled` only once Rare API confirms nothing completed. Second, `auth.login()` opens the window first and navigates it once the intent exists; if the page is suspended before that round trip finishes, the window stays blank. To rule that out for legacy login, create the intent ahead of the tap with `auth.prepareLogin()` (on page load, or when the person is about to tap): the next `auth.login()` with the same params then opens the window already pointed at the hosted page, inside the gesture, with no round trip in between. A prepared login lasts as long as its intent (about fifteen minutes) and is dropped after a logout; `login` creates a fresh intent when none is usable.
 
 ```ts
 await superrare.auth.prepareLogin();
@@ -663,6 +664,61 @@ createSuperRareClient({
 Both default to the browser's own `window.open` and `window.addEventListener('message', ...)`.
 
 Under the hood the hosted page reports the auth callback to the opener with a `postMessage`; the SDK only accepts messages from the Connect origin, verifies `state` and `intentId` against the login it started (so it works with `sessionStorage: false` too), and then exchanges the one-time code server-side with the login's PKCE verifier, which it holds in memory — the wallet address comes from the exchanged session, never from the message. A login that completes after `auth.logout()` ran on the same client resolves `cancelled` instead of resurrecting the session.
+
+### Browser-Verified Login (Opt-In)
+
+Pass `authDelivery: 'browser'` to `auth.login()` and, when used, `auth.prepareLogin()`. This remains permissionless: there is no domain registration, allowlist, client secret, or required migration. Omitting the option retains existing popup/embed/redirect delivery, claim recovery, and the hosted unverified-origin notice.
+
+In browser mode the hosted login waits for a live handshake with its actual parent iframe or popup opener before showing login UI. The SDK answers only challenges from the exact hosted window, Connect origin, and pending intent. It accepts a callback only after answering that watcher's challenge, then still verifies intent/state and exchanges the one-time code with the original S256 PKCE verifier. A confirmed origin identifies the live requester, not an approved or trustworthy merchant.
+
+**Popup example** (create a `#sign-in` button and `#connect-status` element):
+
+```ts
+import { createSuperRareClient } from '@rareprotocol/connect';
+
+const browserLogin = createSuperRareClient({ display: 'popup' });
+const signIn = document.querySelector('#sign-in');
+const loginStatus = document.querySelector('#connect-status');
+if (signIn === null || loginStatus === null) throw new Error('Missing login elements.');
+
+// Optional: removes intent creation from the click path, but not the handshake.
+await browserLogin.auth.prepareLogin({ authDelivery: 'browser' });
+signIn.addEventListener('click', async () => {
+  try {
+    const result = await browserLogin.auth.login({ authDelivery: 'browser' });
+    loginStatus.textContent = result.status;
+  } catch (error) {
+    loginStatus.textContent = error instanceof Error ? error.message : 'Restart login from this site.';
+  }
+});
+```
+
+**Embedded example:** use the `superrare` client and real `iframe.contentWindow` adapter from [Embedded Hosted Login And Checkout](#embedded-hosted-login-and-checkout), replacing its sign-in handler with:
+
+```ts
+document.querySelector('#sign-in')?.addEventListener('click', async () => {
+  try {
+    const result = await superrare.auth.login({ authDelivery: 'browser' });
+    status.textContent = result.status;
+  } catch (error) {
+    status.textContent = error instanceof ConnectEmbedUnavailableError
+      ? 'Embedded login is unavailable. Restart explicitly in a fresh browser-delivered popup.'
+      : 'Login could not verify this browser. Restart from this site.';
+  }
+});
+```
+
+Rollout and browser limitations:
+
+- Deploy browser-delivery support in **both Rare API and hosted Connect before opting clients in**. Creation must echo `data.authDelivery: 'browser'`; an older API that strips the option is rejected before hosted navigation. An incompatible hosted app cannot complete the handshake; it must not be treated as legacy success.
+- The SDK derives `initiatingOrigin` from actual `window.location.origin`. An explicitly supplied parameter or client option must match exactly. HTTPS or HTTP loopback and Web Crypto are required; setting an origin option on a non-browser host cannot manufacture verification.
+- Only `display: 'popup'` and `display: 'embed'` support this option. Redirect login/prepare calls reject with guidance before intent creation. Browser mode never redirects as a fallback.
+- Custom popup adapters must return the actual `window.open` result with callable `postMessage`; embed `messageSource` must be the actual iframe's `contentWindow` with callable `postMessage`. Message-event adapters must preserve `event.source`, not just origin/data. Legacy adapters do not gain a mandatory method, but unsupported browser-mode adapters fail before navigating.
+- The SDK replies to `superrare-connect:request-origin-challenge` with `superrare-connect:request-origin-response`, echoing the exact intent ID and nonempty nonce (at most 128 characters) to the Connect origin, never `'*'`. Confirmation is scoped to one active login watcher and is not reusable for another login.
+- There are **no claim requests** on visibility changes, popup closure, embedded completed status, or any other browser-mode path. A lost callback cannot be recovered by claiming, even after hosted login succeeded. Closing before callback delivery returns `cancelled`; a missing handshake/callback expires under the existing timeout semantics. Embedded status still reconciles cancellation/expiry/failure against the API, but a completed status alone cannot authenticate.
+- Safari suspension, lost opener references, browser policies, provider UI, partitioned-cookie restrictions, and unavailable messaging can prevent completion. `prepareLogin` can save a creation round trip, but even prepared browser popups open blank and install their watcher before hosted navigation; it does not restore legacy Safari claim recovery or guarantee background-page execution. Keep the initiating page alive and restart explicitly with a fresh browser-mode intent after failure. Never retry by silently removing `authDelivery`.
+- Prepared intents are reusable only with matching return path, actual origin, delivery mode, and session generation. `PendingConnectAuth`, `ConnectIntentCreation`, and `ConnectIntent` retain the optional mode; callback pending verification reports `auth_delivery_mismatch` for cross-mode records, including a browser record presented to a legacy redirect callback handler.
+
 
 ## Session And User
 

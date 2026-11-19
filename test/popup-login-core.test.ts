@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   CONNECT_AUTH_CALLBACK_MESSAGE_TYPE,
   parseConnectAuthCallbackMessage,
+  hasConnectPostMessage,
+  parseConnectRequestOriginChallenge,
   resolveConnectHostedUrl,
 } from '../src/popup-login-core.js';
 
@@ -59,6 +61,53 @@ describe('parseConnectAuthCallbackMessage', () => {
         origin: expectedOrigin,
         expectedOrigin,
       })).toEqual({ ok: false, error: 'malformed_message' });
+    }
+  });
+});
+
+describe('browser requester origin challenge', () => {
+  const source = { postMessage(_message: unknown, _targetOrigin: string): void {} };
+  const challenge = {
+    type: 'superrare-connect:request-origin-challenge',
+    intentId: 'connect_intent_login',
+    nonce: 'fresh-browser-nonce',
+  };
+  const event = {
+    data: challenge, origin: expectedOrigin, source, expectedOrigin,
+    expectedSource: source, intentId: challenge.intentId,
+  };
+
+  it('accepts only a challenge bound to the exact hosted window, origin and intent', () => {
+    expect(parseConnectRequestOriginChallenge(event)).toEqual({
+      intentId: challenge.intentId, nonce: challenge.nonce,
+    });
+    for (const mismatch of [
+      { source: { postMessage: source.postMessage } },
+      { source: undefined },
+      { expectedSource: undefined, source: undefined },
+      { expectedSource: null, source: null },
+      { origin: 'https://evil.test' },
+      { data: { ...challenge, intentId: 'another-intent' } },
+      { data: { ...challenge, type: 'superrare-connect:auth-callback' } },
+    ]) {
+      expect(parseConnectRequestOriginChallenge({ ...event, ...mismatch })).toBeUndefined();
+    }
+  });
+
+  it.each([undefined, null, 42, {}, '', 'x'.repeat(129)])('rejects malformed or unbounded nonce %#', (nonce) => {
+    expect(parseConnectRequestOriginChallenge({ ...event, data: { ...challenge, nonce } })).toBeUndefined();
+  });
+
+  it('accepts the hosted maximum nonce length', () => {
+    const nonce = 'x'.repeat(128);
+    expect(parseConnectRequestOriginChallenge({ ...event, data: { ...challenge, nonce } }))
+      .toEqual({ intentId: challenge.intentId, nonce });
+  });
+
+  it('narrows a callable window postMessage without requiring it on legacy adapters', () => {
+    expect(hasConnectPostMessage(source)).toBe(true);
+    for (const value of [undefined, null, {}, { postMessage: 'not callable' }, 42]) {
+      expect(hasConnectPostMessage(value)).toBe(false);
     }
   });
 });

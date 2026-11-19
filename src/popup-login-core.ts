@@ -20,6 +20,45 @@ const connectAuthCallbackMessageSchema = z.object({
   code: z.string().min(1),
 });
 
+const connectRequestOriginChallengeSchema = z.object({
+  type: z.literal('superrare-connect:request-origin-challenge'),
+  intentId: z.string().min(1),
+  nonce: z.string().min(1).max(128),
+});
+
+/** Parses only challenges from the captured hosted window for this login. */
+export function parseConnectRequestOriginChallenge(input: {
+  data: unknown;
+  origin: string;
+  source: unknown;
+  expectedOrigin: string;
+  expectedSource: unknown;
+  intentId: string;
+}): { intentId: string; nonce: string } | undefined {
+  if (
+    input.origin !== input.expectedOrigin ||
+    input.expectedSource === undefined ||
+    input.expectedSource === null ||
+    input.source !== input.expectedSource
+  ) return undefined;
+
+  const parsed = connectRequestOriginChallengeSchema.safeParse(input.data);
+  if (!parsed.success || parsed.data.intentId !== input.intentId) return undefined;
+  return { intentId: parsed.data.intentId, nonce: parsed.data.nonce };
+}
+
+/** Legacy window adapters need not implement postMessage; browser delivery does. */
+export function hasConnectPostMessage(value: unknown): value is {
+  postMessage: (message: unknown, targetOrigin: string) => void;
+} {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'postMessage' in value &&
+    typeof value.postMessage === 'function'
+  );
+}
+
 export type ConnectAuthCallbackMessageParseResult =
   | { ok: true; params: ConnectAuthCallbackParams }
   | { ok: false; error: 'origin_mismatch' | 'not_auth_callback' | 'malformed_message' };

@@ -34,6 +34,7 @@ export type ConnectIntentCreation = {
   intentId: string;
   url: string;
   expiresAt: string;
+  authDelivery?: 'browser';
 };
 
 export type ConnectSessionState = {
@@ -87,6 +88,7 @@ const createConnectIntentResponseSchema = z.object({
     intentId: z.string().min(1),
     url: z.string().min(1),
     expiresAt: z.string().min(1),
+    authDelivery: z.literal('browser').optional(),
   }),
 });
 
@@ -111,6 +113,7 @@ const connectIntentSchema = z.object({
   type: z.string().min(1),
   status: z.enum(['pending', 'requires_user', 'processing', 'completed', 'failed', 'cancelled', 'expired']),
   initiatingOrigin: z.string().optional(),
+  authDelivery: z.literal('browser').optional(),
   returnPath: z.string(),
   expiresAt: z.string().min(1),
   resolvedActionSnapshot: z.object({
@@ -215,6 +218,10 @@ export async function createConnectIntent(input: {
   const parsedResponse = createConnectIntentResponseSchema.safeParse(body);
   if (!parsedResponse.success) {
     throw new Error('Invalid Connect intent response.');
+  }
+
+  if (input.request.authDelivery === 'browser' && parsedResponse.data.data.authDelivery !== 'browser') {
+    throw new Error('Connect API does not support browser auth delivery. Upgrade Rare API before opting in.');
   }
 
   return parsedResponse.data.data;
