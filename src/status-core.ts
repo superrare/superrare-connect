@@ -76,6 +76,7 @@ export type ConnectIntent = {
   type: ConnectOpenStringUnion<ConnectActionType>;
   status: ConnectIntentStatus;
   initiatingOrigin?: string;
+  authDelivery?: 'browser';
   returnPath: string;
   expiresAt: string;
   resolvedActionSnapshot?: ConnectResolvedActionSnapshot;

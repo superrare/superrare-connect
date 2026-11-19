@@ -28,6 +28,7 @@ export type ConnectPkceChallenge = {
 
 export type CreateConnectLoginIntentRequest = {
   action: ConnectActionInput;
+  authDelivery?: 'browser';
   initiatingOrigin?: string;
   payment?: ConnectIntentPayment;
   pkce?: ConnectPkceChallenge;
@@ -342,6 +343,7 @@ export type BuildConnectLoginIntentRequestInput = {
   returnPath?: string;
   state: string;
   initiatingOrigin?: string;
+  authDelivery?: 'browser';
 };
 
 export type BuildConnectLoginIntentRequestResult =
@@ -353,6 +355,7 @@ export const pendingConnectAuthSchema = z.object({
   state: z.string().min(1),
   expiresAt: z.string().min(1),
   codeVerifier: z.string().min(43),
+  authDelivery: z.literal('browser').optional(),
 });
 
 /**
@@ -365,7 +368,8 @@ export type PendingConnectAuth = z.infer<typeof pendingConnectAuthSchema>;
 export type ConnectAuthPendingVerificationError =
   | 'missing_pending_auth'
   | 'intent_mismatch'
-  | 'state_mismatch';
+  | 'state_mismatch'
+  | 'auth_delivery_mismatch';
 
 /** What the auth exchange sends: the callback plus this login's own PKCE verifier. */
 export type ConnectAuthExchangeParams = ConnectAuthCallbackParams & { codeVerifier: string };
@@ -390,6 +394,7 @@ export function buildConnectLoginIntentRequest(
       returnPath: returnPathResult.returnPath,
       state: input.state,
       ...(input.initiatingOrigin === undefined ? {} : { initiatingOrigin: input.initiatingOrigin }),
+      ...(input.authDelivery === undefined ? {} : { authDelivery: input.authDelivery }),
     },
   };
 }
@@ -397,9 +402,14 @@ export function buildConnectLoginIntentRequest(
 export function verifyConnectAuthCallbackAgainstPending(input: {
   pendingAuth: PendingConnectAuth | undefined;
   callbackParams: ConnectAuthCallbackParams;
+  authDelivery?: 'browser';
 }): ConnectAuthPendingVerificationResult {
   if (input.pendingAuth === undefined) {
     return { ok: false, error: 'missing_pending_auth' };
+  }
+
+  if (input.pendingAuth.authDelivery !== input.authDelivery) {
+    return { ok: false, error: 'auth_delivery_mismatch' };
   }
 
   if (input.pendingAuth.intentId !== input.callbackParams.intentId) {
