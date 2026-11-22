@@ -27,11 +27,13 @@ export type BuildConnectCheckoutIntentRequestInput = CheckoutStartParams & {
 export type BuildConnectCheckoutIntentRequestResult =
   | { ok: true; request: CreateConnectIntentRequest }
   | Extract<ReturnPathNormalizationResult, { ok: false }>
-  | { ok: false; error: ConnectActionValidationErrorCode };
+  | { ok: false; error: ConnectActionValidationErrorCode; message?: string };
 
 type CheckoutTargetBuildResult =
   | { ok: true; target: ConnectCheckoutTarget }
-  | { ok: false; error: ConnectActionValidationErrorCode };
+  | { ok: false; error: ConnectActionValidationErrorCode; message?: string };
+
+const maximumCartCheckoutItems = 5;
 
 const listingDigestPattern = /^0x[0-9a-fA-F]{64}$/;
 const quantityPattern = /^[1-9]\d*$/;
@@ -77,11 +79,32 @@ function buildCartCheckoutTarget(target: ConnectCartCheckoutTarget): CheckoutTar
   }
 
   if (!Array.isArray(target.items) || target.items.length === 0) {
-    return { ok: false, error: 'invalid_cart_items' };
+    return {
+      ok: false,
+      error: 'invalid_cart_items',
+      message: 'A Cart checkout needs at least one item.',
+    };
+  }
+
+  if (target.items.length > maximumCartCheckoutItems) {
+    return {
+      ok: false,
+      error: 'invalid_cart_items',
+      message: `A Cart checkout accepts at most ${maximumCartCheckoutItems} items.`,
+    };
   }
 
   if (!target.items.every(hasValidListingDigest)) {
     return { ok: false, error: 'invalid_listing_digest' };
+  }
+
+  const distinctListingDigests = new Set(target.items.map((item) => item.listingDigest.toLowerCase()));
+  if (distinctListingDigests.size !== target.items.length) {
+    return {
+      ok: false,
+      error: 'invalid_cart_items',
+      message: 'A Cart checkout cannot repeat a listing digest.',
+    };
   }
 
   if (!target.items.every(hasValidQuantity)) {

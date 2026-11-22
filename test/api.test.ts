@@ -304,6 +304,61 @@ describe('Connect API client', () => {
     });
   });
 
+  it('keeps the Cart checkout, order id, payment id and payment on a completed Cart intent', async () => {
+    const cartIntent = {
+      intentId: 'connect_intent_cart',
+      type: 'checkout',
+      status: 'completed',
+      returnPath: '/cart/complete',
+      expiresAt: '2026-11-22T00:00:00.000Z',
+      result: {
+        transactionHash: '0xtransaction',
+        paymentId: 'coinflow_payment_123',
+        cartCompletion: { orderId: `0x${'0d'.repeat(32)}` },
+      },
+      payment: {
+        method: 'card',
+        recipient: '0x00000000000000000000000000000000000000a1',
+        email: 'collector@example.com',
+        recipientBoundByCheckout: true,
+      },
+      cartCheckout: {
+        kind: 'cart',
+        chainId: 8453,
+        items: [{ listingDigest: `0x${'cf'.repeat(32)}`, quantity: '1' }],
+        cartAddress: '0x00000000000000000000000000000000000000c4',
+      },
+    };
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: async () => jsonResponse({ data: cartIntent }),
+      intentId: 'connect_intent_cart',
+    })).resolves.toEqual(cartIntent);
+  });
+
+  it('reads a Cart intent without a cart address or payment details', async () => {
+    const cartIntent = {
+      intentId: 'connect_intent_cart',
+      type: 'checkout',
+      status: 'pending',
+      returnPath: '/cart/complete',
+      expiresAt: '2026-11-22T00:00:00.000Z',
+      payment: {},
+      cartCheckout: {
+        kind: 'cart',
+        chainId: 8453,
+        items: [{ listingDigest: `0x${'cf'.repeat(32)}`, quantity: '1' }],
+      },
+    };
+
+    await expect(getConnectIntent({
+      apiUrl: 'https://rare-api.test',
+      fetch: async () => jsonResponse({ data: cartIntent }),
+      intentId: 'connect_intent_cart',
+    })).resolves.toEqual(cartIntent);
+  });
+
   it('parses intent status carrying an offer snapshot with buyer and expiry terms', async () => {
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = input instanceof Request ? input : new Request(input, init);

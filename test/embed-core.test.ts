@@ -36,12 +36,14 @@ describe('parseConnectEmbedMessage', () => {
     }
   });
 
-  it('preserves optional transaction hash and error strings', () => {
+  it('preserves optional transaction hash, order id and error strings', () => {
     for (const fields of [
       { transactionHash: '0x1234' },
       { error: 'Transaction rejected' },
       { transactionHash: '0x1234', error: 'Reconciliation pending' },
       { transactionHash: '', error: '' },
+      { orderId: `0x${'ab'.repeat(32)}` },
+      { transactionHash: '0x1234', orderId: `0x${'ab'.repeat(32)}` },
     ]) {
       const message = { ...terminalMessage, ...fields };
       expect(parseMessage(message)).toEqual({ ok: true, message });

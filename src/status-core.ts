@@ -1,3 +1,5 @@
+import type { ConnectCartCheckoutTarget, ConnectIntentPayment } from './auth-flow-core.js';
+
 export type ConnectActionType =
   | 'login'
   | 'checkout'
@@ -24,6 +26,10 @@ export type ConnectIntentStatus =
 
 export type ConnectIntentResult = {
   approvalTxHash?: string;
+  cartCompletion?: {
+    orderId: string;
+  };
+  paymentId?: string;
   referenceId?: string;
   sessionId?: string;
   transactionHash?: string;
@@ -84,6 +90,15 @@ export type ConnectIntent = {
   error?: {
     code: string;
     message: string;
+  };
+  payment?: {
+    method?: ConnectOpenStringUnion<NonNullable<ConnectIntentPayment['method']>>;
+    recipient?: string;
+    email?: string;
+    recipientBoundByCheckout?: boolean;
+  };
+  cartCheckout?: ConnectCartCheckoutTarget & {
+    cartAddress?: string;
   };
 };
 

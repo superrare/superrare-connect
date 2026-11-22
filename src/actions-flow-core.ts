@@ -169,7 +169,7 @@ export type ConnectActionValidationErrorCode =
 export type BuildConnectActionIntentRequestResult =
   | { ok: true; request: CreateConnectIntentRequest }
   | Extract<ReturnPathNormalizationResult, { ok: false }>
-  | { ok: false; error: ConnectActionValidationErrorCode };
+  | { ok: false; error: ConnectActionValidationErrorCode; message?: string };
 
 type ConnectActionBuildResult<Action extends ConnectActionInput> =
   | { ok: true; action: Action }

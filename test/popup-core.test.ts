@@ -5,6 +5,7 @@ import {
   appendConnectPopupDisplay,
   getConnectPopupDeadline,
   getConnectPopupFeatures,
+  isConfirmedCartCheckout,
   isConnectIntentSettled,
   isRetryableConnectApiStatus,
 } from '../src/popup-core.js';
@@ -66,6 +67,38 @@ describe('isConnectIntentSettled', () => {
     expect(isConnectIntentSettled('pending')).toBe(false);
     expect(isConnectIntentSettled('requires_user')).toBe(false);
     expect(isConnectIntentSettled('processing')).toBe(false);
+  });
+});
+
+describe('isConfirmedCartCheckout', () => {
+  const cartCheckout = {
+    kind: 'cart' as const,
+    chainId: 8453,
+    items: [{ listingDigest: `0x${'cf'.repeat(32)}`, quantity: '1' }],
+  };
+  const snapshot = (targetKind: string) => ({
+    actionKey: 'checkout',
+    actionType: 'checkout',
+    resolvedAt: '2026-11-20T00:00:00.000Z',
+    targetKind,
+    terms: { available: true },
+  });
+
+  it('recognizes a completed Cart checkout by its cart data or its target kind', () => {
+    expect(isConfirmedCartCheckout({ status: 'completed', cartCheckout })).toBe(true);
+    expect(isConfirmedCartCheckout({ status: 'completed', resolvedActionSnapshot: snapshot('cart') })).toBe(true);
+  });
+
+  it('ignores unsettled or unsuccessful Cart checkouts and other completed intents', () => {
+    expect(isConfirmedCartCheckout({ status: 'processing', cartCheckout })).toBe(false);
+    expect(isConfirmedCartCheckout({ status: 'cancelled', cartCheckout })).toBe(false);
+    expect(isConfirmedCartCheckout({ status: 'failed', cartCheckout })).toBe(false);
+    expect(isConfirmedCartCheckout({ status: 'expired', cartCheckout })).toBe(false);
+    expect(isConfirmedCartCheckout({ status: 'completed' })).toBe(false);
+    expect(isConfirmedCartCheckout({
+      status: 'completed',
+      resolvedActionSnapshot: snapshot('erc1155-checkout'),
+    })).toBe(false);
   });
 });
 

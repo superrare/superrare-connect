@@ -92,7 +92,6 @@ describe('buildConnectCheckoutIntentRequest', () => {
   it.each([
     ['a fractional chainId', { ...cartTarget, chainId: 1.5 }, 'invalid_chain_id'],
     ['a zero chainId', { ...cartTarget, chainId: 0 }, 'invalid_chain_id'],
-    ['an empty items list', { ...cartTarget, items: [] }, 'invalid_cart_items'],
     ['a short listing digest', { ...cartTarget, items: [{ listingDigest: '0x1234', quantity: '1' }] }, 'invalid_listing_digest'],
     ['a listing digest without 0x', { ...cartTarget, items: [{ listingDigest: 'cf'.repeat(32), quantity: '1' }] }, 'invalid_listing_digest'],
     ['a non-hex listing digest', { ...cartTarget, items: [{ listingDigest: `0x${'zz'.repeat(32)}`, quantity: '1' }] }, 'invalid_listing_digest'],
@@ -105,5 +104,42 @@ describe('buildConnectCheckoutIntentRequest', () => {
       target,
       state: 'state_cart',
     })).toEqual({ ok: false, error });
+  });
+
+  it.each([
+    ['an empty items list', [], 'A Cart checkout needs at least one item.'],
+    [
+      'more than five items',
+      Array.from({ length: 6 }, (_unused, index) => ({
+        listingDigest: `0x${index.toString(16).padStart(64, '0')}`,
+        quantity: '1',
+      })),
+      'A Cart checkout accepts at most 5 items.',
+    ],
+    [
+      'a listing digest repeated in a different case',
+      [
+        { listingDigest: `0x${'ab'.repeat(32)}`, quantity: '1' },
+        { listingDigest: `0x${'AB'.repeat(32)}`, quantity: '2' },
+      ],
+      'A Cart checkout cannot repeat a listing digest.',
+    ],
+  ] satisfies Array<[string, ConnectCartCheckoutTarget['items'], string]>)('rejects a cart with %s', (_label, items, message) => {
+    expect(buildConnectCheckoutIntentRequest({
+      target: { ...cartTarget, items },
+      state: 'state_cart',
+    })).toEqual({ ok: false, error: 'invalid_cart_items', message });
+  });
+
+  it('accepts five distinct items', () => {
+    const items = Array.from({ length: 5 }, (_unused, index) => ({
+      listingDigest: `0x${index.toString(16).padStart(64, '0')}`,
+      quantity: '1',
+    }));
+
+    expect(buildConnectCheckoutIntentRequest({
+      target: { ...cartTarget, items },
+      state: 'state_cart',
+    })).toMatchObject({ ok: true, request: { action: { target: { items } } } });
   });
 });
