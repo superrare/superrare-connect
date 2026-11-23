@@ -25,9 +25,18 @@ function harness(input: {
   onNavigate?: () => void;
   onSubscribe?: () => void;
   intentType?: 'login' | 'transfer';
+  browserDelivery?: boolean;
+  unsupportedSource?: boolean;
+  onResponse?: () => void;
 } = {}) {
   const listeners = new Set<(event: ConnectPopupMessageEvent) => void>();
-  const source = {};
+  const responses: Array<{ message: unknown; targetOrigin: string }> = [];
+  const source = input.unsupportedSource ? {} : {
+    postMessage(message: unknown, targetOrigin: string): void {
+      input.onResponse?.();
+      responses.push({ message, targetOrigin });
+    },
+  };
   const urls: string[] = [];
   const requests: Request[] = [];
   const unavailable: ConnectEmbedUnavailableError[] = [];
@@ -71,7 +80,10 @@ function harness(input: {
       if (request.method === 'GET') {
         return Response.json({ data: { intentId, type: input.intentType ?? 'login', status, expiresAt, returnPath: '/' } });
       }
-      return Response.json({ data: { intentId, url: `${origin}/action/${intentId}`, expiresAt } });
+      return Response.json({ data: {
+        intentId, url: `${origin}/action/${intentId}`, expiresAt,
+        ...(input.browserDelivery ? { authDelivery: 'browser' } : {}),
+      } });
     },
   });
   const emit = (data: unknown, event: Partial<ConnectPopupMessageEvent> = {}): void => {
@@ -81,7 +93,7 @@ function harness(input: {
     type: 'superrare-connect:auth-callback', intentId, state, code: 'one-time-code', ...fields,
   });
   return {
-    client, frame, source, urls, requests, unavailable, settled, popupOpen,
+    client, frame, source, urls, requests, unavailable, settled, popupOpen, responses,
     emit, callback, setStatus(next: ConnectIntentStatus) { status = next; },
     navigated: async (): Promise<void> => { await vi.waitFor(() => { expect(urls).toHaveLength(1); }); },
   };
@@ -91,7 +103,100 @@ function requestedPaths(requests: Request[]): string[] {
   return requests.map((request) => new URL(request.url).pathname);
 }
 
-afterEach(() => { vi.useRealTimers(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe('browser-delivered embedded login', () => {
+  const challenge = { type: 'superrare-connect:request-origin-challenge', intentId, nonce: 'live-frame-nonce' };
+
+  it.each(['new', 'prepared'] as const)('answers a challenge during %s navigation before accepting the frame callback', async (mode) => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: 'https://game.test' });
+    const h = harness({ browserDelivery: true, onNavigate: () => {
+      h.emit(h.callback());
+      expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/exchange');
+      h.emit(challenge);
+      h.emit(h.callback());
+    } });
+    if (mode === 'prepared') await h.client.auth.prepareLogin({ authDelivery: 'browser' });
+    await expect(h.client.auth.login({ authDelivery: 'browser' })).resolves.toMatchObject({ status: 'authenticated' });
+    expect(h.responses).toEqual([{ message: {
+      type: 'superrare-connect:request-origin-response', intentId, nonce: challenge.nonce,
+    }, targetOrigin: origin }]);
+    expect(h.client.auth.getSession()?.sessionId).toBe('embed-session');
+    expect(h.frame.closed).toBe(false);
+    expect(h.popupOpen).not.toHaveBeenCalled();
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/claim');
+  });
+
+  it.each(['source', 'origin', 'intent', 'empty nonce', 'long nonce'] as const)('does not authorize callbacks after a challenge with wrong %s', async (mismatch) => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: 'https://game.test' });
+    const h = harness({ browserDelivery: true });
+    const pending = h.client.auth.login({ authDelivery: 'browser' });
+    await h.navigated();
+    h.emit({
+      ...challenge,
+      ...(mismatch === 'intent' ? { intentId: 'other-intent' } : {}),
+      ...(mismatch === 'empty nonce' ? { nonce: '' } : {}),
+      ...(mismatch === 'long nonce' ? { nonce: 'x'.repeat(129) } : {}),
+    }, mismatch === 'source' ? { source: {} } : mismatch === 'origin' ? { origin: 'https://evil.test' } : {});
+    h.emit(h.callback());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.responses).toEqual([]);
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/exchange');
+    h.emit(challenge);
+    h.emit(h.callback(), { source: {} });
+    h.emit(h.callback(), { origin: 'https://evil.test' });
+    h.emit(h.callback({ intentId: 'other-intent' }));
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/exchange');
+    h.emit(h.callback());
+    await expect(pending).resolves.toMatchObject({ status: 'authenticated' });
+  });
+
+  it('does not claim a completed status or a dismissed browser-mode frame', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: 'https://game.test' });
+    const h = harness({ browserDelivery: true });
+    const pending = h.client.auth.login({ authDelivery: 'browser' });
+    await h.navigated();
+    h.setStatus('completed');
+    h.emit({ type: 'superrare-connect:intent-status', intentId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requestedPaths(h.requests)).toContain(`/v1/connect/intents/${intentId}`);
+    expect(h.client.auth.getSession()).toBeUndefined();
+    h.frame.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await expect(pending).resolves.toEqual({ status: 'cancelled' });
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/claim');
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/exchange');
+  });
+
+  it('fails before navigation when the frame adapter cannot answer a challenge', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: 'https://game.test' });
+    const h = harness({ browserDelivery: true, unsupportedSource: true });
+    await expect(h.client.auth.login({ authDelivery: 'browser' })).rejects.toThrow('callable postMessage');
+    expect(h.urls).toEqual([]);
+    expect(h.frame.closed).toBe(true);
+    expect(h.popupOpen).not.toHaveBeenCalled();
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/claim');
+  });
+
+  it('rejects a failed challenge response without accepting a later callback', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: 'https://game.test' });
+    const h = harness({ browserDelivery: true, onResponse: () => { throw new Error('Window unavailable.'); } });
+    const pending = h.client.auth.login({ authDelivery: 'browser' });
+    const rejection = expect(pending).rejects.toThrow('Could not answer the Connect origin challenge');
+    await h.navigated();
+    h.emit(challenge);
+    h.emit(h.callback());
+    await rejection;
+    expect(h.client.auth.getSession()).toBeUndefined();
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/exchange');
+    expect(requestedPaths(h.requests)).not.toContain('/v1/connect/auth/claim');
+  });
+});
 
 describe('embedded hosted Connect lifecycle', () => {
   it.each(['new', 'prepared'] as const)('subscribes before %s login navigation and exchanges the matching frame callback without dismissing it', async (mode) => {

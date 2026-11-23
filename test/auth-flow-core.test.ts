@@ -48,6 +48,18 @@ describe('buildConnectLoginIntentRequest', () => {
     });
   });
 
+  it('opts in to browser delivery while preserving the S256 challenge', () => {
+    const result = buildConnectLoginIntentRequest({
+      codeChallenge: rfc7636CodeChallenge, state: 'state_123', authDelivery: 'browser',
+    });
+    expect(result).toMatchObject({
+      ok: true, request: {
+        authDelivery: 'browser',
+        pkce: { codeChallenge: rfc7636CodeChallenge, codeChallengeMethod: 'S256' },
+      },
+    });
+  });
+
   it('rejects unsafe returnPath before API requests', () => {
     expect(buildConnectLoginIntentRequest({
       codeChallenge: rfc7636CodeChallenge,
@@ -79,6 +91,23 @@ describe('verifyConnectAuthCallbackAgainstPending', () => {
         codeVerifier: rfc7636CodeVerifier,
       },
     });
+  });
+
+  it.each(['legacy-pending', 'browser-pending'] as const)('rejects cross-mode reuse of %s', (mode) => {
+    expect(verifyConnectAuthCallbackAgainstPending({
+      pendingAuth: mode === 'legacy-pending' ? pendingAuth : { ...pendingAuth, authDelivery: 'browser' },
+      authDelivery: mode === 'legacy-pending' ? 'browser' : undefined,
+      callbackParams: { intentId: pendingAuth.intentId, state: pendingAuth.state, code: 'one-time-code' },
+    })).toEqual({ ok: false, error: 'auth_delivery_mismatch' });
+  });
+
+  it('retains browser delivery through storage parsing and verifies it explicitly', () => {
+    const parsed = pendingConnectAuthSchema.parse({ ...pendingAuth, authDelivery: 'browser' });
+    expect(parsed.authDelivery).toBe('browser');
+    expect(verifyConnectAuthCallbackAgainstPending({
+      pendingAuth: parsed, authDelivery: 'browser',
+      callbackParams: { intentId: parsed.intentId, state: parsed.state, code: 'one-time-code' },
+    })).toMatchObject({ ok: true, exchangeParams: { codeVerifier: rfc7636CodeVerifier } });
   });
 
   it('treats a pending record without a verifier as missing', () => {

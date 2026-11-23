@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { encodeBase64Url } from '../src/auth-flow-core.js';
 import {
@@ -102,7 +102,7 @@ const storedCredentials = (): ConnectAuthCredentials => ({
   refreshExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString(),
 });
 
-type EmittedMessage = { origin: string; data: unknown };
+type EmittedMessage = { origin: string; data: unknown; source?: unknown };
 
 function createMessageEmitter(): {
   messageEvents: { subscribe: (listener: (event: EmittedMessage) => void) => () => void };
@@ -2233,6 +2233,266 @@ describe('auth.prepareLogin', () => {
 
     emitter.emit({ origin: connectOrigin, data: authCallbackMessage });
     await resultPromise;
+  });
+});
+
+describe('browser-delivered popup login', () => {
+  const connectOrigin = 'https://connect.superrare.test';
+  const browserOrigin = 'https://requester.test';
+  const challenge = {
+    type: 'superrare-connect:request-origin-challenge',
+    intentId: 'connect_intent_login',
+    nonce: 'fresh-popup-nonce',
+  };
+  const browserParams = { authDelivery: 'browser' } as const;
+
+  function harness(input: {
+    echo?: boolean;
+    unsupportedPopup?: boolean;
+    onNavigate?: () => void;
+    display?: 'popup' | 'redirect';
+    initiatingOrigin?: string;
+  } = {}) {
+    const emitter = createMessageEmitter();
+    const visibility = createVisibilityEmitter();
+    const popup = createPopupStub();
+    const responses: Array<{ message: unknown; targetOrigin: string }> = [];
+    const source = {
+      get closed() { return popup.closed; },
+      close: popup.close,
+      location: { replace(url: string): void { popup.location.replace(url); input.onNavigate?.(); } },
+      postMessage(message: unknown, targetOrigin: string): void { responses.push({ message, targetOrigin }); },
+    };
+    const requests: Request[] = [];
+    const openedUrls: string[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test', createState: () => 'state_login', sessionStorage: createMemoryStorage(),
+      display: input.display ?? 'popup', initiatingOrigin: input.initiatingOrigin,
+      popup: {
+        open: (url) => { openedUrls.push(url); return input.unsupportedPopup ? popup : source; },
+        messageEvents: emitter.messageEvents, visibilityEvents: visibility.visibilityEvents,
+      },
+      fetch: async (requestInput, init) => {
+        const request = new Request(requestInput, init);
+        requests.push(request);
+        const path = new URL(request.url).pathname;
+        if (path === '/v1/connect/auth/exchange') return sessionResponse();
+        if (path === '/v1/connect/users/me') return jsonResponse({ error: 'No profile.' }, { status: 503 });
+        if (path === '/v1/connect/auth/claim') return claimIssuedResponse();
+        return jsonResponse({ data: {
+          intentId: 'connect_intent_login', expiresAt: futureExpiry(),
+          url: `${connectOrigin}/login?intentId=connect_intent_login`,
+          ...(input.echo === false ? {} : { authDelivery: 'browser' }),
+        } });
+      },
+    });
+    const emit = (data: unknown, event: Partial<EmittedMessage> = {}): void => {
+      emitter.emit({ origin: connectOrigin, source, data, ...event });
+    };
+    return {
+      client, popup, source, emitter, visibility, responses, requests, openedUrls, emit,
+      paths: () => requests.map((request) => new URL(request.url).pathname),
+      navigated: async (): Promise<void> => { await vi.waitFor(() => { expect(popup.replacedUrls).toHaveLength(1); }); },
+    };
+  }
+
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it.each(['new', 'prepared'] as const)('registers the %s watcher before navigation, then exchanges with the original PKCE verifier', async (mode) => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness({ onNavigate: () => {
+      h.emit(authCallbackMessage);
+      expect(h.paths()).not.toContain('/v1/connect/auth/exchange');
+      h.emit(challenge);
+      h.emit(authCallbackMessage);
+    } });
+    if (mode === 'prepared') {
+      await h.client.auth.prepareLogin(browserParams);
+      await h.client.auth.prepareLogin(browserParams);
+    }
+    await expect(h.client.auth.login(browserParams)).resolves.toMatchObject({ status: 'authenticated' });
+    expect(h.openedUrls).toEqual(['about:blank']);
+    expect(h.paths().filter((path) => path === '/v1/connect/intents')).toHaveLength(1);
+    const creation = h.requests.find((request) => new URL(request.url).pathname === '/v1/connect/intents');
+    const exchange = h.requests.find((request) => new URL(request.url).pathname === '/v1/connect/auth/exchange');
+    if (creation === undefined || exchange === undefined) throw new Error('Login requests missing.');
+    const creationBody: unknown = await creation.json();
+    expect(creationBody).toMatchObject({
+      action: { type: 'login' }, authDelivery: 'browser', initiatingOrigin: browserOrigin,
+      pkce: { codeChallengeMethod: 'S256' },
+    });
+    const created = loginIntentBodySchema.parse(creationBody);
+    const exchanged = codeVerifierBodySchema.parse(await exchange.json());
+    expect(await s256(exchanged.codeVerifier)).toBe(created.pkce.codeChallenge);
+    expect(h.responses).toEqual([{ message: {
+      type: 'superrare-connect:request-origin-response', intentId: challenge.intentId, nonce: challenge.nonce,
+    }, targetOrigin: connectOrigin }]);
+    expect(h.client.auth.getSession()?.sessionId).toBe('connect_session_login');
+    expect(h.emitter.listenerCount()).toBe(0);
+    expect(h.visibility.listenerCount()).toBe(0);
+    expect(h.paths()).not.toContain('/v1/connect/auth/claim');
+  });
+
+  it('binds both challenge and callback to the exact popup, origin, and intent', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness();
+    const pending = h.client.auth.login(browserParams);
+    await h.navigated();
+    h.emit(challenge, { source: {} });
+    h.emit(challenge, { origin: 'https://evil.test' });
+    h.emit({ ...challenge, intentId: 'other-intent' });
+    h.emit({ ...challenge, nonce: 'x'.repeat(129) });
+    h.emit(authCallbackMessage);
+    expect(h.responses).toEqual([]);
+    expect(h.paths()).not.toContain('/v1/connect/auth/exchange');
+    h.emit(challenge);
+    h.emit(authCallbackMessage, { source: {} });
+    h.emit(authCallbackMessage, { source: undefined });
+    h.emit(authCallbackMessage, { origin: 'https://evil.test' });
+    h.emit({ ...authCallbackMessage, intentId: 'other-intent' });
+    expect(h.paths()).not.toContain('/v1/connect/auth/exchange');
+    h.emit(authCallbackMessage);
+    await expect(pending).resolves.toMatchObject({ status: 'authenticated' });
+  });
+
+  it('does not reuse handshake confirmation for the next watcher', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness();
+    const first = h.client.auth.login(browserParams);
+    await h.navigated();
+    h.emit(challenge);
+    h.emit(authCallbackMessage);
+    await first;
+    const second = h.client.auth.login(browserParams);
+    await vi.waitFor(() => { expect(h.popup.replacedUrls).toHaveLength(2); });
+    h.emit(authCallbackMessage);
+    expect(h.paths().filter((path) => path === '/v1/connect/auth/exchange')).toHaveLength(1);
+    h.emit({ ...challenge, nonce: 'second-watcher-nonce' });
+    h.emit(authCallbackMessage);
+    await expect(second).resolves.toMatchObject({ status: 'authenticated' });
+    expect(h.responses.map((response) => response.message)).toEqual([
+      { type: 'superrare-connect:request-origin-response', intentId: challenge.intentId, nonce: challenge.nonce },
+      { type: 'superrare-connect:request-origin-response', intentId: challenge.intentId, nonce: 'second-watcher-nonce' },
+    ]);
+  });
+
+  it('still rejects a mismatched callback state after the handshake', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness();
+    const pending = h.client.auth.login(browserParams);
+    const rejection = expect(pending).rejects.toMatchObject({ code: 'state_mismatch' });
+    await h.navigated();
+    h.emit(challenge);
+    h.emit({ ...authCallbackMessage, state: 'other-state' });
+    await rejection;
+    expect(h.paths()).not.toContain('/v1/connect/auth/exchange');
+    expect(h.client.auth.getSession()).toBeUndefined();
+  });
+
+  it('never claims on visibility or popup dismissal even when a claim could authenticate', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness();
+    const pending = h.client.auth.login(browserParams);
+    await h.navigated();
+    h.visibility.emit(true);
+    h.popup.close();
+    await vi.advanceTimersByTimeAsync(2000);
+    await expect(pending).resolves.toEqual({ status: 'cancelled' });
+    expect(h.paths()).not.toContain('/v1/connect/auth/claim');
+    expect(h.paths()).not.toContain('/v1/connect/auth/exchange');
+    expect(h.client.auth.getSession()).toBeUndefined();
+    expect(h.emitter.listenerCount()).toBe(0);
+  });
+
+  it.each(['login', 'prepareLogin'] as const)('rejects an old API without a mode echo before %s can navigate', async (operation) => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness({ echo: false });
+    await expect(h.client.auth[operation](browserParams)).rejects.toThrow('does not support browser auth delivery');
+    expect(h.popup.replacedUrls).toEqual([]);
+    expect(h.paths()).toEqual(['/v1/connect/intents']);
+    if (operation === 'login') expect(h.popup.closed).toBe(true);
+    else expect(h.openedUrls).toEqual([]);
+  });
+
+  it('refuses a legacy popup adapter without postMessage before navigating', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness({ unsupportedPopup: true });
+    await expect(h.client.auth.login(browserParams)).rejects.toThrow('callable postMessage');
+    expect(h.popup.replacedUrls).toEqual([]);
+    expect(h.popup.closed).toBe(true);
+    expect(h.paths()).not.toContain('/v1/connect/auth/claim');
+  });
+
+  it.each(['login', 'prepareLogin'] as const)('rejects redirect display for %s before creating an intent', async (operation) => {
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness({ display: 'redirect' });
+    await expect(h.client.auth[operation](browserParams)).rejects.toThrow("requires display: 'embed' or 'popup'");
+    expect(h.requests).toEqual([]);
+    expect(h.openedUrls).toEqual([]);
+  });
+
+  it('does not exchange a browser pending record through the legacy redirect callback handler', async () => {
+    vi.stubGlobal('sessionStorage', undefined);
+    const storage = createMemoryStorage();
+    storage.setItem(`${credentialStorageKey}:redirect-login`, JSON.stringify({
+      intentId: authCallbackMessage.intentId, state: authCallbackMessage.state,
+      expiresAt: futureExpiry(), codeVerifier: 'x'.repeat(43), authDelivery: 'browser',
+    }));
+    const requests: Request[] = [];
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test', display: 'redirect', sessionStorage: storage,
+      fetch: async (input, init) => { requests.push(new Request(input, init)); return sessionResponse(); },
+    });
+    await expect(client.auth.handleRedirectCallback(new URLSearchParams({
+      intentId: authCallbackMessage.intentId, state: authCallbackMessage.state, code: authCallbackMessage.code,
+    }))).rejects.toMatchObject({ code: 'auth_delivery_mismatch' });
+    expect(requests).toEqual([]);
+    expect(client.auth.getSession()).toBeUndefined();
+  });
+
+  it.each(['parameter', 'option', 'missing browser', 'insecure browser'] as const)('refuses a fabricated origin from %s before creating an intent', async (kind) => {
+    vi.stubGlobal('location', kind === 'missing browser' ? undefined : {
+      origin: kind === 'insecure browser' ? 'http://requester.test' : browserOrigin,
+    });
+    const h = harness(kind === 'option' ? { initiatingOrigin: 'https://forged.test' } : {});
+    await expect(h.client.auth.login({
+      ...browserParams, ...(kind === 'parameter' ? { initiatingOrigin: 'https://forged.test' } : {}),
+    })).rejects.toThrow(kind === 'parameter' || kind === 'option' ? 'must match' : 'actual browser location origin');
+    expect(h.requests).toEqual([]);
+    expect(h.openedUrls).toEqual([]);
+  });
+
+  it.each(['legacy to browser', 'browser to legacy'] as const)('does not reuse a prepared intent across %s mode changes', async (direction) => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness();
+    await h.client.auth.prepareLogin(direction === 'legacy to browser' ? {} : browserParams);
+    const pending = h.client.auth.login(direction === 'legacy to browser' ? browserParams : {});
+    await h.navigated();
+    expect(h.paths().filter((path) => path === '/v1/connect/intents')).toHaveLength(2);
+    if (direction === 'legacy to browser') h.emit(challenge);
+    h.emit(authCallbackMessage);
+    await expect(pending).resolves.toMatchObject({ status: 'authenticated' });
+  });
+
+  it('rejects a concurrent mode change instead of joining a different delivery mode', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('location', { origin: browserOrigin });
+    const h = harness();
+    const pending = h.client.auth.login(browserParams);
+    await expect(h.client.auth.login()).rejects.toThrow('different auth delivery mode');
+    await h.navigated();
+    h.emit(challenge);
+    h.emit(authCallbackMessage);
+    await expect(pending).resolves.toMatchObject({ status: 'authenticated' });
+    expect(h.openedUrls).toHaveLength(1);
   });
 });
 

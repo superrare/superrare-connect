@@ -85,6 +85,8 @@ import {
   type ConnectPopupWindow,
 } from './popup-core.js';
 import {
+  hasConnectPostMessage,
+  parseConnectRequestOriginChallenge,
   parseConnectAuthCallbackMessage,
   resolveConnectHostedUrl,
   type ConnectPopupLoginResult,
@@ -157,10 +159,9 @@ export type SuperRareConnectClientOptions = ConnectAuthApiOptions & {
     /** Message-event source for the login callback; defaults to the window. */
     messageEvents?: ConnectPopupMessageEvents;
     /**
-     * Page-visibility source for the login; defaults to the document. A
-     * login claims its result from Rare API whenever this page becomes
-     * visible again: iOS Safari suspends the page while the hosted window
-     * is in front, and the callback posted meanwhile never arrives.
+     * Page-visibility source for legacy login; defaults to the document.
+     * Legacy login claims its result when this page becomes visible again.
+     * Browser-delivered login never claims a missed callback.
      */
     visibilityEvents?: ConnectPopupVisibilityEvents;
   };
@@ -222,6 +223,8 @@ export type ConnectEmbedOptions = {
 export type ConnectAuthLoginParams = {
   returnPath?: string;
   initiatingOrigin?: string;
+  /** Opt in to a live origin handshake and postMessage-only login delivery. */
+  authDelivery?: 'browser';
 };
 
 /** A login intent created ahead of the tap by `auth.prepareLogin`. */
@@ -800,18 +803,21 @@ export function createSuperRareClient(
   const visibilityEvents = options.popup?.visibilityEvents ?? readBrowserVisibilityEvents();
   let popupLoginReplacementGeneration = 0;
   let inFlightLogin: Promise<ConnectPopupLoginResult> | undefined;
+  let inFlightLoginAuthDelivery: 'browser' | undefined;
   const createLoginIntent = async (
     params: ConnectAuthLoginParams,
     // Not `options`: that name belongs to the client options this closure
     // reads for initiatingOrigin.
     intentOptions: { signal?: AbortSignal } = {},
   ): Promise<StartedLoginIntent> => {
+    const resolvedParams = resolveLoginParams(params);
     const pkce = await createConnectPkcePair();
     const requestResult = buildConnectLoginIntentRequest({
       codeChallenge: pkce.codeChallenge,
       returnPath: params.returnPath,
       state: createState(),
-      initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+      initiatingOrigin: resolvedParams.initiatingOrigin,
+      authDelivery: resolvedParams.authDelivery,
     });
     if (!requestResult.ok) {
       throw new ConnectReturnPathError();
@@ -829,6 +835,7 @@ export function createSuperRareClient(
         state: requestResult.request.state,
         expiresAt: intent.expiresAt,
         codeVerifier: pkce.codeVerifier,
+        ...(resolvedParams.authDelivery === undefined ? {} : { authDelivery: resolvedParams.authDelivery }),
       },
     };
   };
@@ -836,10 +843,30 @@ export function createSuperRareClient(
   // tied to this client's session generation (a logout invalidates it) and
   // to the params it was prepared with.
   let preparedLogin: PreparedLogin | undefined;
-  const resolveLoginParams = (params: ConnectAuthLoginParams): ResolvedLoginParams => ({
-    returnPath: params.returnPath,
-    initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
-  });
+  const resolveLoginParams = (params: ConnectAuthLoginParams): ResolvedLoginParams => {
+    if (params.authDelivery !== 'browser') {
+      return {
+        returnPath: params.returnPath,
+        initiatingOrigin: params.initiatingOrigin ?? options.initiatingOrigin ?? readBrowserOrigin(),
+        authDelivery: undefined,
+      };
+    }
+    if (redirectDisplay) {
+      throw new Error("Browser auth delivery requires display: 'embed' or 'popup'; redirect cannot verify a live requester.");
+    }
+    const actualOrigin = readBrowserOrigin();
+    const checkedOrigin = actualOrigin === undefined ? undefined : resolveConnectHostedUrl(actualOrigin);
+    if (checkedOrigin === undefined || !checkedOrigin.ok || checkedOrigin.origin !== actualOrigin) {
+      throw new Error('Browser auth delivery requires the actual browser location origin in a secure context.');
+    }
+    if (
+      (params.initiatingOrigin !== undefined && params.initiatingOrigin !== actualOrigin) ||
+      (options.initiatingOrigin !== undefined && options.initiatingOrigin !== actualOrigin)
+    ) {
+      throw new Error('Browser auth delivery initiatingOrigin must match the actual browser location origin.');
+    }
+    return { returnPath: params.returnPath, initiatingOrigin: actualOrigin, authDelivery: 'browser' };
+  };
   const prepareLogin = async (
     params: ConnectAuthLoginParams = {},
   ): Promise<ConnectPreparedLogin> => {
@@ -954,8 +981,14 @@ export function createSuperRareClient(
     connectOrigin: string;
     deadline: number;
     operationGeneration: number;
-  }): Promise<ConnectPopupLoginResult> =>
-    new Promise<ConnectPopupLoginResult>((resolve, reject) => {
+  }): Promise<ConnectPopupLoginResult> => {
+    const browserDelivery = input.pendingAuth.authDelivery === 'browser';
+    const expectedSource = embedOptions === undefined ? input.popup : embeddedMessageSources.get(input.popup);
+    if (browserDelivery && !hasConnectPostMessage(expectedSource)) {
+      throw new Error('Browser auth delivery requires the actual hosted window with callable postMessage; use iframe.contentWindow or the window.open result.');
+    }
+    return new Promise<ConnectPopupLoginResult>((resolve, reject) => {
+      let answeredOriginChallenge = false;
       let settled = false;
       // The hosted page closes itself right after posting the callback, so the
       // close-watcher stands down once an exchange is in flight. The
@@ -995,6 +1028,7 @@ export function createSuperRareClient(
         const verification = verifyConnectAuthCallbackAgainstPending({
           pendingAuth: input.pendingAuth,
           callbackParams: params,
+          authDelivery: input.pendingAuth.authDelivery,
         });
         if (!verification.ok) {
           settle(() => {
@@ -1036,7 +1070,7 @@ export function createSuperRareClient(
       // finding the window closed — Rare API is asked for the result: a fresh
       // code once the hosted login completed, 409 until then.
       const claimCompletedLogin = async (): Promise<void> => {
-        if (settled || exchanging || claiming) return;
+        if (browserDelivery || settled || exchanging || claiming) return;
         claiming = true;
         try {
           const claim = await claimConnectAuthCode(
@@ -1085,7 +1119,7 @@ export function createSuperRareClient(
           if (settled || exchanging) return;
           switch (intent.status) {
             case 'completed':
-              await claimCompletedLogin();
+              if (!browserDelivery) await claimCompletedLogin();
               break;
             case 'cancelled':
               settle(() => resolve({ status: 'cancelled' }));
@@ -1119,6 +1153,29 @@ export function createSuperRareClient(
       };
       unsubscribe = input.messageEvents.subscribe((event) => {
         if (settled || exchanging) return;
+        if (browserDelivery) {
+          if (event.source !== expectedSource || event.origin !== input.connectOrigin) return;
+          const challenge = parseConnectRequestOriginChallenge({
+            ...event,
+            source: event.source,
+            expectedOrigin: input.connectOrigin,
+            expectedSource,
+            intentId: input.pendingAuth.intentId,
+          });
+          if (challenge !== undefined && hasConnectPostMessage(expectedSource)) {
+            try {
+              expectedSource.postMessage({
+                type: 'superrare-connect:request-origin-response',
+                intentId: challenge.intentId,
+                nonce: challenge.nonce,
+              }, input.connectOrigin);
+              answeredOriginChallenge = true;
+            } catch {
+              settle(() => reject(new Error('Could not answer the Connect origin challenge. Restart login from this site; browser delivery cannot fall back to claims.')));
+            }
+            return;
+          }
+        }
         if (embedOptions !== undefined) {
           if (event.source !== embeddedMessageSources.get(input.popup)) return;
           const embedded = parseConnectEmbedMessage({
@@ -1139,6 +1196,7 @@ export function createSuperRareClient(
             return;
           }
         }
+        if (browserDelivery && !answeredOriginChallenge) return;
         const parsed = parseConnectAuthCallbackMessage({
           data: event.data,
           origin: event.origin,
@@ -1150,7 +1208,7 @@ export function createSuperRareClient(
       });
       if (settled) unsubscribe();
 
-      unsubscribeVisibility = input.visibilityEvents?.subscribe((visible) => {
+      unsubscribeVisibility = browserDelivery ? ((): void => {}) : input.visibilityEvents?.subscribe((visible) => {
         if (visible) void claimCompletedLogin();
       }) ?? ((): void => {});
 
@@ -1176,7 +1234,7 @@ export function createSuperRareClient(
             // The hosted page closes itself once it has posted the callback:
             // a closed window is where a missed callback is most likely, so
             // it is a cancel only once Rare API confirms nothing completed.
-            if (!claiming) await claimCompletedLogin();
+            if (!browserDelivery && !claiming) await claimCompletedLogin();
             if (settled || exchanging || claiming) continue;
 
             settle(() => {
@@ -1194,6 +1252,7 @@ export function createSuperRareClient(
       };
       void watchPopupLifetime();
     });
+  };
 
   const runPopupLogin = async (
     params: ConnectAuthLoginParams,
@@ -1215,12 +1274,12 @@ export function createSuperRareClient(
     // The popup must open before the first await to stay inside the user
     // gesture; it navigates once the intent exists. A blocked window fails
     // the login before any intent is created — there is no same-page
-    // fallback. A login prepared ahead of the tap has its intent already:
-    // the window opens straight at the hosted page, with no round trip for a
-    // suspended opener to leave unfinished.
+    // fallback. A legacy prepared login can open directly at the hosted page;
+    // browser delivery opens blank so its challenge watcher is listening
+    // before even a prepared intent navigates.
     const popup = openHostedWindow(
       `superrare-connect-login-${createConnectPopupName()}`,
-      embedOptions === undefined ? prepared?.popupUrl : undefined,
+      embedOptions === undefined && params.authDelivery !== 'browser' ? prepared?.popupUrl : undefined,
     );
     if (popup === null) {
       throw new ConnectPopupBlockedError();
@@ -1242,7 +1301,7 @@ export function createSuperRareClient(
           }),
           operationGeneration,
         });
-        if (embedOptions !== undefined) popup.location.replace(prepared.popupUrl);
+        if (embedOptions !== undefined || params.authDelivery === 'browser') popup.location.replace(prepared.popupUrl);
         return await completion;
       } catch (error) {
         // A rejected watcher is observed even if navigation failed before await.
@@ -1305,7 +1364,7 @@ export function createSuperRareClient(
     });
     let completion: Promise<ConnectPopupLoginResult> | undefined;
     try {
-      if (embedOptions === undefined) popup.location.replace(popupUrl);
+      if (embedOptions === undefined && params.authDelivery !== 'browser') popup.location.replace(popupUrl);
       completion = watchPopupLogin({
         popup,
         pendingAuth,
@@ -1315,7 +1374,7 @@ export function createSuperRareClient(
         deadline,
         operationGeneration,
       });
-      if (embedOptions !== undefined) popup.location.replace(popupUrl);
+      if (embedOptions !== undefined || params.authDelivery === 'browser') popup.location.replace(popupUrl);
       return await completion;
     } catch (error) {
       // The watcher settles and cleans up on its own; this boundary covers a
@@ -1361,6 +1420,8 @@ export function createSuperRareClient(
         ? undefined
         : parseStoredPendingConnectAuth(storedPendingAuth),
       callbackParams,
+      // Redirect callbacks are always legacy; browser pending records must fail.
+      authDelivery: undefined,
     });
     if (!verification.ok) throw new ConnectAuthPendingError(verification.error);
 
@@ -1401,11 +1462,16 @@ export function createSuperRareClient(
   const login = async (
     params: ConnectAuthLoginParams = {},
   ): Promise<ConnectPopupLoginResult> => {
+    resolveLoginParams(params);
+    if (inFlightLogin !== undefined && inFlightLoginAuthDelivery !== params.authDelivery) {
+      throw new Error('A Connect login with a different auth delivery mode is already running. Finish or cancel it first.');
+    }
     // One login at a time: the SDK holds a single session, so a second
     // concurrent login could only race the first for the same slot. A
     // caller that asks again — a double click — joins the login already
     // running instead of opening a second window or navigating twice.
     if (inFlightLogin === undefined) {
+      inFlightLoginAuthDelivery = params.authDelivery;
       const started = redirectDisplay ? startRedirectLogin(params) : runPopupLogin(params);
       const pending = started.finally(() => {
         if (inFlightLogin === pending) inFlightLogin = undefined;
@@ -2096,6 +2162,7 @@ type StartedLoginIntent = {
 type ResolvedLoginParams = {
   returnPath: string | undefined;
   initiatingOrigin: string | undefined;
+  authDelivery: 'browser' | undefined;
 };
 
 type PreparedLogin = {
@@ -2125,7 +2192,8 @@ function isPreparedLoginUsable(input: {
 }): boolean {
   if (
     input.prepared.params.returnPath !== input.params.returnPath ||
-    input.prepared.params.initiatingOrigin !== input.params.initiatingOrigin
+    input.prepared.params.initiatingOrigin !== input.params.initiatingOrigin ||
+    input.prepared.params.authDelivery !== input.params.authDelivery
   ) {
     return false;
   }
