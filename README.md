@@ -509,7 +509,7 @@ The minimum received is pinned when the intent is created. Rare API quotes the w
 
 Liquid Edition trades are wallet-only: `payment` accepts only `{ method: 'wallet' }` (TypeScript rejects `'card'`), and Rare API refuses card payment for these intents with `INVALID_REQUEST`.
 
-Liquid Editions trade on Ethereum mainnet (`chainId: 1`) and Sepolia (`11155111`). Production Connect executes mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia) with a `liquid-edition` target on `chainId: 11155111`.
+Liquid Editions trade on Ethereum mainnet (`chainId: 1`) and Sepolia (`11155111`). Production Connect executes both; for Sepolia pass a `liquid-edition` target on `chainId: 11155111` (see [Testing on Sepolia](#testing-on-sepolia)).
 
 ## Transfers
 
@@ -536,7 +536,7 @@ await superrare.actions.transfer({
 
 `beforeOpen` runs after the intent is created and before the hosted window shows the transfer. The window stays blank until `beforeOpen` resolves, so bound its work with a timeout. If `beforeOpen` throws, the SDK closes the window and `actions.transfer` rejects with that error, so the hosted window never shows a transfer your backend has not recorded.
 
-- Chains: Ethereum mainnet (`1`), Base (`8453`), Sepolia (`11155111`) and Base Sepolia (`84532`) are supported; each hosted Connect deployment enables a subset. Production executes mainnet only; for Sepolia use the dev `apiUrl`/`connectUrl` pair in [Testing on Sepolia](#testing-on-sepolia). On a chain the deployment does not enable, the hosted window shows the transfer as not available.
+- Chains: Ethereum mainnet (`1`), Base (`8453`), Sepolia (`11155111`) and Base Sepolia (`84532`) are supported; each hosted Connect deployment enables a subset. Production executes mainnet and Sepolia (see [Testing on Sepolia](#testing-on-sepolia)). On a chain the deployment does not enable, the hosted window shows the transfer as not available.
 - Currencies: `ETH` and `USDC`.
 - `amount` is a raw base-unit string, like bid and offer amounts: wei for ETH (`'50000000000000000'` is 0.05 ETH) and 6 decimals for USDC (`'25000000'` is 25 USDC). The SDK rejects decimals, zero, leading zeros, and non-string amounts with `ConnectActionValidationError` (`code: 'invalid_amount'`) before any window opens.
 - `to` must be a `0x`-prefixed, 40-hex-character address other than the zero address; the SDK rejects anything else with `ConnectActionValidationError` (`code: 'invalid_address'`) before any window opens.
@@ -758,13 +758,10 @@ Use `connectUrl` to force hosted intent URLs to a matching Connect deployment in
 
 ## Testing on Sepolia
 
-Production (`connect.superrare.com`) is Ethereum mainnet only. To test an integration on the **Sepolia** testnet, point the client at the shared dev environment and pass the Sepolia chain id (`11155111`) on the action target:
+Production (`connect.superrare.com`) executes both Ethereum mainnet and the **Sepolia** testnet. To test an integration on Sepolia, keep the default client and pass the Sepolia chain id (`11155111`) on the action target:
 
 ```ts
-const superrare = createSuperRareClient({
-  apiUrl: 'https://rare-api-dev-mainnet.superrare.co',
-  connectUrl: 'https://connect-dev-mainnet.superrare.co',
-});
+const superrare = createSuperRareClient();
 
 await superrare.actions.buy({
   target: {
@@ -777,7 +774,16 @@ await superrare.actions.buy({
 });
 ```
 
-The dev environment resolves and executes both mainnet (`1`) and Sepolia (`11155111`) listings; the hosted window runs on whichever chain the action names, with no in-window network switch. You need a testnet asset the buyer can actually purchase (a live Sepolia listing whose seller still owns the token) and a buyer wallet funded with Sepolia ETH. Switch back to the production `apiUrl`/`connectUrl` for mainnet.
+The hosted window runs on whichever chain the action names, and login signs on that chain. You need a testnet asset the buyer can actually purchase (a live Sepolia listing whose seller still owns the token) and a buyer wallet funded with Sepolia ETH. Moving to mainnet only changes the `chainId` and the target; the client stays the same.
+
+Card payments on Sepolia (Coinflow sandbox) are tested against the shared dev environment instead:
+
+```ts
+const superrare = createSuperRareClient({
+  apiUrl: 'https://rare-api-dev-mainnet.superrare.co',
+  connectUrl: 'https://connect-dev-mainnet.superrare.co',
+});
+```
 
 ## Hosted Windows
 
