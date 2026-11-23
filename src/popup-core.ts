@@ -1,4 +1,4 @@
-import type { ConnectIntentStatus } from './status-core.js';
+import type { ConnectIntent, ConnectIntentStatus } from './status-core.js';
 
 /**
  * The window every hosted Connect flow runs in: the hosted URL opens in a
@@ -69,6 +69,12 @@ const settledStatuses: ReadonlySet<ConnectIntentStatus> = new Set([
 /** Terminal intent statuses — the popup can be closed once one is reached. */
 export const isConnectIntentSettled = (status: ConnectIntentStatus): boolean =>
   settledStatuses.has(status);
+
+export const isConfirmedCartCheckout = (
+  intent: Pick<ConnectIntent, 'status' | 'cartCheckout' | 'resolvedActionSnapshot'>,
+): boolean =>
+  intent.status === 'completed' &&
+  (intent.cartCheckout !== undefined || intent.resolvedActionSnapshot?.targetKind === 'cart');
 
 /**
  * Deadline for a popup watcher, in epoch milliseconds. An expiry that cannot be

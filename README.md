@@ -242,7 +242,7 @@ const superrare = createSuperRareClient({
     open(url) {
       const frame = document.createElement('iframe');
       frame.title = 'SuperRare Connect';
-      frame.allow = 'payment';
+      frame.allow = 'payment; clipboard-write';
       frame.style.width = '100%';
       frame.style.height = '720px';
       container.append(frame);
@@ -361,6 +361,42 @@ const checkout = await superrare.checkout.getStatus({
   sessionId: 'connect_checkout_session_123',
 });
 ```
+
+## Cart Checkout
+
+`checkout.start` also takes a `cart` target: the Listings to buy, each named by its `listingDigest` (`0x` plus 64 hex characters) and a `quantity` (a positive integer string). Rare API answers with the hosted cart page for the intent, and the SDK opens that URL in the configured display (`popup`, `redirect`, or `embed`) like any other intent.
+
+```ts
+const intent = await superrare.checkout.start({
+  target: {
+    kind: 'cart',
+    chainId: 8453,
+    items: [
+      {
+        listingDigest: '0xcf6398559ea0e93d7d7233ca93b09912da8ff57b45ebe7a3ede9c74d17a76f13',
+        quantity: '1',
+      },
+    ],
+  },
+  returnPath: '/cart/complete',
+});
+```
+
+A cart holds one to five items and names each Listing once: Rare API rejects more than five items and repeated listing digests, compared case-insensitively. The SDK rejects a cart before any window opens with `ConnectActionValidationError`: `invalid_chain_id` for a `chainId` that is not a positive integer, `invalid_cart_items` for an empty `items` list, more than five items, or a repeated listing digest (the error `message` says which), `invalid_listing_digest`, and `invalid_quantity` for a quantity with decimals, zero, or leading zeros. The hosted cart page currently completes a single item with quantity `'1'`.
+
+A completed Cart checkout carries its order id on the intent. Read it from `onIntentSettled`, `intents.get`, `actions.getStatus`, or `intents.getRedirectResult()`:
+
+```ts
+const settled = await superrare.intents.get({ intentId: intent.intentId });
+
+if (settled.status === 'completed') {
+  const orderId = settled.result?.cartCompletion?.orderId;
+}
+```
+
+The same intent also returns `cartCheckout` (the cart's `chainId` and `items`, plus `cartAddress` when Rare API knows the Cart contract for that chain), `payment` when the intent has payment details, and `result.paymentId` for a card payment. All of them are optional. `checkout.getStatus({ sessionId })` does not apply to Cart checkouts: a Cart intent has no checkout session, so follow it through the intent.
+
+In popup mode the window stays open after a Cart order is confirmed: the hosted page shows an order confirmation with a copyable order number and its own close control, and `onIntentSettled` still fires with the completed intent. A cancelled, failed, or expired Cart checkout closes the window like every other flow. In embed mode, include `clipboard-write` in the iframe's `allow` attribute, as in the [embed example](#embedded-hosted-login-and-checkout), so the confirmation can copy the order number.
 
 ## Anonymous ERC-721 Bid And Mint
 
@@ -803,6 +839,8 @@ const superrare = createSuperRareClient({
 });
 ```
 
+One exception: a confirmed [Cart checkout](#cart-checkout) leaves the window open on the hosted order confirmation; `onIntentSettled` still fires.
+
 Call `actions.buy()` (or any other action) directly from the click handler: the window opens synchronously inside the user gesture, so browsers allow it. When the window cannot be opened, the call rejects with `ConnectPopupBlockedError` before any intent is created — there is no same-page fallback.
 
 ## Full-Page Redirect
@@ -884,7 +922,7 @@ const result = normalizeReturnPath('/account');
 The SDK throws typed errors for branchable public failures:
 
 - `ConnectReturnPathError` for invalid `returnPath`.
-- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_address`, `invalid_min_received`, or `invalid_max_slippage_bps`.
+- `ConnectActionValidationError` for action parameters the SDK rejects before creating an intent, with `code` `invalid_amount`, `invalid_address`, `invalid_min_received`, `invalid_max_slippage_bps`, `invalid_chain_id`, `invalid_cart_items`, `invalid_listing_digest`, or `invalid_quantity`.
 - `ConnectPopupBlockedError` when the hosted window could not be opened (popup blocked, or the call ran outside a user gesture).
 - `ConnectAuthCallbackError` when a redirect login callback has missing, duplicate, or malformed `intentId`, `state`, or `code`.
 - `ConnectAuthPendingError` when the login callback's `intentId` or `state` does not match the login that was started.

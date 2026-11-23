@@ -106,6 +106,35 @@ describe('display: redirect actions', () => {
     expect(assign).toHaveBeenCalledWith('https://connect.superrare.test/intents/connect_intent_buy');
   });
 
+  it('navigates a cart checkout to the cart start URL Rare API returns', async () => {
+    const assign = vi.fn<(url: string) => void>();
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      display: 'redirect',
+      navigation: { assign },
+      sessionStorage: memoryStorage(),
+      createState: () => 'state_cart',
+      fetch: async () => jsonResponse({
+        data: {
+          intentId: 'connect_intent_cart',
+          url: 'https://connect.superrare.test/cart/connect_intent_cart/start',
+          expiresAt: futureExpiry(),
+        },
+      }),
+    });
+
+    await client.checkout.start({
+      target: {
+        kind: 'cart',
+        chainId: 8453,
+        items: [{ listingDigest: `0x${'cf'.repeat(32)}`, quantity: '1' }],
+      },
+      returnPath: '/cart/complete',
+    });
+
+    expect(assign).toHaveBeenCalledWith('https://connect.superrare.test/cart/connect_intent_cart/start');
+  });
+
   it('runs beforeOpen before navigating and does not navigate when it fails', async () => {
     const order: string[] = [];
     const assign = vi.fn<(url: string) => void>(() => { order.push('assign'); });

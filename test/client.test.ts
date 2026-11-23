@@ -9,6 +9,7 @@ import {
 } from '../src/client.js';
 import type { TransferActionParams } from '../src/actions-flow-core.js';
 import type {
+  ConnectCartCheckoutTarget,
   ConnectErc1155CheckoutTarget,
   ConnectErc721BatchOfferTarget,
   ConnectErc721DirectListingTarget,
@@ -65,6 +66,12 @@ const checkoutTarget: ConnectErc1155CheckoutTarget = {
       expected: { currency: 'ETH', unitPrice: '1.2' },
     },
   ],
+};
+
+const cartTarget: ConnectCartCheckoutTarget = {
+  kind: 'cart',
+  chainId: 8453,
+  items: [{ listingDigest: `0x${'cf'.repeat(32)}`, quantity: '1' }],
 };
 
 const offerTarget: ConnectErc721OfferTarget = {
@@ -643,6 +650,189 @@ describe('createSuperRareClient', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('starts cart checkout intents and opens the cart start URL Rare API returns', async () => {
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        connectUrl: 'https://connect.staging.test',
+        createState: () => 'state_cart',
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'GET') return completedIntentStatusResponse(request);
+
+          expect(request.url).toBe('https://rare-api.test/v1/connect/intents');
+          expect(await request.json()).toEqual({
+            action: {
+              type: 'checkout',
+              target: cartTarget,
+            },
+            initiatingOrigin: 'https://shop.example',
+            returnPath: '/cart/complete',
+            state: 'state_cart',
+          });
+
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_cart',
+              url: 'https://connect.superrare.test/cart/connect_intent_cart/start',
+              expiresAt: '2026-06-22T00:00:00.000Z',
+            },
+          });
+        },
+        sessionStorage: false,
+      });
+
+      await expect(client.checkout.start({
+        target: cartTarget,
+        returnPath: '/cart/complete',
+        initiatingOrigin: 'https://shop.example',
+      })).resolves.toMatchObject({
+        intentId: 'connect_intent_cart',
+        url: 'https://connect.staging.test/cart/connect_intent_cart/start',
+      });
+      expect(popup.replacedUrls).toEqual([
+        'https://connect.staging.test/cart/connect_intent_cart/start?display=popup',
+      ]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    {
+      label: 'keeps the window open once a Cart checkout is confirmed',
+      status: 'completed',
+      cartFields: { cartCheckout: { ...cartTarget, cartAddress: '0x00000000000000000000000000000000000000c4' } },
+      closed: false,
+    },
+    {
+      label: 'keeps the window open for a confirmed intent whose snapshot target kind is cart',
+      status: 'completed',
+      cartFields: {
+        resolvedActionSnapshot: {
+          actionKey: 'cart-checkout',
+          actionType: 'checkout',
+          resolvedAt: '2026-11-20T00:00:00.000Z',
+          targetKind: 'cart',
+          terms: { available: true },
+        },
+      },
+      closed: false,
+    },
+    ...['cancelled', 'failed', 'expired'].map((status) => ({
+      label: `closes the window once a Cart checkout is ${status}`,
+      status,
+      cartFields: { cartCheckout: cartTarget },
+      closed: true,
+    })),
+  ])('$label', async ({ status, cartFields, closed }) => {
+    vi.useFakeTimers();
+    try {
+      const popup = createPopupStub();
+      const settled: ConnectIntent[] = [];
+      const orderId = `0x${'0d'.repeat(32)}`;
+      const client = createSuperRareClient({
+        apiUrl: 'https://rare-api.test',
+        createState: () => 'state_cart',
+        onIntentSettled: (intent) => {
+          settled.push(intent);
+        },
+        popup: { open: () => popup },
+        fetch: async (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          if (request.method === 'POST') return connectIntentCreationResponse('connect_intent_cart');
+
+          return jsonResponse({
+            data: {
+              intentId: 'connect_intent_cart',
+              type: 'checkout',
+              status,
+              returnPath: '/cart/complete',
+              expiresAt: futureExpiry(),
+              ...cartFields,
+              ...(status === 'completed'
+                ? { result: { transactionHash: '0xtransaction', cartCompletion: { orderId } } }
+                : {}),
+            },
+          });
+        },
+        sessionStorage: false,
+      });
+
+      await client.checkout.start({ target: cartTarget, returnPath: '/cart/complete' });
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(popup.closed).toBe(closed);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]).toMatchObject({ status, ...cartFields });
+      if (status === 'completed') {
+        expect(settled[0]?.result?.cartCompletion?.orderId).toBe(orderId);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects invalid cart checkout parameters before opening a window or creating an intent', async () => {
+    const open = vi.fn(() => createPopupStub());
+    const fetchImplementation = vi.fn(async () => connectIntentCreationResponse('connect_intent_cart'));
+    const client = createSuperRareClient({
+      apiUrl: 'https://rare-api.test',
+      createState: () => 'state_cart',
+      popup: { open },
+      fetch: fetchImplementation,
+      sessionStorage: false,
+    });
+
+    const emptyCart = client.checkout.start({ target: { ...cartTarget, items: [] } });
+    await expect(emptyCart).rejects.toBeInstanceOf(ConnectActionValidationError);
+    await expect(emptyCart).rejects.toMatchObject({
+      code: 'invalid_cart_items',
+      message: 'A Cart checkout needs at least one item.',
+    });
+    await expect(client.checkout.start({
+      target: {
+        ...cartTarget,
+        items: Array.from({ length: 6 }, (_unused, index) => ({
+          listingDigest: `0x${index.toString(16).padStart(64, '0')}`,
+          quantity: '1',
+        })),
+      },
+    })).rejects.toMatchObject({
+      code: 'invalid_cart_items',
+      message: 'A Cart checkout accepts at most 5 items.',
+    });
+    await expect(client.checkout.start({
+      target: {
+        ...cartTarget,
+        items: [
+          { listingDigest: `0x${'ab'.repeat(32)}`, quantity: '1' },
+          { listingDigest: `0x${'AB'.repeat(32)}`, quantity: '1' },
+        ],
+      },
+    })).rejects.toMatchObject({
+      code: 'invalid_cart_items',
+      message: 'A Cart checkout cannot repeat a listing digest.',
+    });
+    await expect(client.checkout.start({
+      target: { ...cartTarget, items: [{ listingDigest: '0x1234', quantity: '1' }] },
+    })).rejects.toMatchObject({ code: 'invalid_listing_digest' });
+    await expect(client.checkout.start({
+      target: { ...cartTarget, items: [{ listingDigest: `0x${'cf'.repeat(32)}`, quantity: '0' }] },
+    })).rejects.toMatchObject({ code: 'invalid_quantity' });
+    await expect(client.checkout.start({
+      target: { ...cartTarget, chainId: 1.5 },
+    })).rejects.toMatchObject({ code: 'invalid_chain_id' });
+
+    expect(open).not.toHaveBeenCalled();
+    expect(fetchImplementation).not.toHaveBeenCalled();
   });
 
   it('rejects invalid liquid edition parameters before opening a window or creating an intent', async () => {

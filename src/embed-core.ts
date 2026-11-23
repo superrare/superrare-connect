@@ -6,6 +6,7 @@ const connectEmbedMessageSchema = z.discriminatedUnion('type', [
     intentId: z.string().min(1),
     status: z.enum(['completed', 'cancelled', 'failed', 'expired']),
     transactionHash: z.string().optional(),
+    orderId: z.string().optional(),
     error: z.string().optional(),
   }),
   z.object({

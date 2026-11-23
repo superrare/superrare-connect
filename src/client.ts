@@ -78,6 +78,7 @@ import {
   appendConnectPopupDisplay,
   getConnectPopupDeadline,
   getConnectPopupFeatures,
+  isConfirmedCartCheckout,
   isConnectIntentSettled,
   isRetryableConnectApiStatus,
   type ConnectPopupOpener,
@@ -403,8 +404,8 @@ export class ConnectReturnPathError extends Error {
 export class ConnectActionValidationError extends Error {
   readonly code: ConnectActionValidationErrorCode;
 
-  constructor(code: ConnectActionValidationErrorCode) {
-    super(`Invalid Connect action parameters: ${code}.`);
+  constructor(code: ConnectActionValidationErrorCode, message?: string) {
+    super(message ?? `Invalid Connect action parameters: ${code}.`);
     this.name = 'ConnectActionValidationError';
     this.code = code;
   }
@@ -627,7 +628,8 @@ export function createSuperRareClient(
 
       if (input.isAbandoned?.()) return;
       if (lastIntent !== undefined && isConnectIntentSettled(lastIntent.status)) {
-        closePopup();
+        // The hosted page shows a confirmed Cart order with its own close control.
+        if (!isConfirmedCartCheckout(lastIntent)) closePopup();
         options.onIntentSettled?.(lastIntent);
         return;
       }
@@ -717,7 +719,7 @@ export function createSuperRareClient(
     if (!requestResult.ok) {
       throw requestResult.error === 'invalid_return_path'
         ? new ConnectReturnPathError()
-        : new ConnectActionValidationError(requestResult.error);
+        : new ConnectActionValidationError(requestResult.error, requestResult.message);
     }
 
     if (redirectDisplay) {

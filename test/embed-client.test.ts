@@ -24,7 +24,8 @@ function harness(input: {
   display?: ConnectDisplay;
   onNavigate?: () => void;
   onSubscribe?: () => void;
-  intentType?: 'login' | 'transfer';
+  intentType?: 'login' | 'transfer' | 'checkout';
+  intentPath?: string;
 } = {}) {
   const listeners = new Set<(event: ConnectPopupMessageEvent) => void>();
   const source = {};
@@ -71,7 +72,7 @@ function harness(input: {
       if (request.method === 'GET') {
         return Response.json({ data: { intentId, type: input.intentType ?? 'login', status, expiresAt, returnPath: '/' } });
       }
-      return Response.json({ data: { intentId, url: `${origin}/action/${intentId}`, expiresAt } });
+      return Response.json({ data: { intentId, url: `${origin}${input.intentPath ?? `/action/${intentId}`}`, expiresAt } });
     },
   });
   const emit = (data: unknown, event: Partial<ConnectPopupMessageEvent> = {}): void => {
@@ -204,6 +205,22 @@ describe('embedded hosted Connect lifecycle', () => {
     releaseLink();
     await expect(pending).resolves.toMatchObject({ intentId });
     expect(new URL(h.urls[0] ?? '').searchParams.get('display')).toBe('embed');
+    h.frame.close();
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+
+  it('opens the cart start URL Rare API returns inside the embed frame', async () => {
+    vi.useFakeTimers();
+    const h = harness({ intentType: 'checkout', intentPath: `/cart/${intentId}/start` });
+    await h.client.checkout.start({
+      target: {
+        kind: 'cart',
+        chainId: 8453,
+        items: [{ listingDigest: `0x${'ab'.repeat(32)}`, quantity: '1' }],
+      },
+    });
+    expect(h.urls).toEqual([`${origin}/cart/${intentId}/start?display=embed`]);
+    expect(h.popupOpen).not.toHaveBeenCalled();
     h.frame.close();
     await vi.advanceTimersByTimeAsync(2000);
   });

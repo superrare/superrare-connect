@@ -141,6 +141,10 @@ const connectIntentSchema = z.object({
   }).optional(),
   result: z.object({
     approvalTxHash: z.string().optional(),
+    cartCompletion: z.object({
+      orderId: z.string(),
+    }).optional(),
+    paymentId: z.string().optional(),
     referenceId: z.string().optional(),
     sessionId: z.string().optional(),
     transactionHash: z.string().optional(),
@@ -148,6 +152,21 @@ const connectIntentSchema = z.object({
   error: z.object({
     code: z.string(),
     message: z.string(),
+  }).optional(),
+  payment: z.object({
+    method: z.string().optional(),
+    recipient: z.string().optional(),
+    email: z.string().optional(),
+    recipientBoundByCheckout: z.boolean().optional(),
+  }).optional(),
+  cartCheckout: z.object({
+    kind: z.literal('cart'),
+    chainId: z.number(),
+    items: z.array(z.object({
+      listingDigest: z.string(),
+      quantity: z.string(),
+    })),
+    cartAddress: z.string().optional(),
   }).optional(),
 });
 
